@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -26,6 +27,11 @@ import (
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
+
+// errRegistryRequired is returned by commands that access the registry when
+// the --registry flag was not given. The flag is not marked required so that
+// local-only commands such as top can run without it.
+var errRegistryRequired = errors.New("required flag --registry not set")
 
 func main() {
 	cmd := newCommand()
@@ -64,6 +70,9 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "running", Usage: "file of running images used to annotate stats"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if reg == nil {
+						return errRegistryRequired
+					}
 					var runningRules []*rules.RepoRule
 					if runningFile := cmd.String("running"); runningFile != "" {
 						f, err := os.Open(runningFile)
@@ -114,6 +123,9 @@ func newCommand() *cli.Command {
 					&cli.DurationFlag{Name: "keep-younger", Aliases: []string{"keepyounger"}, Value: 24 * time.Hour, Usage: "never delete manifests updated within this period"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if reg == nil {
+						return errRegistryRequired
+					}
 					var in io.Reader = os.Stdin
 					if inPath := cmd.String("input"); inPath != "" {
 						f, err := os.Open(inPath)
@@ -148,6 +160,9 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "output", Aliases: []string{"out", "outfile"}},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if cmd.String("registry") == "" {
+						return errRegistryRequired
+					}
 					specs := rules.KeepRulesFromImageList(os.Stdin, cmd.String("registry"))
 					logger.Debug("Built rules", "rules", len(specs))
 					out := os.Stdout
@@ -161,6 +176,39 @@ func newCommand() *cli.Command {
 					return writeJSON(out, specs)
 				},
 			},
+			{
+				Name:  "top",
+				Usage: "print the top repositories from a statistics JSON file as a table",
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "input", Aliases: []string{"in", "infile"}, Usage: "statistics JSON file (defaults to stdin)"},
+					&cli.StringFlag{Name: "sort", Aliases: []string{"s"}, Value: "unique", Usage: "sort key: " + strings.Join(pruner.StatSortKeys(), ", ")},
+					&cli.IntFlag{Name: "top", Aliases: []string{"k", "n"}, Value: 20, Usage: "number of rows to print (0 for all)"},
+				},
+				ArgsUsage: "[stats.json]",
+				Action: func(ctx context.Context, cmd *cli.Command) error {
+					inPath := cmd.String("input")
+					if inPath == "" {
+						inPath = cmd.Args().First()
+					}
+					var in io.Reader = os.Stdin
+					if inPath != "" {
+						f, err := os.Open(inPath)
+						if err != nil {
+							return err
+						}
+						defer func() { _ = f.Close() }()
+						in = f
+					}
+					stats, err := pruner.ReadStats(in)
+					if err != nil {
+						return err
+					}
+					if err := pruner.SortStatsBy(stats, cmd.String("sort")); err != nil {
+						return err
+					}
+					return pruner.WriteStatsTable(os.Stdout, stats, int(cmd.Int("top")))
+				},
+			},
 		},
 
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
@@ -169,6 +217,12 @@ func newCommand() *cli.Command {
 			}
 
 			registryName := cmd.String("registry")
+			if registryName == "" {
+				// Local-only commands (top) run without Azure credentials;
+				// commands that access the registry fail with
+				// errRegistryRequired instead.
+				return ctx, nil
+			}
 			var cache *registry.Cache
 			if dir := cmd.String("cache"); dir != "" {
 				cache = registry.NewCache(filepath.Join(dir, registryName))
@@ -191,7 +245,7 @@ func newCommand() *cli.Command {
 		},
 
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Required: true, Usage: "registry name or full login server"},
+			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "registry name or full login server (required except for local-only commands)"},
 			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests"},
 			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250},
 			&cli.IntFlag{Name: "parallelism", Value: 16},

@@ -16,11 +16,13 @@ Uses `DefaultAzureCredential` from the Azure SDK (environment variables, managed
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
-| `--registry` | `-r` | *(required)* | Registry name (`myreg`) or full login server (`myreg.azurecr.cn`) |
+| `--registry` | `-r` | *(required)*&nbsp;¹ | Registry name (`myreg`) or full login server (`myreg.azurecr.cn`) |
 | `--cache` | `-c` | | Local directory for caching downloaded manifests |
 | `--page-size` | `--pagesize` | `250` | Number of items per API page request |
 | `--parallelism` | | `16` | Number of concurrent API operations |
 | `--verbose` | `-v` | `false` | Enable debug logging |
+
+¹ Required by commands that access the registry; local-only commands such as `top` run without it.
 
 ## Commands
 
@@ -87,6 +89,35 @@ Reads a list of `registry.azurecr.io/repo:tag` image references from stdin and p
 
 ```sh
 scripts/get_pod_images.sh | acrprune -r myregistry generate | acrprune -r myregistry -v prune --dry-run=false
+```
+
+### `top`
+
+Reads a statistics JSON file (as produced by `statistics`) and prints the top repositories as an aligned table, with sizes in human-readable form and `shared` as a percentage. Runs entirely locally — no registry access or `--registry` flag needed. The input file may also be given as a positional argument.
+
+| Flag | Alias | Default | Description |
+|------|-------|---------|-------------|
+| `--input` | `--in`, `--infile` | stdin | Statistics JSON file |
+| `--sort` | `-s` | `unique` | Sort key: `count`, `name`, `newest`, `oldest`, `running`, `shared`, `tagged`, `total`, `unique`, `untagged` |
+| `--top` | `-k`, `-n` | `20` | Number of rows to print (`0` for all) |
+
+Sizes and counts sort descending (largest first), `newest` most-recent-first, `oldest` oldest-first, and `name` alphabetically.
+
+```sh
+# Top 20 repositories by unique (deduplicated) size
+acrprune top stats.json
+
+# Top 10 by total size
+acrprune top stats.json -s total -k 10
+
+# Straight from a fresh scan
+acrprune -r myregistry stats | acrprune top -s shared
+```
+
+```text
+NAME        UNIQUE  TOTAL   SHARED  TAGGED  UNTAGGED  COUNT  RUNNING  NEWEST      OLDEST
+runner      25 GB   66 GB   62.6%   53      106       159    0        2026-06-15  2025-06-01
+gp-profile  11 GB   29 GB   63.5%   75      150       225    0        2026-06-23  2025-11-27
 ```
 
 ## Rule File Format
