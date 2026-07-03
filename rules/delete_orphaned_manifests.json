@@ -1,0 +1,8 @@
+[
+  {
+    "description": "Deletes orphaned manifests from all repositories. A manifest is orphaned if it or its dependencies cannot be downloaded",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": true
+  }
+]

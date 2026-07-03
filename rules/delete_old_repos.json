@@ -1,0 +1,21 @@
+[
+  {
+    "description": "Deletes repositories if all manifests are older than 730 days",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": false,
+    "must_delete_everything": true,
+    "untagged": [
+      {
+        "match_older": "730d",
+        "keep": false
+      }
+    ],
+    "tagged": [
+      {
+        "match_older": "730d",
+        "keep": false
+      }
+    ]
+  }
+]

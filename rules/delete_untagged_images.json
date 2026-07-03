@@ -1,0 +1,14 @@
+[
+  {
+    "description": "Deletes untagged manifests from all repositories. Manifests modified in the last 24 hours are kept",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": false,
+    "untagged": [
+      {
+        "match_older": "24h",
+        "keep": false
+      }
+    ]
+  }
+]

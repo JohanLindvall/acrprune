@@ -1,0 +1,21 @@
+[
+  {
+    "description": "Deletes (tagged) feature branch and PR images older than 14 days",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": false,
+    "untagged": [
+      {
+        "match_older": "24h",
+        "keep": false
+      }
+    ],
+    "tagged": [
+      {
+        "tag": "^\\d{8}(-br|\\.\\d+-(br|pr|ft|local|db)\\..+)$",
+        "match_older": "14d",
+        "keep": false
+      }
+    ]
+  }
+]

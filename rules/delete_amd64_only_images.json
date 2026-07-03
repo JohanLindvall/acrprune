@@ -1,0 +1,25 @@
+[
+  {
+    "description": "Deletes repositories if they have only images with amd64 architecture",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": false,
+    "must_delete_everything": true,
+    "untagged": [
+      {
+        "match_older": "24h",
+        "keep": false
+      }
+    ],
+    "tagged": [
+      {
+        "arch": "arm64",
+        "keep": true
+      },
+      {
+        "arch": "amd64",
+        "keep": false
+      }
+    ]
+  }
+]
