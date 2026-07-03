@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
           cache: true
       - run: make vet
       - name: Lint
@@ -40,7 +40,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: '1.26.x'
           cache: true
 
       - name: Compute next version
