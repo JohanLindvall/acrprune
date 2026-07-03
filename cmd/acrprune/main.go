@@ -28,6 +28,15 @@ import (
 var version = "dev"
 
 func main() {
+	cmd := newCommand()
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
+		os.Exit(1)
+	}
+}
+
+// newCommand builds the acrprune CLI command tree. It is split out from main
+// so tests can inspect the flag wiring.
+func newCommand() *cli.Command {
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
 
@@ -36,6 +45,10 @@ func main() {
 	}))
 
 	var reg *registry.Registry
+
+	// Keep -v bound to the verbose flag below; expose the version only as
+	// --version so the auto-generated version flag does not claim -v.
+	cli.VersionFlag = &cli.BoolFlag{Name: "version", Usage: "print the version"}
 
 	cmd := &cli.Command{
 		Name:    "acrprune",
@@ -189,9 +202,7 @@ func main() {
 		},
 	}
 
-	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		os.Exit(1)
-	}
+	return cmd
 }
 
 // loginServerURL turns a bare registry name into its azurecr.io login server
