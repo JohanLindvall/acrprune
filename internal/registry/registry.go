@@ -46,7 +46,7 @@ func (r *Registry) ListRepositories(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to advance repository page: %w", err)
 		}
-		for _, repository := range repositoryPage.Repositories.Names {
+		for _, repository := range repositoryPage.Names {
 			repositories = append(repositories, *repository)
 		}
 	}

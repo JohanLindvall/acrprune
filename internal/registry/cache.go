@@ -46,5 +46,5 @@ func (c *Cache) Remove(digest string) {
 	if c == nil {
 		return
 	}
-	os.Remove(filepath.Join(c.dir, digest))
+	_ = os.Remove(filepath.Join(c.dir, digest))
 }

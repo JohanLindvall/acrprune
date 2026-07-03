@@ -87,14 +87,14 @@ func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
 		result.MustDeleteEverything = *s.MustDeleteEverything
 	}
 	for _, u := range s.Untagged {
-		common, err := u.CommonRuleSpec.compile()
+		common, err := u.compile()
 		if err != nil {
 			return nil, err
 		}
 		result.Untagged = append(result.Untagged, UntaggedRule{CommonRule: common})
 	}
 	for _, t := range s.Tagged {
-		common, err := t.CommonRuleSpec.compile()
+		common, err := t.compile()
 		if err != nil {
 			return nil, err
 		}

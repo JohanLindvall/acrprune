@@ -22,7 +22,7 @@ func TestShippedRuleFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		specs, err := ParseSpecs(f)
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			t.Errorf("%s: parse failed: %v", file, err)
 			continue

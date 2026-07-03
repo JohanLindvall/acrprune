@@ -92,7 +92,7 @@ func TestCache(t *testing.T) {
 }
 
 func TestNilCache(t *testing.T) {
-	var c *Cache = NewCache("")
+	c := NewCache("")
 	if c != nil {
 		t.Fatal("empty dir should yield nil cache")
 	}

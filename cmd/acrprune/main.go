@@ -24,6 +24,9 @@ import (
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
 
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
@@ -35,8 +38,9 @@ func main() {
 	var reg *registry.Registry
 
 	cmd := &cli.Command{
-		Name:  "acrprune",
-		Usage: "prune Azure Container Registry manifests using declarative rules",
+		Name:    "acrprune",
+		Version: version,
+		Usage:   "prune Azure Container Registry manifests using declarative rules",
 		Commands: []*cli.Command{
 			{
 				Name:    "statistics",
@@ -54,7 +58,7 @@ func main() {
 							return fmt.Errorf("failed to open running file: %w", err)
 						}
 						specs := rules.KeepRulesFromImageList(f, cmd.String("registry"))
-						f.Close()
+						_ = f.Close()
 						if runningRules, err = rules.Compile(specs); err != nil {
 							return err
 						}
@@ -67,7 +71,7 @@ func main() {
 						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
 							return err
 						}
-						defer out.Close()
+						defer func() { _ = out.Close() }()
 						// Rewrite the file after each repository so partial
 						// results survive an interrupted run.
 						onUpdate = func(stats []pruner.RepositoryStats) error {
@@ -103,7 +107,7 @@ func main() {
 						if err != nil {
 							return err
 						}
-						defer f.Close()
+						defer func() { _ = f.Close() }()
 						in = f
 					}
 					specs, err := rules.ParseSpecs(in)
@@ -139,7 +143,7 @@ func main() {
 						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
 							return err
 						}
-						defer out.Close()
+						defer func() { _ = out.Close() }()
 					}
 					return writeJSON(out, specs)
 				},
