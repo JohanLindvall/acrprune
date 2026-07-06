@@ -12,6 +12,15 @@ go install github.com/JohanLindvall/acrprune/cmd/acrprune@latest
 
 Uses `DefaultAzureCredential` from the Azure SDK (environment variables, managed identity, Azure CLI, etc.).
 
+### ABAC registries and scoped permissions
+
+acrprune works with [ABAC-enabled registries](https://learn.microsoft.com/azure/container-registry/container-registry-rbac-abac-repository-permissions), where permissions are granted per repository rather than registry-wide. The underlying `azcontainerregistry` SDK uses challenge-based authentication, so it automatically requests an ACR access token scoped to exactly the repository each request touches — there is no wildcard-scope requirement and no batch-size tuning to configure.
+
+Two things follow from this:
+
+- **Catalog listing is only used when needed.** When every rule targets a literal repository (`^name$`), acrprune addresses those repositories directly and never lists the catalog, so the `Container Registry Repository Catalog Lister` role is not required. It is only needed when a rule uses a repository regex; if listing is denied, acrprune reports the missing role and suggests switching to literal patterns.
+- **Partial access is tolerated.** If a repository-regex rule matches repositories the caller cannot access, acrprune skips each denied repository (logging which were pruned, denied and remaining) instead of aborting the whole run, and exits non-zero at the end with the list of repositories that were denied. To purge only what you own, prefer literal `^repo$` patterns.
+
 ## Global Flags
 
 | Flag | Alias | Default | Description |
@@ -35,6 +44,7 @@ Deletes manifests (and empty repositories) according to a JSON rule file. By def
 | `--input` | `--in`, `--infile` | stdin | Path to a JSON rules file |
 | `--dry-run` | `--dryrun` | `true` | When true, only logs what would be deleted |
 | `--keep-younger` | `--keepyounger` | `24h` | Grace period — manifests younger than this are never deleted |
+| `--include-locked` | `--includelocked` | `false` | Unlock delete/write-disabled manifests and tags before deleting them |
 
 ```sh
 # Dry run (default)
@@ -45,7 +55,16 @@ acrprune -r myregistry -v prune --dry-run=false --in rules/cleanup_feature_branc
 
 # Read rules from stdin
 cat rules/delete_orphaned_manifests.json | acrprune -r myregistry prune --dry-run=false
+
+# Also delete images that have been locked for protection
+acrprune -r myregistry -v prune --dry-run=false --include-locked --in rules/cleanup_feature_branches.json
 ```
+
+#### Locked images
+
+By default a manifest or tag whose `deleteEnabled` or `writeEnabled` attribute has been set to `false` (see [Lock a container image](https://learn.microsoft.com/azure/container-registry/container-registry-image-lock)) cannot be deleted, and the delete will fail. Passing `--include-locked` re-enables delete and write on any locked manifest — and on any locked tag pointing at a manifest being deleted — immediately before deletion. In dry-run mode locked manifests are annotated with `locked=true` in the log but nothing is changed.
+
+**Warning:** `--include-locked` bypasses the image-lock protection mechanism. If unlocking a particular manifest or tag fails, acrprune logs a warning and still attempts the delete.
 
 ### `statistics` (alias: `stats`)
 

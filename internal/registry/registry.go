@@ -175,6 +175,64 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest) e
 	return group.Wait()
 }
 
+// ListTagLocks returns the set of tag names in the repository whose delete or
+// write attribute is disabled. It is used before deletion, when unlocking is
+// requested, so that only genuinely locked tags are updated.
+func (r *Registry) ListTagLocks(ctx context.Context, repository string) (map[string]bool, error) {
+	locked := map[string]bool{}
+	pager := r.client.NewListTagsPager(repository, &azcontainerregistry.ClientListTagsOptions{MaxNum: to.Ptr(r.pageSize)})
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list tags for %s: %w", repository, err)
+		}
+		for _, t := range page.Tags {
+			c := t.ChangeableAttributes
+			if c != nil && ((c.CanDelete != nil && !*c.CanDelete) || (c.CanWrite != nil && !*c.CanWrite)) {
+				locked[*t.Name] = true
+			}
+		}
+	}
+	return locked, nil
+}
+
+// UnlockManifests re-enables delete and write on the locked manifests and on
+// any of their tags named in lockedTags, so a subsequent delete can proceed.
+// Individual failures are logged and tolerated: the delete that follows
+// surfaces anything that genuinely could not be unlocked.
+func (r *Registry) UnlockManifests(ctx context.Context, manifests []*Manifest, lockedTags map[string]bool) {
+	unlocked := &azcontainerregistry.ManifestWriteableProperties{CanDelete: to.Ptr(true), CanWrite: to.Ptr(true)}
+	unlockedTag := &azcontainerregistry.TagWriteableProperties{CanDelete: to.Ptr(true), CanWrite: to.Ptr(true)}
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(r.parallelism)
+	for _, m := range manifests {
+		repository, digest := ParseRef(m.Ref)
+		if m.Locked() {
+			group.Go(func() error {
+				r.logger.Info("Unlocking manifest", "manifest", m)
+				if _, err := r.client.UpdateManifestProperties(groupCtx, repository, digest, &azcontainerregistry.ClientUpdateManifestPropertiesOptions{Value: unlocked}); err != nil {
+					r.logger.Warn("Failed to unlock manifest; attempting deletion anyway", "manifest", m.Ref, "err", err)
+				}
+				return nil
+			})
+		}
+		for _, tag := range m.Tags() {
+			if !lockedTags[tag] {
+				continue
+			}
+			group.Go(func() error {
+				r.logger.Info("Unlocking tag", "repository", repository, "tag", tag)
+				if _, err := r.client.UpdateTagProperties(groupCtx, repository, tag, &azcontainerregistry.ClientUpdateTagPropertiesOptions{Value: unlockedTag}); err != nil {
+					r.logger.Warn("Failed to unlock tag; attempting deletion anyway", "repository", repository, "tag", tag, "err", err)
+				}
+				return nil
+			})
+		}
+	}
+	_ = group.Wait()
+}
+
 // DeleteRepository deletes an entire repository.
 func (r *Registry) DeleteRepository(ctx context.Context, repository string) error {
 	if _, err := r.client.DeleteRepository(ctx, repository, nil); err != nil {

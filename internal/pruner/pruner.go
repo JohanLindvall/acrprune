@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
 
+	azerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 	"github.com/dustin/go-humanize"
@@ -24,6 +26,9 @@ type Pruner struct {
 	// KeepYounger is a grace period: manifests updated within it are never
 	// deleted, whatever the rules say.
 	KeepYounger time.Duration
+	// IncludeLocked unlocks manifests and tags whose delete/write attribute is
+	// disabled before deleting them, instead of failing on them.
+	IncludeLocked bool
 }
 
 // Stats accumulates counts over one or more repository prunes.
@@ -68,22 +73,48 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 	}
 
 	var total Stats
-	for _, repository := range repositories {
+	var purged, denied []string
+	for i, repository := range repositories {
 		for _, rule := range ruleSet {
 			if !rule.Repo.MatchString(repository) {
 				continue
 			}
 			stats, err := p.pruneRepository(ctx, repository, rule)
 			if err != nil {
+				// On an ABAC registry a broad rule can match repositories the
+				// caller has no access to. Skip those (rather than aborting
+				// the whole run) but report them and fail at the end.
+				if isPermissionError(err) {
+					denied = append(denied, repository)
+					p.Logger.Warn("Insufficient permission to prune repository; skipping",
+						"repository", repository, "purged", len(purged), "denied", len(denied),
+						"remaining", len(repositories)-i-1, "err", err)
+					break
+				}
 				return fmt.Errorf("failed to prune repository %s: %w", repository, err)
 			}
+			purged = append(purged, repository)
 			total.Add(stats)
 			p.Logger.Info("Processed", "totals", total)
 			break
 		}
 	}
 
+	if len(denied) > 0 {
+		return fmt.Errorf("insufficient permission to prune %d of %d repositories (purged %d): %s",
+			len(denied), len(repositories), len(purged), strings.Join(denied, ", "))
+	}
 	return nil
+}
+
+// isPermissionError reports whether err is an ACR 401/403, i.e. the caller
+// lacks permission on the resource (typical on ABAC registries scoped to a
+// subset of repositories).
+func isPermissionError(err error) bool {
+	if re := azerrors.IsResponseError(err); re != nil {
+		return re.StatusCode == http.StatusForbidden || re.StatusCode == http.StatusUnauthorized
+	}
+	return false
 }
 
 // candidateRepositories returns the repositories the rules can apply to: the
@@ -94,12 +125,19 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 	for _, rule := range ruleSet {
 		name, ok := rule.LiteralRepoName()
 		if !ok {
-			return p.Registry.ListRepositories(ctx)
+			repositories, err := p.Registry.ListRepositories(ctx)
+			if err != nil && isPermissionError(err) {
+				// On ABAC registries catalog listing needs the Catalog Lister
+				// role. Point the user at the literal-name path that avoids it.
+				return nil, fmt.Errorf("%w (listing the catalog requires the Container Registry Repository Catalog Lister role; on ABAC registries, use literal ^repo$ patterns to target specific repositories without listing)", err)
+			}
+			return repositories, err
 		}
 		if !slices.Contains(literals, name) {
 			literals = append(literals, name)
 		}
 	}
+	p.Logger.Debug("All rules target literal repositories; skipping catalog listing", "repositories", literals)
 	return literals, nil
 }
 
@@ -147,6 +185,18 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	slices.SortFunc(toDelete, func(a, b *registry.Manifest) int {
 		return strings.Compare(a.Ref, b.Ref)
 	})
+
+	if !p.DryRun && p.IncludeLocked {
+		toUnlock := toDelete
+		if len(kept) == 0 {
+			toUnlock = slices.Collect(maps.Values(manifests))
+		}
+		lockedTags, tagErr := p.Registry.ListTagLocks(ctx, repository)
+		if tagErr != nil {
+			return Stats{}, tagErr
+		}
+		p.Registry.UnlockManifests(ctx, toUnlock, lockedTags)
+	}
 
 	if p.DryRun {
 		if len(kept) == 0 {

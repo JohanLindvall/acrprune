@@ -121,6 +121,7 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "input", Aliases: []string{"in", "infile"}, Usage: "rule file (defaults to stdin)"},
 					&cli.BoolFlag{Name: "dry-run", Aliases: []string{"dryrun"}, Value: true},
 					&cli.DurationFlag{Name: "keep-younger", Aliases: []string{"keepyounger"}, Value: 24 * time.Hour, Usage: "never delete manifests updated within this period"},
+					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "unlock delete/write-disabled manifests and tags before deleting them"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if reg == nil {
@@ -145,10 +146,11 @@ func newCommand() *cli.Command {
 					}
 
 					p := &pruner.Pruner{
-						Registry:    reg,
-						Logger:      logger,
-						DryRun:      cmd.Bool("dry-run"),
-						KeepYounger: cmd.Duration("keep-younger"),
+						Registry:      reg,
+						Logger:        logger,
+						DryRun:        cmd.Bool("dry-run"),
+						KeepYounger:   cmd.Duration("keep-younger"),
+						IncludeLocked: cmd.Bool("include-locked"),
 					}
 					return p.Prune(ctx, ruleSet)
 				},

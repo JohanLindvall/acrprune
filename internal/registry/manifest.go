@@ -47,6 +47,16 @@ func ParseRef(ref string) (repository, digest string) {
 	return
 }
 
+// Locked reports whether the manifest is protected from deletion, i.e. its
+// delete or write attribute has been disabled.
+func (m *Manifest) Locked() bool {
+	if m.Azure == nil || m.Azure.ChangeableAttributes == nil {
+		return false
+	}
+	c := m.Azure.ChangeableAttributes
+	return (c.CanDelete != nil && !*c.CanDelete) || (c.CanWrite != nil && !*c.CanWrite)
+}
+
 // Tags returns the manifest's registry tags.
 func (m *Manifest) Tags() []string {
 	if m.Azure == nil {
@@ -85,6 +95,9 @@ func (m *Manifest) LogValue() slog.Value {
 	}
 	if m.Orphaned {
 		attrs = append(attrs, slog.Bool("orphaned", true))
+	}
+	if m.Locked() {
+		attrs = append(attrs, slog.Bool("locked", true))
 	}
 	if tags := m.Tags(); len(tags) > 0 {
 		attrs = append(attrs, slog.String("tags", strings.Join(tags, ",")))

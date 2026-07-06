@@ -1,12 +1,15 @@
 package pruner
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -307,6 +310,26 @@ func TestCountRunning(t *testing.T) {
 	}
 	if got := countRunning(manifests, "other", ruleSet); got != 0 {
 		t.Errorf("countRunning for unmatched repo = %d, want 0", got)
+	}
+}
+
+func TestIsPermissionError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"forbidden", &azcore.ResponseError{StatusCode: 403}, true},
+		{"unauthorized", &azcore.ResponseError{StatusCode: 401}, true},
+		{"wrapped forbidden", fmt.Errorf("prune failed: %w", &azcore.ResponseError{StatusCode: 403}), true},
+		{"not found", &azcore.ResponseError{StatusCode: 404}, false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		if got := isPermissionError(tt.err); got != tt.want {
+			t.Errorf("%s: isPermissionError = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 

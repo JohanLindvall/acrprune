@@ -72,6 +72,43 @@ func TestLogValueIncludesUpdated(t *testing.T) {
 	}
 }
 
+func TestLocked(t *testing.T) {
+	tests := []struct {
+		name  string
+		attrs *azcontainerregistry.ManifestWriteableProperties
+		want  bool
+	}{
+		{"no attributes", nil, false},
+		{"fully enabled", &azcontainerregistry.ManifestWriteableProperties{CanDelete: to.Ptr(true), CanWrite: to.Ptr(true)}, false},
+		{"delete disabled", &azcontainerregistry.ManifestWriteableProperties{CanDelete: to.Ptr(false)}, true},
+		{"write disabled", &azcontainerregistry.ManifestWriteableProperties{CanWrite: to.Ptr(false)}, true},
+	}
+	for _, tt := range tests {
+		m := &Manifest{Azure: &azcontainerregistry.ManifestAttributes{ChangeableAttributes: tt.attrs}}
+		if got := m.Locked(); got != tt.want {
+			t.Errorf("%s: Locked = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+	if (&Manifest{}).Locked() {
+		t.Error("manifest without attributes should not be locked")
+	}
+}
+
+func TestLogValueIncludesLocked(t *testing.T) {
+	m := &Manifest{Ref: "r@d", Azure: &azcontainerregistry.ManifestAttributes{
+		ChangeableAttributes: &azcontainerregistry.ManifestWriteableProperties{CanDelete: to.Ptr(false)},
+	}}
+	found := false
+	for _, a := range m.LogValue().Group() {
+		if a.Key == "locked" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("LogValue of a locked manifest should include locked=true")
+	}
+}
+
 func TestCache(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sub") // exercise MkdirAll in Put
 	c := NewCache(dir)
