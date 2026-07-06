@@ -60,9 +60,11 @@ func WriteStatsTable(w io.Writer, stats []RepositoryStats, top int) error {
 		stats = stats[:top]
 	}
 	tw := tabwriter.NewWriter(w, 0, 8, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tUNIQUE\tTOTAL\tSHARED\tTAGGED\tUNTAGGED\tCOUNT\tRUNNING\tNEWEST\tOLDEST")
+	if _, err := fmt.Fprintln(tw, "NAME\tUNIQUE\tTOTAL\tSHARED\tTAGGED\tUNTAGGED\tCOUNT\tRUNNING\tNEWEST\tOLDEST"); err != nil {
+		return err
+	}
 	for _, s := range stats {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%.1f%%\t%d\t%d\t%d\t%d\t%s\t%s\n",
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%.1f%%\t%d\t%d\t%d\t%d\t%s\t%s\n",
 			s.Name,
 			humanize.Bytes(s.Unique),
 			humanize.Bytes(s.Total),
@@ -73,7 +75,9 @@ func WriteStatsTable(w io.Writer, stats []RepositoryStats, top int) error {
 			s.Running,
 			s.Newest.Format("2006-01-02"),
 			s.Oldest.Format("2006-01-02"),
-		)
+		); err != nil {
+			return err
+		}
 	}
 	return tw.Flush()
 }
