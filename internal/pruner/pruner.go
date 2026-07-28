@@ -4,16 +4,13 @@ package pruner
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"maps"
-	"net/http"
 	"slices"
 	"strings"
 	"time"
 
-	azerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 	"github.com/dustin/go-humanize"
@@ -31,14 +28,14 @@ type Pruner struct {
 	IncludeLocked bool
 }
 
-// Stats accumulates counts over one or more repository prunes.
-type Stats struct {
+// PruneStats accumulates counts over one or more repository prunes.
+type PruneStats struct {
 	Repositories, KeptRepositories                 int
 	SeenManifests, KeptManifests, DeletedManifests int
 	SeenBytes, KeptBytes, DeletedBytes             uint64
 }
 
-func (s *Stats) Add(o Stats) {
+func (s *PruneStats) Add(o PruneStats) {
 	s.Repositories += o.Repositories
 	s.KeptRepositories += o.KeptRepositories
 	s.SeenManifests += o.SeenManifests
@@ -49,7 +46,7 @@ func (s *Stats) Add(o Stats) {
 	s.DeletedBytes += o.DeletedBytes
 }
 
-func (s Stats) LogValue() slog.Value {
+func (s PruneStats) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("repositories", s.Repositories),
 		slog.Int("kept_repos", s.KeptRepositories),
@@ -72,8 +69,8 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 		return err
 	}
 
-	var total Stats
-	var purged, denied []string
+	var total PruneStats
+	var pruned, denied []string
 	for i, repository := range repositories {
 		for _, rule := range ruleSet {
 			if !rule.Repo.MatchString(repository) {
@@ -84,16 +81,16 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 				// On an ABAC registry a broad rule can match repositories the
 				// caller has no access to. Skip those (rather than aborting
 				// the whole run) but report them and fail at the end.
-				if isPermissionError(err) {
+				if registry.IsPermissionError(err) {
 					denied = append(denied, repository)
 					p.Logger.Warn("Insufficient permission to prune repository; skipping",
-						"repository", repository, "purged", len(purged), "denied", len(denied),
+						"repository", repository, "pruned", len(pruned), "denied", len(denied),
 						"remaining", len(repositories)-i-1, "err", err)
 					break
 				}
 				return fmt.Errorf("failed to prune repository %s: %w", repository, err)
 			}
-			purged = append(purged, repository)
+			pruned = append(pruned, repository)
 			total.Add(stats)
 			p.Logger.Info("Processed", "totals", total)
 			break
@@ -101,32 +98,22 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 	}
 
 	if len(denied) > 0 {
-		return fmt.Errorf("insufficient permission to prune %d of %d repositories (purged %d): %s",
-			len(denied), len(repositories), len(purged), strings.Join(denied, ", "))
+		return fmt.Errorf("insufficient permission to prune %d of %d repositories (pruned %d): %s",
+			len(denied), len(repositories), len(pruned), strings.Join(denied, ", "))
 	}
 	return nil
 }
 
-// isPermissionError reports whether err is an ACR 401/403, i.e. the caller
-// lacks permission on the resource (typical on ABAC registries scoped to a
-// subset of repositories).
-func isPermissionError(err error) bool {
-	if re := azerrors.IsResponseError(err); re != nil {
-		return re.StatusCode == http.StatusForbidden || re.StatusCode == http.StatusUnauthorized
-	}
-	return false
-}
-
 // candidateRepositories returns the repositories the rules can apply to: the
 // literal names when every rule targets a plain ^name$ pattern, or the full
-// registry listing otherwise.
+// registry listing as soon as one rule needs it to resolve what it matches.
 func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.RepoRule) ([]string, error) {
 	var literals []string
 	for _, rule := range ruleSet {
 		name, ok := rule.LiteralRepoName()
 		if !ok {
 			repositories, err := p.Registry.ListRepositories(ctx)
-			if err != nil && isPermissionError(err) {
+			if registry.IsPermissionError(err) {
 				// On ABAC registries catalog listing needs the Catalog Lister
 				// role. Point the user at the literal-name path that avoids it.
 				return nil, fmt.Errorf("%w (listing the catalog requires the Container Registry Repository Catalog Lister role; on ABAC registries, use literal ^repo$ patterns to target specific repositories without listing)", err)
@@ -141,163 +128,117 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 	return literals, nil
 }
 
-func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *rules.RepoRule) (Stats, error) {
+func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *rules.RepoRule) (PruneStats, error) {
 	manifests, found, err := p.Registry.FetchRepositoryManifests(ctx, repository, rule.IgnoreMissingManifests)
 	if err != nil {
-		return Stats{}, err
+		return PruneStats{}, err
 	}
 	if !found {
-		return Stats{}, nil // repository disappeared; nothing to do
+		return PruneStats{}, nil // repository disappeared; nothing to do
 	}
 
-	markOrphans(manifests, repository)
+	markOrphans(manifests)
 
 	if err := p.reportOrphans(manifests, rule); err != nil {
-		return Stats{}, err
+		return PruneStats{}, err
 	}
 
-	kept, err := p.decide(manifests, repository, rule)
+	all := slices.SortedFunc(maps.Values(manifests), byNewest)
+	kept, err := p.decide(all, manifests, rule)
 	if err != nil {
-		return Stats{}, err
+		return PruneStats{}, err
 	}
 
 	toKeep := make([]*registry.Manifest, 0, len(kept))
-	var toDelete []*registry.Manifest
-	for ref, m := range manifests {
-		if _, ok := kept[ref]; ok {
+	toDelete := make([]*registry.Manifest, 0, len(all))
+	for _, m := range all {
+		_, keep := kept[m.Digest]
+		if keep {
 			toKeep = append(toKeep, m)
-			if !m.HasOwner {
-				p.Logger.Debug("Keeping root manifest", "manifest", m)
-			}
 		} else {
 			toDelete = append(toDelete, m)
-			if !m.HasOwner {
-				p.Logger.Debug("Deleting root manifest", "manifest", m)
-			}
+		}
+		if !m.HasOwner {
+			p.Logger.Debug("Root manifest", "manifest", m, "kept", keep)
 		}
 	}
 
-	totalBytes := calculateStats("", slices.Collect(maps.Values(manifests))).Unique
+	seenBytes := calculateStats("", all).Unique
 	keptBytes := calculateStats("", toKeep).Unique
 
-	p.Logger.Info("Processed manifests", "repository", repository, "seen", humanize.Bytes(totalBytes), "kept", humanize.Bytes(keptBytes), "deleted", humanize.Bytes(totalBytes-keptBytes))
+	p.Logger.Info("Processed manifests", "repository", repository,
+		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), "deleted", humanize.Bytes(seenBytes-keptBytes))
 
-	slices.SortFunc(toDelete, func(a, b *registry.Manifest) int {
-		return strings.Compare(a.Ref, b.Ref)
-	})
-
-	if !p.DryRun && p.IncludeLocked {
-		toUnlock := toDelete
-		if len(kept) == 0 {
-			toUnlock = slices.Collect(maps.Values(manifests))
-		}
-		lockedTags, tagErr := p.Registry.ListTagLocks(ctx, repository)
-		if tagErr != nil {
-			return Stats{}, tagErr
-		}
-		p.Registry.UnlockManifests(ctx, toUnlock, lockedTags)
-	}
+	// An empty repository is deleted outright rather than manifest by
+	// manifest; ACR keeps no repository without manifests anyway.
+	deleteWholeRepository := len(kept) == 0
 
 	if p.DryRun {
-		if len(kept) == 0 {
+		if deleteWholeRepository {
 			p.Logger.Info("Dry-run: deleting repository", "repository", repository)
 		} else {
 			for _, m := range toDelete {
 				p.Logger.Info("Dry-run: deleting manifest", "manifest", m)
 			}
 		}
-	} else if len(kept) == 0 {
-		p.Logger.Info("Deleting repository", "repository", repository)
-		err = p.Registry.DeleteRepository(ctx, repository)
 	} else {
-		err = p.Registry.DeleteManifests(ctx, toDelete)
-	}
-
-	stats := Stats{
-		Repositories:     1,
-		SeenManifests:    len(manifests),
-		KeptManifests:    len(kept),
-		DeletedManifests: len(toDelete),
-		SeenBytes:        totalBytes,
-		KeptBytes:        keptBytes,
-		DeletedBytes:     totalBytes - keptBytes,
-	}
-	if len(kept) > 0 {
-		stats.KeptRepositories = 1
-	}
-	return stats, err
-}
-
-// markOrphans propagates the Orphaned flag until a fixpoint: a manifest is
-// orphaned when a manifest it references is missing or itself orphaned, and
-// every manifest referenced by an orphaned index is orphaned too. It also
-// marks referenced manifests as owned.
-func markOrphans(manifests map[string]*registry.Manifest, repository string) {
-	for changed := true; changed; {
-		changed = false
-		for _, m := range manifests {
-			for _, child := range m.Manifests {
-				dep, ok := manifests[registry.MakeRef(repository, string(child.Digest))]
-				if ok {
-					dep.HasOwner = true
-				}
-				if (!ok || dep.Orphaned) && !m.Orphaned {
-					changed = true
-					m.Orphaned = true
-				} else if ok && m.Orphaned && !dep.Orphaned {
-					changed = true
-					dep.Orphaned = true
-				}
+		if p.IncludeLocked {
+			if err := p.unlock(ctx, repository, toDelete); err != nil {
+				return PruneStats{}, err
 			}
 		}
+		if deleteWholeRepository {
+			p.Logger.Info("Deleting repository", "repository", repository)
+			err = p.Registry.DeleteRepository(ctx, repository)
+		} else {
+			err = p.Registry.DeleteManifests(ctx, toDelete)
+		}
+		if err != nil {
+			return PruneStats{}, err
+		}
 	}
+
+	stats := PruneStats{
+		Repositories:     1,
+		SeenManifests:    len(all),
+		KeptManifests:    len(kept),
+		DeletedManifests: len(toDelete),
+		SeenBytes:        seenBytes,
+		KeptBytes:        keptBytes,
+		DeletedBytes:     seenBytes - keptBytes,
+	}
+	if !deleteWholeRepository {
+		stats.KeptRepositories = 1
+	}
+	return stats, nil
 }
 
-// reportOrphans fails on orphaned manifests unless the rule either ignores
-// missing manifests or deletes orphans.
-func (p *Pruner) reportOrphans(manifests map[string]*registry.Manifest, rule *rules.RepoRule) error {
-	if rule.IgnoreMissingManifests || rule.DeleteOrphanedManifests {
+// unlock re-enables delete and write on the manifests about to be deleted, and
+// on any of their tags that are locked.
+func (p *Pruner) unlock(ctx context.Context, repository string, toDelete []*registry.Manifest) error {
+	if len(toDelete) == 0 {
 		return nil
 	}
-	orphaned := 0
-	for _, m := range manifests {
-		if !m.Orphaned {
-			continue
-		}
-		orphaned++
-		content, _ := json.Marshal(m.OCIManifest)
-		p.Logger.Warn("Orphaned manifest", "manifest", m.Ref, "content", string(content))
+	lockedTags, err := p.Registry.ListTagLocks(ctx, repository)
+	if err != nil {
+		return err
 	}
-	if orphaned > 0 {
-		return fmt.Errorf("%d manifest(s) orphaned", orphaned)
-	}
+	p.Registry.UnlockManifests(ctx, toDelete, lockedTags)
 	return nil
 }
 
-// decide returns the set of manifest refs to keep, including the transitive
-// dependencies of every kept manifest.
-func (p *Pruner) decide(manifests map[string]*registry.Manifest, repository string, rule *rules.RepoRule) (map[string]struct{}, error) {
-	now := time.Now()
-
-	ordered := slices.Collect(maps.Values(manifests))
-	slices.SortFunc(ordered, func(a, b *registry.Manifest) int { // newest first
-		return b.Azure.LastUpdatedOn.Compare(*a.Azure.LastUpdatedOn)
-	})
-	var tagged, untagged []*registry.Manifest
-	for _, m := range ordered {
-		if m.Azure != nil && len(m.Azure.Tags) > 0 {
-			tagged = append(tagged, m)
-		} else {
-			untagged = append(untagged, m)
-		}
-	}
+// decide returns the digests of the manifests to keep, including the
+// transitive dependencies of every kept manifest. all must hold the values of
+// manifests in a deterministic order.
+func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry.Manifest, rule *rules.RepoRule) (map[string]struct{}, error) {
+	evaluator := newEvaluator(rule, all, time.Now())
 
 	kept := map[string]struct{}{}
-	for ref, m := range manifests {
-		if !p.shouldKeep(m, rule, tagged, untagged, now) {
+	for _, m := range all {
+		if !p.shouldKeep(m, evaluator, rule) {
 			continue
 		}
-		if err := p.keepWithDependencies(ref, manifests, kept, repository, rule); err != nil {
+		if err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
 			return nil, err
 		}
 	}
@@ -305,8 +246,8 @@ func (p *Pruner) decide(manifests map[string]*registry.Manifest, repository stri
 	// A must-delete-everything rule is all-or-nothing: keeping one manifest
 	// keeps the whole repository.
 	if rule.MustDeleteEverything && len(kept) > 0 {
-		for ref := range manifests {
-			kept[ref] = struct{}{}
+		for digest := range manifests {
+			kept[digest] = struct{}{}
 		}
 	}
 
@@ -314,59 +255,57 @@ func (p *Pruner) decide(manifests map[string]*registry.Manifest, repository stri
 }
 
 // shouldKeep applies the first matching tagged/untagged rule, then the
-// overrides: orphan deletion, subject retention and the grace period.
-func (p *Pruner) shouldKeep(m *registry.Manifest, rule *rules.RepoRule, tagged, untagged []*registry.Manifest, now time.Time) bool {
-	keep := true
-	if tags := m.Tags(); len(tags) == 0 {
-		for _, r := range rule.Untagged {
-			if commonRuleMatches(r.CommonRule, m, untagged, now) {
-				keep = r.Keep
-				break
-			}
-		}
-	} else {
-		for _, r := range rule.Tagged {
-			if matchAny(r.Tag, tags) && commonRuleMatches(r.CommonRule, m, tagged, now) {
-				keep = r.Keep
-				break
-			}
-		}
-	}
+// overrides that can only save a manifest: orphan deletion, subject retention,
+// the grace period and a missing timestamp.
+func (p *Pruner) shouldKeep(m *registry.Manifest, evaluator *evaluator, rule *rules.RepoRule) bool {
+	keep := evaluator.keep(m)
 
 	if rule.DeleteOrphanedManifests && m.Orphaned {
 		keep = false
 	}
 
 	if m.Subject != nil {
+		// Signatures and attestations are deleted along with their subject,
+		// not on their own account.
 		keep = true
 		p.Logger.Info("Keeping manifest with subject", "manifest", m)
 	}
 
-	if p.KeepYounger != 0 && !keep {
-		keep = m.Azure.LastUpdatedOn.Add(p.KeepYounger).After(now)
+	if !keep && !m.HasTimestamp() {
+		// Every age-based rule silently treats an unknown timestamp as the
+		// zero time, i.e. as infinitely old. Refuse to delete on that basis.
+		keep = true
+		p.Logger.Warn("Keeping manifest with no last-updated timestamp", "manifest", m)
+	}
+
+	if !keep && p.KeepYounger != 0 {
+		keep = m.LastUpdated().Add(p.KeepYounger).After(evaluator.now)
 	}
 
 	return keep
 }
 
-// keepWithDependencies marks ref and every manifest it transitively
+// keepWithDependencies marks the manifest and every manifest it transitively
 // references as kept.
-func (p *Pruner) keepWithDependencies(ref string, manifests map[string]*registry.Manifest, kept map[string]struct{}, repository string, rule *rules.RepoRule) error {
-	if _, ok := kept[ref]; ok {
+func (p *Pruner) keepWithDependencies(digest string, manifests map[string]*registry.Manifest, kept map[string]struct{}, rule *rules.RepoRule) error {
+	if _, ok := kept[digest]; ok {
 		return nil
 	}
-	kept[ref] = struct{}{}
 
-	m := manifests[ref]
+	m := manifests[digest]
 	if m == nil {
+		// Do not record a missing dependency as kept: len(kept) decides
+		// whether anything of the repository survives.
 		if rule.IgnoreMissingManifests {
-			p.Logger.Warn("Manifest missing", "manifest", ref)
+			p.Logger.Warn("Kept manifest depends on a missing manifest", "digest", digest)
 			return nil
 		}
-		return fmt.Errorf("manifest missing %s", ref)
+		return fmt.Errorf("manifest missing %s", digest)
 	}
+	kept[digest] = struct{}{}
+
 	for _, child := range m.Manifests {
-		if err := p.keepWithDependencies(registry.MakeRef(repository, string(child.Digest)), manifests, kept, repository, rule); err != nil {
+		if err := p.keepWithDependencies(string(child.Digest), manifests, kept, rule); err != nil {
 			return err
 		}
 	}

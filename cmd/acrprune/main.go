@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,34 +74,22 @@ func newCommand() *cli.Command {
 					if reg == nil {
 						return errRegistryRequired
 					}
-					var runningRules []*rules.RepoRule
-					if runningFile := cmd.String("running"); runningFile != "" {
-						f, err := os.Open(runningFile)
-						if err != nil {
-							return fmt.Errorf("failed to open running file: %w", err)
-						}
-						specs := rules.KeepRulesFromImageList(f, cmd.String("registry"))
-						_ = f.Close()
-						if runningRules, err = rules.Compile(specs); err != nil {
-							return err
-						}
+					runningRules, err := loadRunningRules(cmd.String("running"), cmd.String("registry"))
+					if err != nil {
+						return err
 					}
 
 					var out *os.File
 					var onUpdate func([]pruner.RepositoryStats) error
 					if outPath := cmd.String("output"); outPath != "" {
-						var err error
-						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
+						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
 							return err
 						}
 						defer func() { _ = out.Close() }()
 						// Rewrite the file after each repository so partial
 						// results survive an interrupted run.
 						onUpdate = func(stats []pruner.RepositoryStats) error {
-							if _, err := out.Seek(0, io.SeekStart); err != nil {
-								return err
-							}
-							return writeJSON(out, stats)
+							return rewriteJSON(out, stats)
 						}
 					}
 
@@ -111,7 +100,9 @@ func newCommand() *cli.Command {
 					if out == nil {
 						return writeJSON(os.Stdout, stats)
 					}
-					return nil
+					// Write once more so an empty registry still leaves valid
+					// JSON behind rather than an empty file.
+					return rewriteJSON(out, stats)
 				},
 			},
 			{
@@ -127,15 +118,17 @@ func newCommand() *cli.Command {
 					if reg == nil {
 						return errRegistryRequired
 					}
-					var in io.Reader = os.Stdin
-					if inPath := cmd.String("input"); inPath != "" {
-						f, err := os.Open(inPath)
-						if err != nil {
-							return err
-						}
-						defer func() { _ = f.Close() }()
-						in = f
+					keepYounger := cmd.Duration("keep-younger")
+					if keepYounger < 0 {
+						return errors.New("--keep-younger must not be negative")
 					}
+
+					in, closeIn, err := openInput(cmd.String("input"))
+					if err != nil {
+						return err
+					}
+					defer closeIn()
+
 					specs, err := rules.ParseSpecs(in)
 					if err != nil {
 						return err
@@ -149,7 +142,7 @@ func newCommand() *cli.Command {
 						Registry:      reg,
 						Logger:        logger,
 						DryRun:        cmd.Bool("dry-run"),
-						KeepYounger:   cmd.Duration("keep-younger"),
+						KeepYounger:   keepYounger,
 						IncludeLocked: cmd.Bool("include-locked"),
 					}
 					return p.Prune(ctx, ruleSet)
@@ -165,12 +158,14 @@ func newCommand() *cli.Command {
 					if cmd.String("registry") == "" {
 						return errRegistryRequired
 					}
-					specs := rules.KeepRulesFromImageList(os.Stdin, cmd.String("registry"))
+					specs, err := rules.KeepRulesFromImageList(os.Stdin, cmd.String("registry"))
+					if err != nil {
+						return err
+					}
 					logger.Debug("Built rules", "rules", len(specs))
 					out := os.Stdout
 					if outPath := cmd.String("output"); outPath != "" {
-						var err error
-						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644); err != nil {
+						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
 							return err
 						}
 						defer func() { _ = out.Close() }()
@@ -192,15 +187,12 @@ func newCommand() *cli.Command {
 					if inPath == "" {
 						inPath = cmd.Args().First()
 					}
-					var in io.Reader = os.Stdin
-					if inPath != "" {
-						f, err := os.Open(inPath)
-						if err != nil {
-							return err
-						}
-						defer func() { _ = f.Close() }()
-						in = f
+					in, closeIn, err := openInput(inPath)
+					if err != nil {
+						return err
 					}
+					defer closeIn()
+
 					stats, err := pruner.ReadStats(in)
 					if err != nil {
 						return err
@@ -208,7 +200,7 @@ func newCommand() *cli.Command {
 					if err := pruner.SortStatsBy(stats, cmd.String("sort")); err != nil {
 						return err
 					}
-					return pruner.WriteStatsTable(os.Stdout, stats, int(cmd.Int("top")))
+					return pruner.WriteStatsTable(os.Stdout, stats, cmd.Int("top"))
 				},
 			},
 		},
@@ -216,6 +208,16 @@ func newCommand() *cli.Command {
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
 			if cmd.Bool("verbose") {
 				logLevel.Set(slog.LevelDebug)
+			}
+
+			pageSize := cmd.Int("page-size")
+			if pageSize < 1 || pageSize > math.MaxInt32 {
+				return ctx, fmt.Errorf("--page-size must be between 1 and %d, got %d", math.MaxInt32, pageSize)
+			}
+			// A parallelism of zero would stall every download group forever.
+			parallelism := cmd.Int("parallelism")
+			if parallelism < 1 {
+				return ctx, fmt.Errorf("--parallelism must be at least 1, got %d", parallelism)
 			}
 
 			registryName := cmd.String("registry")
@@ -242,8 +244,8 @@ func newCommand() *cli.Command {
 				return ctx, err
 			}
 
-			reg = registry.New(client, logger, int(cmd.Int("page-size")), int(cmd.Int("parallelism")), cache)
-			return ctx, nil
+			reg, err = registry.New(client, logger, pageSize, parallelism, cache)
+			return ctx, err
 		},
 
 		Flags: []cli.Flag{
@@ -261,6 +263,38 @@ func newCommand() *cli.Command {
 	return cmd
 }
 
+// openInput opens path for reading, falling back to stdin when it is empty.
+// The returned function closes the file, and does nothing for stdin.
+func openInput(path string) (io.Reader, func(), error) {
+	if path == "" {
+		return os.Stdin, func() {}, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { _ = f.Close() }, nil
+}
+
+// loadRunningRules compiles the keep-rules describing the images listed in
+// path, or returns nil when no file was given.
+func loadRunningRules(path, registryName string) ([]*rules.RepoRule, error) {
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open running file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	specs, err := rules.KeepRulesFromImageList(f, registryName)
+	if err != nil {
+		return nil, err
+	}
+	return rules.Compile(specs)
+}
+
 // loginServerURL turns a bare registry name into its azurecr.io login server
 // URL; names containing a dot are treated as complete login servers, so
 // sovereign-cloud registries can be passed directly.
@@ -276,6 +310,18 @@ func writeJSON(w io.Writer, v any) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(data)
+	_, err = w.Write(append(data, '\n'))
 	return err
+}
+
+// rewriteJSON replaces the whole file with v, truncating whatever was there
+// before so a shorter document cannot leave a tail of the previous one behind.
+func rewriteJSON(f *os.File, v any) error {
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return writeJSON(f, v)
 }

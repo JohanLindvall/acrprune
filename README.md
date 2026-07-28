@@ -27,8 +27,8 @@ Two things follow from this:
 |------|-------|---------|-------------|
 | `--registry` | `-r` | *(required)*&nbsp;¹ | Registry name (`myreg`) or full login server (`myreg.azurecr.cn`) |
 | `--cache` | `-c` | | Local directory for caching downloaded manifests |
-| `--page-size` | `--pagesize` | `250` | Number of items per API page request |
-| `--parallelism` | | `16` | Number of concurrent API operations |
+| `--page-size` | `--pagesize` | `250` | Number of items per API page request (at least 1) |
+| `--parallelism` | | `16` | Number of concurrent API operations (at least 1) |
 | `--verbose` | `-v` | `false` | Enable debug logging |
 
 ¹ Required by commands that access the registry; local-only commands such as `top` run without it.
@@ -88,7 +88,7 @@ The output is a JSON array with one object per repository:
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Repository name |
-| `unique` | int | Bytes counted once per blob across the whole registry scan (deduplicated contribution) |
+| `unique` | int | Bytes counted once per blob (manifest document, config and layers) across the whole registry scan (deduplicated contribution) |
 | `total` | int | Bytes counting every reference, without cross-repository deduplication |
 | `shared` | float | Fraction of `total` bytes shared with other manifests/repos (`1 - unique/total`) |
 | `tagged` | int | Number of tagged manifests |
@@ -100,7 +100,7 @@ The output is a JSON array with one object per repository:
 
 ### `generate`
 
-Reads a list of `registry.azurecr.io/repo:tag` image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos).
+Reads a list of `registry.azurecr.io/repo:tag` image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos). References for other registries, and untagged (digest-only) references, are ignored. The input need not be sorted or deduplicated: each repository yields exactly one rule listing all of its tags.
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
@@ -173,7 +173,7 @@ Rules are a JSON array of repository rules. Each rule matches repositories by re
 |-------|------|---------|-------------|
 | `tag` | string | *(match all)* | Regex to match tag names |
 | `arch` | string | *(match all)* | Regex to match architecture (e.g. `amd64`, `arm64`) |
-| `newest` | int | | Keep/match only the N newest manifests. Negative value excludes the N newest |
+| `newest` | int | | Match only the N newest of the manifests this rule matches. Negative value excludes the N newest |
 | `match_newer` | string | | Match manifests newer than this duration (e.g. `24h`, `30d`) |
 | `match_older` | string | | Match manifests older than this duration |
 | `keep` | bool | `true` | Whether matching manifests are kept or deleted |
@@ -185,6 +185,17 @@ Same as tagged rules but without the `tag` field.
 ### Rule Evaluation
 
 Rules are evaluated in order. The first matching rule determines whether a manifest is kept or deleted. If no rule matches, the manifest is kept. Duration values support Go duration syntax (`24h`, `168h`) and extended syntax with days and weeks (`14d`, `2w`).
+
+`newest` ranks a manifest against the other manifests **the same rule matches**, not against the whole repository. So the pair of rules below keeps the three most recent release images however many newer feature-branch images sit alongside them:
+
+```json
+"tagged": [
+  { "tag": "^release-", "newest": 3, "keep": true },
+  { "tag": ".+", "keep": false }
+]
+```
+
+Manifests of equal age are ranked by digest, so repeated runs over an unchanged repository always decide the same way.
 
 ## Included Rule Examples
 
@@ -201,7 +212,9 @@ Rules are evaluated in order. The first matching rule determines whether a manif
 - Repositories that have no manifests after download are deleted entirely (respecting `--dry-run`).
 - Manifests with a `subject` field (e.g. signatures, attestations) are always kept.
 - The `--keep-younger` grace period overrides rule decisions — recently updated manifests are never deleted.
-- When every rule targets a literal repository name (`^name$`), only those repositories are fetched instead of listing the whole registry.
+- A manifest the registry reports no last-updated time for is never deleted, since every age-based rule would otherwise read it as infinitely old.
+- A manifest is orphaned when something it references is missing, and the flag propagates both up to the indexes referencing it and down to its children — but a child still reachable through a healthy index is not orphaned by a broken sibling.
+- When every rule targets a literal repository name (`^name$`), only those repositories are fetched instead of listing the whole registry. A pattern containing an active metacharacter is not a literal name: `^my.repo$` matches `myXrepo` too, so it is resolved by listing the catalog. Write `^my\.repo$` (what `generate` emits) to address a repository with a dot in its name directly.
 - Cached manifests are stored under `<cache>/<registry>/` and are removed from cache when deleted from the registry.
 
 ## Package Layout
@@ -218,3 +231,7 @@ Rules are evaluated in order. The first matching rule determines whether a manif
 - https://github.com/Azure/acr-cli
 
 This however lacks the rules and robustness, making it unusable for larger registries.
+
+## License
+
+[MIT](LICENSE)

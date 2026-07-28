@@ -1,41 +1,58 @@
 package registry
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-func TestRefRoundtrip(t *testing.T) {
-	ref := MakeRef("myrepo", "sha256:abc")
-	if ref != "myrepo@sha256:abc" {
-		t.Errorf("MakeRef = %q", ref)
-	}
-	repo, digest := ParseRef(ref)
-	if repo != "myrepo" || digest != "sha256:abc" {
-		t.Errorf("ParseRef = %q, %q", repo, digest)
-	}
-	repo, digest = ParseRef("no-at-sign")
-	if repo != "" || digest != "" {
-		t.Errorf("malformed ref should yield empty strings, got %q, %q", repo, digest)
+func TestRef(t *testing.T) {
+	m := &Manifest{Repository: "myrepo", Digest: "sha256:abc"}
+	if got := m.Ref(); got != "myrepo@sha256:abc" {
+		t.Errorf("Ref = %q", got)
 	}
 }
 
 func TestTags(t *testing.T) {
 	m := &Manifest{Azure: &azcontainerregistry.ManifestAttributes{
-		Tags: []*string{to.Ptr("latest"), to.Ptr("v1")},
+		Tags: []*string{to.Ptr("latest"), nil, to.Ptr("v1")},
 	}}
 	if got := m.Tags(); strings.Join(got, ",") != "latest,v1" {
 		t.Errorf("Tags = %v", got)
 	}
 	if got := (&Manifest{}).Tags(); len(got) != 0 {
 		t.Errorf("manifest without attributes should yield no tags, got %v", got)
+	}
+}
+
+func TestLastUpdated(t *testing.T) {
+	now := time.Now()
+	m := &Manifest{Azure: &azcontainerregistry.ManifestAttributes{LastUpdatedOn: &now}}
+	if !m.HasTimestamp() || !m.LastUpdated().Equal(now) {
+		t.Errorf("LastUpdated = %v, HasTimestamp = %v", m.LastUpdated(), m.HasTimestamp())
+	}
+
+	// A manifest the registry reported no timestamp for must not panic and
+	// must not claim to have one: age rules would read the zero time as
+	// "infinitely old" and delete it.
+	for _, m := range []*Manifest{
+		{},
+		{Azure: &azcontainerregistry.ManifestAttributes{}},
+		{Azure: &azcontainerregistry.ManifestAttributes{LastUpdatedOn: &time.Time{}}},
+	} {
+		if m.HasTimestamp() {
+			t.Errorf("%+v should not report a timestamp", m.Azure)
+		}
+		if !m.LastUpdated().IsZero() {
+			t.Errorf("LastUpdated = %v, want zero time", m.LastUpdated())
+		}
 	}
 }
 
@@ -49,6 +66,7 @@ func TestArchitectures(t *testing.T) {
 				{Platform: &v1.Platform{Architecture: "amd64"}},
 				{Platform: &v1.Platform{Architecture: "unknown"}},
 				{Platform: &v1.Platform{Architecture: "arm64"}},
+				{Platform: &v1.Platform{Architecture: "amd64"}}, // duplicate
 				{Platform: nil},
 			},
 		},
@@ -65,7 +83,7 @@ func TestArchitectures(t *testing.T) {
 
 func TestLogValueIncludesUpdated(t *testing.T) {
 	now := time.Now()
-	m := &Manifest{Ref: "r@d", Azure: &azcontainerregistry.ManifestAttributes{LastUpdatedOn: &now}}
+	m := &Manifest{Repository: "r", Digest: "d", Azure: &azcontainerregistry.ManifestAttributes{LastUpdatedOn: &now}}
 	attrs := m.LogValue().Group()
 	if len(attrs) != 2 || attrs[0].Key != "ref" || attrs[1].Key != "updated" {
 		t.Errorf("LogValue = %v", attrs)
@@ -95,7 +113,7 @@ func TestLocked(t *testing.T) {
 }
 
 func TestLogValueIncludesLocked(t *testing.T) {
-	m := &Manifest{Ref: "r@d", Azure: &azcontainerregistry.ManifestAttributes{
+	m := &Manifest{Repository: "r", Digest: "d", Azure: &azcontainerregistry.ManifestAttributes{
 		ChangeableAttributes: &azcontainerregistry.ManifestWriteableProperties{CanDelete: to.Ptr(false)},
 	}}
 	found := false
@@ -109,34 +127,43 @@ func TestLogValueIncludesLocked(t *testing.T) {
 	}
 }
 
-func TestCache(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "sub") // exercise MkdirAll in Put
-	c := NewCache(dir)
-	if c.Get("sha256:x") != nil {
-		t.Error("empty cache should miss")
+func TestIsPermissionError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"forbidden", &azcore.ResponseError{StatusCode: 403}, true},
+		{"unauthorized", &azcore.ResponseError{StatusCode: 401}, true},
+		{"wrapped forbidden", fmt.Errorf("prune failed: %w", &azcore.ResponseError{StatusCode: 403}), true},
+		{"not found", &azcore.ResponseError{StatusCode: 404}, false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
 	}
-	c.Put("sha256:x", []byte("data"))
-	if string(c.Get("sha256:x")) != "data" {
-		t.Error("cache should hit after Put")
-	}
-	c.Remove("sha256:x")
-	if c.Get("sha256:x") != nil {
-		t.Error("cache should miss after Remove")
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Errorf("cache dir should exist: %v", err)
+	for _, tt := range tests {
+		if got := IsPermissionError(tt.err); got != tt.want {
+			t.Errorf("%s: IsPermissionError = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
-func TestNilCache(t *testing.T) {
-	c := NewCache("")
-	if c != nil {
-		t.Fatal("empty dir should yield nil cache")
+func TestNewRejectsUnusableLimits(t *testing.T) {
+	tests := []struct {
+		name                  string
+		pageSize, parallelism int
+	}{
+		// A limit of zero makes errgroup.Go block forever.
+		{"zero parallelism", 250, 0},
+		{"negative parallelism", 250, -1},
+		{"zero page size", 0, 16},
+		{"page size overflowing int32", 1 << 40, 16},
 	}
-	// All operations must be nil-safe no-ops.
-	c.Put("d", []byte("x"))
-	if c.Get("d") != nil {
-		t.Error("nil cache should always miss")
+	for _, tt := range tests {
+		if _, err := New(nil, nil, tt.pageSize, tt.parallelism, nil); err == nil {
+			t.Errorf("%s: New should have failed", tt.name)
+		}
 	}
-	c.Remove("d")
+	if _, err := New(nil, nil, 250, 16, nil); err != nil {
+		t.Errorf("valid limits rejected: %v", err)
+	}
 }

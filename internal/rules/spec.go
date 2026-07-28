@@ -6,41 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"time"
-
-	str2duration "github.com/xhit/go-str2duration/v2"
 )
-
-// Duration unmarshals from Go duration syntax ("24h"), extended syntax with
-// days and weeks ("30d", "2w") or a plain number of nanoseconds.
-type Duration struct {
-	time.Duration
-}
-
-func (d Duration) MarshalJSON() ([]byte, error) {
-	return json.Marshal(d.String())
-}
-
-func (d *Duration) UnmarshalJSON(b []byte) error {
-	var v interface{}
-	if err := json.Unmarshal(b, &v); err != nil {
-		return err
-	}
-	switch value := v.(type) {
-	case float64:
-		d.Duration = time.Duration(value)
-		return nil
-	case string:
-		var err error
-		d.Duration, err = str2duration.ParseDuration(value)
-		if err != nil {
-			d.Duration, err = time.ParseDuration(value)
-		}
-		return err
-	default:
-		return errors.New("invalid duration")
-	}
-}
 
 // CommonRuleSpec holds the match criteria shared by tagged and untagged rules.
 type CommonRuleSpec struct {
@@ -70,14 +36,18 @@ type RepoRuleSpec struct {
 	Tagged                  []*TaggedRuleSpec   `json:"tagged,omitempty"`
 }
 
-// ParseSpecs decodes a JSON array of repository rule specs, rejecting
-// unknown fields.
+// ParseSpecs decodes a JSON array of repository rule specs, rejecting unknown
+// fields and trailing content so a malformed rule file cannot be silently
+// truncated into a rule set that deletes more than intended.
 func ParseSpecs(r io.Reader) ([]*RepoRuleSpec, error) {
 	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	var specs []*RepoRuleSpec
 	if err := dec.Decode(&specs); err != nil {
 		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("unexpected trailing content after the rule array")
 	}
 	return specs, nil
 }

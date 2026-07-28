@@ -59,7 +59,8 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 }
 
 // countRunning counts tagged manifests whose first matching tag rule keeps
-// them, i.e. images that appear in the running set.
+// them, i.e. images that appear in the running set. Only the tag is consulted,
+// which is all the rules generated from an image list constrain.
 func countRunning(manifests map[string]*registry.Manifest, repository string, ruleSet []*rules.RepoRule) int {
 	running := 0
 	for _, m := range manifests {
@@ -91,42 +92,50 @@ func calculateStats(repository string, manifests []*registry.Manifest) Repositor
 	return calculateStatsSeen(repository, manifests, map[string]struct{}{})
 }
 
-// calculateStatsSeen summarizes manifests; blobs whose digest is already in
-// seen count towards Total but not Unique.
+// calculateStatsSeen summarizes manifests, counting each blob — the manifest
+// document itself, its config and its layers — towards Unique only the first
+// time that digest is seen. Repeats still count towards Total, so Shared is
+// the fraction of bytes a repository holds in common with what came before it.
 func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen map[string]struct{}) RepositoryStats {
-	seen[""] = struct{}{}
 	var unique, total uint64
 	var tagged, untagged int
 	var newest, oldest time.Time
+
+	// count adds a blob, charging it to Unique unless its digest is a repeat.
+	count := func(digest string, size uint64) {
+		total += size
+		if digest != "" {
+			if _, repeat := seen[digest]; repeat {
+				return
+			}
+			seen[digest] = struct{}{}
+		}
+		// A blob the manifest states no digest for cannot be shown to be a
+		// duplicate, so it counts in full.
+		unique += size
+	}
+
 	for _, m := range manifests {
-		if len(m.Azure.Tags) > 0 {
+		if len(m.Tags()) > 0 {
 			tagged++
 		} else {
 			untagged++
 		}
-		if newest.IsZero() || m.Azure.LastUpdatedOn.After(newest) {
-			newest = *m.Azure.LastUpdatedOn
-		}
-		if oldest.IsZero() || m.Azure.LastUpdatedOn.Before(oldest) {
-			oldest = *m.Azure.LastUpdatedOn
-		}
-		unique += m.Size
-		total += m.Size
-		if m.Config != nil {
-			dig := string(m.Config.Digest)
-			if _, ok := seen[dig]; !ok {
-				seen[dig] = struct{}{}
-				unique += uint64(m.Config.Size)
+		if updated := m.LastUpdated(); m.HasTimestamp() {
+			if newest.IsZero() || updated.After(newest) {
+				newest = updated
 			}
-			total += uint64(m.Config.Size)
+			if oldest.IsZero() || updated.Before(oldest) {
+				oldest = updated
+			}
+		}
+
+		count(m.Digest, m.Size)
+		if m.Config != nil {
+			count(string(m.Config.Digest), uint64(m.Config.Size))
 		}
 		for _, layer := range m.Layers {
-			dig := string(layer.Digest)
-			if _, ok := seen[dig]; !ok {
-				seen[dig] = struct{}{}
-				unique += uint64(layer.Size)
-			}
-			total += uint64(layer.Size)
+			count(string(layer.Digest), uint64(layer.Size))
 		}
 	}
 

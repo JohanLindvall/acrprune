@@ -1,15 +1,14 @@
 package pruner
 
 import (
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -18,9 +17,12 @@ import (
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
 
-func testManifest(ref string, updated time.Time, tags ...string) *registry.Manifest {
+// testManifest builds a manifest in repository "r" with the given digest,
+// last-updated time and tags.
+func testManifest(digest string, updated time.Time, tags ...string) *registry.Manifest {
 	m := &registry.Manifest{
-		Ref: ref,
+		Repository: "r",
+		Digest:     digest,
 		Azure: &azcontainerregistry.ManifestAttributes{
 			LastUpdatedOn: &updated,
 		},
@@ -29,6 +31,15 @@ func testManifest(ref string, updated time.Time, tags ...string) *registry.Manif
 		m.Azure.Tags = append(m.Azure.Tags, to.Ptr(tag))
 	}
 	return m
+}
+
+// byDigest keys manifests the way a repository fetch does.
+func byDigest(manifests ...*registry.Manifest) map[string]*registry.Manifest {
+	result := map[string]*registry.Manifest{}
+	for _, m := range manifests {
+		result[m.Digest] = m
+	}
+	return result
 }
 
 func testPruner() *Pruner {
@@ -44,86 +55,23 @@ func compileRule(t *testing.T, spec *rules.RepoRuleSpec) *rules.RepoRule {
 	return rule
 }
 
-func TestMatchesNewest(t *testing.T) {
-	now := time.Now()
-	a := testManifest("r@a", now)
-	b := testManifest("r@b", now.Add(-time.Hour))
-	c := testManifest("r@c", now.Add(-2*time.Hour))
-	all := []*registry.Manifest{a, b, c}
-
-	tests := []struct {
-		name   string
-		in     *registry.Manifest
-		newest int
-		want   bool
-	}{
-		{"first of 2 newest", a, 2, true},
-		{"second of 2 newest", b, 2, true},
-		{"third not in 2 newest", c, 2, false},
-		{"newest larger than len", c, 5, true},
-		{"exclude 1 newest, a excluded", a, -1, false},
-		{"exclude 1 newest, b included", b, -1, true},
-		{"exclude more than len", a, -5, false},
-		{"zero never matches", a, 0, false},
+// decide runs the pruner's decision over a manifest map, returning the kept
+// digests sorted for comparison.
+func decideDigests(t *testing.T, p *Pruner, manifests map[string]*registry.Manifest, rule *rules.RepoRule) []string {
+	t.Helper()
+	all := slices.SortedFunc(maps.Values(manifests), byNewest)
+	kept, err := p.decide(all, manifests, rule)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		if got := matchesNewest(tt.in, all, tt.newest); got != tt.want {
-			t.Errorf("%s: matchesNewest = %v, want %v", tt.name, got, tt.want)
-		}
-	}
+	return slices.Sorted(maps.Keys(kept))
 }
 
-func TestCommonRuleMatches(t *testing.T) {
-	now := time.Now()
-	old := testManifest("r@old", now.Add(-100*24*time.Hour))
-	fresh := testManifest("r@fresh", now.Add(-time.Hour))
-	ordered := []*registry.Manifest{fresh, old}
-
-	compile := func(spec rules.CommonRuleSpec) rules.CommonRule {
-		rule := compileRule(t, &rules.RepoRuleSpec{Untagged: []*rules.UntaggedRuleSpec{{CommonRuleSpec: spec}}})
-		return rule.Untagged[0].CommonRule
+func splitList(s string) []string {
+	if s == "" {
+		return nil
 	}
-	duration := func(d time.Duration) *rules.Duration {
-		return &rules.Duration{Duration: d}
-	}
-
-	// Empty rule matches everything.
-	if !commonRuleMatches(compile(rules.CommonRuleSpec{}), old, ordered, now) {
-		t.Error("empty rule should match")
-	}
-
-	older := compile(rules.CommonRuleSpec{MatchOlderThan: duration(30 * 24 * time.Hour)})
-	if !commonRuleMatches(older, old, ordered, now) {
-		t.Error("old manifest should match match_older=30d")
-	}
-	if commonRuleMatches(older, fresh, ordered, now) {
-		t.Error("fresh manifest should not match match_older=30d")
-	}
-
-	newer := compile(rules.CommonRuleSpec{MatchNewerThan: duration(24 * time.Hour)})
-	if !commonRuleMatches(newer, fresh, ordered, now) {
-		t.Error("fresh manifest should match match_newer=24h")
-	}
-	if commonRuleMatches(newer, old, ordered, now) {
-		t.Error("old manifest should not match match_newer=24h")
-	}
-
-	newest := compile(rules.CommonRuleSpec{MatchNewest: to.Ptr(1)})
-	if !commonRuleMatches(newest, fresh, ordered, now) {
-		t.Error("fresh should be in the 1 newest")
-	}
-	if commonRuleMatches(newest, old, ordered, now) {
-		t.Error("old should not be in the 1 newest")
-	}
-
-	arm := testManifest("r@arm", now)
-	arm.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureArm64)
-	if !commonRuleMatches(compile(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("arm64")}), arm, ordered, now) {
-		t.Error("arm64 manifest should match arch regex arm64")
-	}
-	if commonRuleMatches(compile(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("amd64")}), arm, ordered, now) {
-		t.Error("arm64 manifest should not match arch regex amd64")
-	}
+	return strings.Split(s, ",")
 }
 
 func TestShouldKeep(t *testing.T) {
@@ -140,104 +88,99 @@ func TestShouldKeep(t *testing.T) {
 	})
 
 	old := now.Add(-48 * time.Hour)
-	release := testManifest("r@1", old, "release-1.0")
-	feature := testManifest("r@2", old, "feature-x")
-	untagged := testManifest("r@3", old)
-	unmatchedTag := testManifest("r@4", old, "v1")
+	release := testManifest("1", old, "release-1.0")
+	feature := testManifest("2", old, "feature-x")
+	untagged := testManifest("3", old)
+	unmatchedTag := testManifest("4", old, "v1")
+	all := []*registry.Manifest{release, feature, untagged, unmatchedTag}
 
-	if !p.shouldKeep(release, rule, nil, nil, now) {
+	shouldKeep := func(m *registry.Manifest, rule *rules.RepoRule, manifests []*registry.Manifest) bool {
+		return p.shouldKeep(m, newEvaluator(rule, manifests, now), rule)
+	}
+
+	if !shouldKeep(release, rule, all) {
 		t.Error("release tag should be kept")
 	}
-	if p.shouldKeep(feature, rule, nil, nil, now) {
+	if shouldKeep(feature, rule, all) {
 		t.Error("feature tag should be deleted")
 	}
-	if p.shouldKeep(untagged, rule, nil, nil, now) {
+	if shouldKeep(untagged, rule, all) {
 		t.Error("untagged should be deleted")
 	}
-	if p.shouldKeep(unmatchedTag, rule, nil, nil, now) {
+	if shouldKeep(unmatchedTag, rule, all) {
 		t.Error("catch-all tag rule should delete v1")
 	}
 
 	// No matching rule at all keeps the manifest.
 	empty := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
-	if !p.shouldKeep(feature, empty, nil, nil, now) {
+	if !shouldKeep(feature, empty, all) {
 		t.Error("manifest with no matching rule should be kept")
 	}
 
 	// Manifests with a subject are always kept.
-	signature := testManifest("r@5", old, "feature-x")
+	signature := testManifest("5", old, "feature-x")
 	signature.Subject = &v1.Descriptor{Digest: "sha256:parent"}
-	if !p.shouldKeep(signature, rule, nil, nil, now) {
+	if !shouldKeep(signature, rule, append(slices.Clone(all), signature)) {
 		t.Error("manifest with subject should always be kept")
 	}
 
 	// The grace period overrides deletion.
 	p.KeepYounger = 24 * time.Hour
-	young := testManifest("r@6", now.Add(-time.Hour), "feature-x")
-	if !p.shouldKeep(young, rule, nil, nil, now) {
+	young := testManifest("6", now.Add(-time.Hour), "feature-x")
+	if !shouldKeep(young, rule, append(slices.Clone(all), young)) {
 		t.Error("young manifest should be kept by grace period")
 	}
-	if p.shouldKeep(feature, rule, nil, nil, now) {
+	if shouldKeep(feature, rule, all) {
 		t.Error("old manifest should still be deleted with grace period set")
 	}
 	p.KeepYounger = 0
 
 	// Orphan deletion overrides a keep decision.
 	orphanRule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", DeleteOrphanedManifests: to.Ptr(true)})
-	orphan := testManifest("r@7", old, "release-1.0")
+	orphan := testManifest("7", old, "release-1.0")
 	orphan.Orphaned = true
-	if p.shouldKeep(orphan, orphanRule, nil, nil, now) {
+	if shouldKeep(orphan, orphanRule, []*registry.Manifest{orphan}) {
 		t.Error("orphaned manifest should be deleted when delete_orphaned_manifests is set")
 	}
 }
 
-func TestMarkOrphans(t *testing.T) {
-	index := testManifest("r@sha256:idx", time.Now(), "latest")
-	index.Manifests = []v1.Descriptor{{Digest: "sha256:child"}, {Digest: "sha256:missing"}}
-	child := testManifest("r@sha256:child", time.Now())
-	grandIndex := testManifest("r@sha256:top", time.Now())
-	grandIndex.Manifests = []v1.Descriptor{{Digest: "sha256:idx"}}
-	standalone := testManifest("r@sha256:alone", time.Now())
+// TestShouldKeepWithoutTimestamp guards against deleting a manifest on the
+// strength of an age rule the registry gave us no age for: the zero time would
+// otherwise read as infinitely old.
+func TestShouldKeepWithoutTimestamp(t *testing.T) {
+	now := time.Now()
+	p := testPruner()
+	rule := compileRule(t, &rules.RepoRuleSpec{
+		RepoRegex: ".+",
+		Untagged: []*rules.UntaggedRuleSpec{
+			{CommonRuleSpec: rules.CommonRuleSpec{MatchOlderThan: &rules.Duration{Duration: time.Hour}, Keep: to.Ptr(false)}},
+		},
+	})
 
-	manifests := map[string]*registry.Manifest{
-		index.Ref:      index,
-		child.Ref:      child,
-		grandIndex.Ref: grandIndex,
-		standalone.Ref: standalone,
-	}
-	markOrphans(manifests, "r")
+	undated := &registry.Manifest{Repository: "r", Digest: "undated"}
+	dated := testManifest("dated", now.Add(-48*time.Hour))
+	all := []*registry.Manifest{undated, dated}
+	e := newEvaluator(rule, all, now)
 
-	if !index.Orphaned {
-		t.Error("index with a missing child should be orphaned")
+	if !p.shouldKeep(undated, e, rule) {
+		t.Error("a manifest with no last-updated timestamp must not be deleted by an age rule")
 	}
-	if !grandIndex.Orphaned {
-		t.Error("orphaned state should propagate up to the referencing index")
-	}
-	if !child.Orphaned {
-		t.Error("children of an orphaned index should be orphaned")
-	}
-	if standalone.Orphaned {
-		t.Error("standalone manifest should not be orphaned")
-	}
-	if !child.HasOwner || !index.HasOwner {
-		t.Error("referenced manifests should be marked as owned")
-	}
-	if grandIndex.HasOwner || standalone.HasOwner {
-		t.Error("unreferenced manifests should not be marked as owned")
+	if p.shouldKeep(dated, e, rule) {
+		t.Error("a manifest older than match_older should be deleted")
 	}
 }
 
 func TestKeepWithDependencies(t *testing.T) {
 	p := testPruner()
-	index := testManifest("r@sha256:idx", time.Now(), "latest")
-	index.Manifests = []v1.Descriptor{{Digest: "sha256:a"}, {Digest: "sha256:b"}}
-	a := testManifest("r@sha256:a", time.Now())
-	b := testManifest("r@sha256:b", time.Now())
-	manifests := map[string]*registry.Manifest{index.Ref: index, a.Ref: a, b.Ref: b}
+	index := testManifest("idx", time.Now(), "latest")
+	index.Manifests = []v1.Descriptor{{Digest: "a"}, {Digest: "b"}}
+	a := testManifest("a", time.Now())
+	b := testManifest("b", time.Now())
+	manifests := byDigest(index, a, b)
 
 	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
 	kept := map[string]struct{}{}
-	if err := p.keepWithDependencies(index.Ref, manifests, kept, "r", rule); err != nil {
+	if err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
 		t.Fatal(err)
 	}
 	if len(kept) != 3 {
@@ -245,24 +188,70 @@ func TestKeepWithDependencies(t *testing.T) {
 	}
 
 	// A missing dependency fails unless ignore_missing_manifests is set.
-	index.Manifests = append(index.Manifests, v1.Descriptor{Digest: "sha256:gone"})
+	index.Manifests = append(index.Manifests, v1.Descriptor{Digest: "gone"})
 	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false)})
-	if err := p.keepWithDependencies(index.Ref, manifests, map[string]struct{}{}, "r", strict); err == nil {
+	if err := p.keepWithDependencies(index.Digest, manifests, map[string]struct{}{}, strict); err == nil {
 		t.Error("missing dependency should fail in strict mode")
 	}
-	if err := p.keepWithDependencies(index.Ref, manifests, map[string]struct{}{}, "r", rule); err != nil {
+
+	kept = map[string]struct{}{}
+	if err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
 		t.Errorf("missing dependency should be tolerated by default: %v", err)
+	}
+	// The missing digest must not be recorded as kept: an empty repository is
+	// recognized by nothing being left in the kept set.
+	if _, ok := kept["gone"]; ok {
+		t.Errorf("a missing dependency should not count as kept: %v", slices.Sorted(maps.Keys(kept)))
+	}
+	if len(kept) != 3 {
+		t.Errorf("kept = %v, want the 3 manifests that exist", slices.Sorted(maps.Keys(kept)))
+	}
+}
+
+// TestKeepWithDependenciesCycle checks that a manifest cycle terminates.
+func TestKeepWithDependenciesCycle(t *testing.T) {
+	p := testPruner()
+	a := testManifest("a", time.Now(), "latest")
+	b := testManifest("b", time.Now())
+	a.Manifests = []v1.Descriptor{{Digest: "b"}}
+	b.Manifests = []v1.Descriptor{{Digest: "a"}}
+
+	kept := map[string]struct{}{}
+	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
+	if err := p.keepWithDependencies("a", byDigest(a, b), kept, rule); err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != 2 {
+		t.Errorf("kept = %v, want both", slices.Sorted(maps.Keys(kept)))
+	}
+}
+
+func TestDecideKeepsDependencies(t *testing.T) {
+	now := time.Now()
+	p := testPruner()
+
+	index := testManifest("idx", now, "latest")
+	index.Manifests = []v1.Descriptor{{Digest: "child"}}
+	child := testManifest("child", now) // untagged, and the untagged rule deletes
+
+	rule := compileRule(t, &rules.RepoRuleSpec{
+		RepoRegex: ".+",
+		Untagged:  []*rules.UntaggedRuleSpec{{CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}}},
+	})
+
+	got := decideDigests(t, p, byDigest(index, child), rule)
+	if strings.Join(got, ",") != "child,idx" {
+		t.Errorf("kept = %v, want the index and the child it references", got)
 	}
 }
 
 func TestDecideMustDeleteEverything(t *testing.T) {
 	p := testPruner()
 	now := time.Now()
-	keep := testManifest("r@sha256:keep", now, "arm64-app")
+	keep := testManifest("keep", now, "arm64-app")
 	keep.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureArm64)
-	deletable := testManifest("r@sha256:del", now.Add(-time.Hour), "amd64-app")
+	deletable := testManifest("del", now.Add(-time.Hour), "amd64-app")
 	deletable.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureAmd64)
-	manifests := map[string]*registry.Manifest{keep.Ref: keep, deletable.Ref: deletable}
 
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex:            ".+",
@@ -273,102 +262,12 @@ func TestDecideMustDeleteEverything(t *testing.T) {
 		},
 	})
 
-	kept, err := p.decide(manifests, "r", rule)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(kept) != 2 {
-		t.Errorf("must_delete_everything with one kept manifest should keep all, kept = %v", kept)
+	if got := decideDigests(t, p, byDigest(keep, deletable), rule); len(got) != 2 {
+		t.Errorf("must_delete_everything with one kept manifest should keep all, kept = %v", got)
 	}
 
 	// Without the arm64 manifest everything goes.
-	delete(manifests, keep.Ref)
-	kept, err = p.decide(manifests, "r", rule)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(kept) != 0 {
-		t.Errorf("amd64-only repo should be fully deleted, kept = %v", kept)
-	}
-}
-
-func TestCountRunning(t *testing.T) {
-	now := time.Now()
-	running := testManifest("r@1", now, "v1")
-	stopped := testManifest("r@2", now, "v9")
-	untagged := testManifest("r@3", now)
-	manifests := map[string]*registry.Manifest{running.Ref: running, stopped.Ref: stopped, untagged.Ref: untagged}
-
-	specs := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg")
-	ruleSet, err := rules.Compile(specs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := countRunning(manifests, "app", ruleSet); got != 1 {
-		t.Errorf("countRunning = %d, want 1 (only v1 is running; the catch-all delete rule must not count)", got)
-	}
-	if got := countRunning(manifests, "other", ruleSet); got != 0 {
-		t.Errorf("countRunning for unmatched repo = %d, want 0", got)
-	}
-}
-
-func TestIsPermissionError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"forbidden", &azcore.ResponseError{StatusCode: 403}, true},
-		{"unauthorized", &azcore.ResponseError{StatusCode: 401}, true},
-		{"wrapped forbidden", fmt.Errorf("prune failed: %w", &azcore.ResponseError{StatusCode: 403}), true},
-		{"not found", &azcore.ResponseError{StatusCode: 404}, false},
-		{"plain error", errors.New("boom"), false},
-		{"nil", nil, false},
-	}
-	for _, tt := range tests {
-		if got := isPermissionError(tt.err); got != tt.want {
-			t.Errorf("%s: isPermissionError = %v, want %v", tt.name, got, tt.want)
-		}
-	}
-}
-
-func TestCalculateStats(t *testing.T) {
-	now := time.Now()
-	older := now.Add(-time.Hour)
-
-	m1 := testManifest("r@1", now, "latest")
-	m1.Size = 100
-	m1.Config = &v1.Descriptor{Digest: "sha256:cfg", Size: 10}
-	m1.Layers = []v1.Descriptor{
-		{Digest: "sha256:l1", Size: 1000},
-		{Digest: "sha256:l2", Size: 2000},
-	}
-
-	m2 := testManifest("r@2", older)
-	m2.Size = 50
-	m2.Config = &v1.Descriptor{Digest: "sha256:cfg2", Size: 20}
-	m2.Layers = []v1.Descriptor{
-		{Digest: "sha256:l1", Size: 1000}, // shared with m1
-	}
-
-	stats := calculateStats("myrepo", []*registry.Manifest{m1, m2})
-	if stats.Name != "myrepo" {
-		t.Errorf("Name = %q", stats.Name)
-	}
-	if stats.Count != 2 || stats.Tagged != 1 || stats.Untagged != 1 {
-		t.Errorf("Count/Tagged/Untagged = %d/%d/%d, want 2/1/1", stats.Count, stats.Tagged, stats.Untagged)
-	}
-	wantTotal := uint64(100 + 10 + 1000 + 2000 + 50 + 20 + 1000)
-	wantUnique := uint64(100 + 10 + 1000 + 2000 + 50 + 20) // second l1 not counted
-	if stats.Total != wantTotal || stats.Unique != wantUnique {
-		t.Errorf("Total/Unique = %d/%d, want %d/%d", stats.Total, stats.Unique, wantTotal, wantUnique)
-	}
-	if !stats.Newest.Equal(now) || !stats.Oldest.Equal(older) {
-		t.Errorf("Newest/Oldest = %v/%v", stats.Newest, stats.Oldest)
-	}
-
-	if empty := calculateStats("empty", nil); empty.Shared != 0 {
-		t.Errorf("empty repository Shared = %v, want 0", empty.Shared)
+	if got := decideDigests(t, p, byDigest(deletable), rule); len(got) != 0 {
+		t.Errorf("amd64-only repo should be fully deleted, kept = %v", got)
 	}
 }

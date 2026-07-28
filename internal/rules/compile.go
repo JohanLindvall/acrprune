@@ -1,21 +1,20 @@
 package rules
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
-	"strings"
 	"time"
 )
-
-// literalRepoName matches repository patterns that are plain names rather
-// than regexes needing a full registry listing to resolve.
-var literalRepoName = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
 
 // CommonRule is the compiled form of CommonRuleSpec. A nil regexp matches
 // anything.
 type CommonRule struct {
-	Architecture   *regexp.Regexp
-	MatchNewest    int // >0: only the N newest; <0: all but the N newest; 0: no constraint
+	Architecture *regexp.Regexp
+	// MatchNewest ranks a manifest against the other manifests this same rule
+	// matches: >0 selects the N newest of them, <0 selects all but the N
+	// newest, 0 imposes no constraint.
+	MatchNewest    int
 	MatchNewerThan time.Duration
 	MatchOlderThan time.Duration
 	Keep           bool
@@ -39,21 +38,6 @@ type RepoRule struct {
 	Tagged                  []TaggedRule
 }
 
-// LiteralRepoName reports whether the rule's repository pattern is a plain
-// anchored name (^name$) and returns that name, allowing callers to skip
-// listing the whole registry.
-func (r *RepoRule) LiteralRepoName() (string, bool) {
-	pattern := r.Repo.String()
-	if !strings.HasPrefix(pattern, "^") || !strings.HasSuffix(pattern, "$") {
-		return "", false
-	}
-	name := pattern[1 : len(pattern)-1]
-	if !literalRepoName.MatchString(name) {
-		return "", false
-	}
-	return name, true
-}
-
 // Compile validates and compiles a slice of rule specs.
 func Compile(specs []*RepoRuleSpec) ([]*RepoRule, error) {
 	result := make([]*RepoRule, len(specs))
@@ -69,6 +53,11 @@ func Compile(specs []*RepoRuleSpec) ([]*RepoRule, error) {
 
 // Compile validates the spec's regexes and applies defaults.
 func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
+	// An empty pattern is a valid regex that matches every repository, which
+	// is never what someone means to write in a file that deletes things.
+	if s.RepoRegex == "" {
+		return nil, errors.New("missing repo pattern (use \".+\" to match every repository)")
+	}
 	repo, err := regexp.Compile(s.RepoRegex)
 	if err != nil {
 		return nil, fmt.Errorf("invalid repo regex %q: %w", s.RepoRegex, err)
@@ -86,22 +75,22 @@ func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
 	if s.MustDeleteEverything != nil {
 		result.MustDeleteEverything = *s.MustDeleteEverything
 	}
-	for _, u := range s.Untagged {
+	for i, u := range s.Untagged {
 		common, err := u.compile()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("untagged rule %d: %w", i, err)
 		}
 		result.Untagged = append(result.Untagged, UntaggedRule{CommonRule: common})
 	}
-	for _, t := range s.Tagged {
+	for i, t := range s.Tagged {
 		common, err := t.compile()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("tagged rule %d: %w", i, err)
 		}
 		rule := TaggedRule{CommonRule: common}
 		if t.TagRegex != nil && *t.TagRegex != "" {
 			if rule.Tag, err = regexp.Compile(*t.TagRegex); err != nil {
-				return nil, fmt.Errorf("invalid tag regex %q: %w", *t.TagRegex, err)
+				return nil, fmt.Errorf("tagged rule %d: invalid tag regex %q: %w", i, *t.TagRegex, err)
 			}
 		}
 		result.Tagged = append(result.Tagged, rule)

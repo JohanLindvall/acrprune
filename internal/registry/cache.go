@@ -3,7 +3,13 @@ package registry
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 )
+
+// digestPattern matches an `algorithm:hex` OCI digest. Digests become file
+// names, so anything else is refused rather than allowed to name a path
+// outside the cache directory.
+var digestPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[a-zA-Z0-9=_-]+$`)
 
 // Cache stores downloaded manifest documents on disk, keyed by digest.
 // A nil *Cache is valid and disables caching.
@@ -19,12 +25,22 @@ func NewCache(dir string) *Cache {
 	return &Cache{dir: dir}
 }
 
+// path returns the file backing digest, or "" when the cache is disabled or
+// the digest is not a well-formed, safe file name.
+func (c *Cache) path(digest string) string {
+	if c == nil || !digestPattern.MatchString(digest) {
+		return ""
+	}
+	return filepath.Join(c.dir, digest)
+}
+
 // Get returns the cached document for digest, or nil.
 func (c *Cache) Get(digest string) []byte {
-	if c == nil {
+	path := c.path(digest)
+	if path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(filepath.Join(c.dir, digest))
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
@@ -33,18 +49,18 @@ func (c *Cache) Get(digest string) []byte {
 
 // Put stores a document; cache write failures are ignored.
 func (c *Cache) Put(digest string, data []byte) {
-	if c == nil {
+	path := c.path(digest)
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(c.dir, 0755); err == nil {
-		_ = os.WriteFile(filepath.Join(c.dir, digest), data, 0644)
+	if err := os.MkdirAll(c.dir, 0o755); err == nil {
+		_ = os.WriteFile(path, data, 0o644)
 	}
 }
 
 // Remove drops a document from the cache.
 func (c *Cache) Remove(digest string) {
-	if c == nil {
-		return
+	if path := c.path(digest); path != "" {
+		_ = os.Remove(path)
 	}
-	_ = os.Remove(filepath.Join(c.dir, digest))
 }

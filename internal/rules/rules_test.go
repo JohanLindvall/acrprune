@@ -18,6 +18,7 @@ func TestDurationUnmarshalJSON(t *testing.T) {
 		{`"24h"`, 24 * time.Hour, false},
 		{`"30d"`, 30 * 24 * time.Hour, false},
 		{`"2w"`, 14 * 24 * time.Hour, false},
+		{`"1h30m"`, 90 * time.Minute, false},
 		{`3600000000000`, time.Hour, false},
 		{`"bogus"`, 0, true},
 		{`true`, 0, true},
@@ -79,13 +80,21 @@ func TestCompileRejectsBadRegex(t *testing.T) {
 	if _, err := (&RepoRuleSpec{RepoRegex: "["}).Compile(); err == nil {
 		t.Error("invalid repo regex should fail to compile")
 	}
-	spec := &RepoRuleSpec{Tagged: []*TaggedRuleSpec{{TagRegex: to.Ptr("[")}}}
+	spec := &RepoRuleSpec{RepoRegex: ".+", Tagged: []*TaggedRuleSpec{{TagRegex: to.Ptr("[")}}}
 	if _, err := spec.Compile(); err == nil {
 		t.Error("invalid tag regex should fail to compile")
 	}
-	spec = &RepoRuleSpec{Untagged: []*UntaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{ArchitectureRegex: to.Ptr("[")}}}}
+	spec = &RepoRuleSpec{RepoRegex: ".+", Untagged: []*UntaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{ArchitectureRegex: to.Ptr("[")}}}}
 	if _, err := spec.Compile(); err == nil {
 		t.Error("invalid arch regex should fail to compile")
+	}
+}
+
+// TestCompileRejectsEmptyRepo guards a destructive default: the empty pattern
+// is a valid regex matching every repository in the registry.
+func TestCompileRejectsEmptyRepo(t *testing.T) {
+	if _, err := (&RepoRuleSpec{}).Compile(); err == nil {
+		t.Error("a rule without a repo pattern should fail to compile")
 	}
 }
 
@@ -97,8 +106,18 @@ func TestLiteralRepoName(t *testing.T) {
 	}{
 		{"^myrepo$", "myrepo", true},
 		{"^team/service$", "team/service", true},
-		{"^my_repo.v2$", "my_repo.v2", true},
+		{`^my_repo\.v2$`, "my_repo.v2", true}, // as produced by regexp.QuoteMeta
+		{"^my-repo$", "my-repo", true},
+
+		// An unescaped dot is a metacharacter: `^my_repo.v2$` also matches
+		// `my_repoXv2`, so it must be resolved by listing the catalog rather
+		// than addressed as the literal name `my_repo.v2`.
+		{"^my_repo.v2$", "", false},
 		{"^app.*$", "", false},
+		{"^(a|b)$", "", false},
+		{`^a\d$`, "", false}, // \d is a character class, not a literal
+		{`^a\$`, "", false},  // trailing escape
+		{"^$", "", false},
 		{"myrepo", "", false},
 		{"^myrepo", "", false},
 		{".+", "", false},
@@ -111,6 +130,26 @@ func TestLiteralRepoName(t *testing.T) {
 		got, ok := rule.LiteralRepoName()
 		if got != tt.want || ok != tt.ok {
 			t.Errorf("LiteralRepoName(%q) = %q, %v; want %q, %v", tt.pattern, got, ok, tt.want, tt.ok)
+		}
+		// Whatever is reported as a literal name must be a repository the
+		// pattern actually matches, and only that one.
+		if ok && !rule.Repo.MatchString(got) {
+			t.Errorf("LiteralRepoName(%q) = %q, which the pattern does not match", tt.pattern, got)
+		}
+	}
+}
+
+// TestLiteralRepoNameMatchesQuoteMeta checks that every name the generator can
+// emit is recognized, so generated rules never force a catalog listing.
+func TestLiteralRepoNameMatchesQuoteMeta(t *testing.T) {
+	for _, name := range []string{"app", "team/service", "my.repo", "a-b_c.d/e", "repo.v2"} {
+		rule, err := (&RepoRuleSpec{RepoRegex: anchored(name)}).Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := rule.LiteralRepoName()
+		if !ok || got != name {
+			t.Errorf("LiteralRepoName(%q) = %q, %v; want %q, true", anchored(name), got, ok, name)
 		}
 	}
 }
@@ -128,6 +167,14 @@ func TestParseSpecsRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// TestParseSpecsRejectsTrailingContent stops a rule file from being silently
+// read as only its first array.
+func TestParseSpecsRejectsTrailingContent(t *testing.T) {
+	if _, err := ParseSpecs(strings.NewReader(`[{"repo": ".+"}] [{"repo": "other"}]`)); err == nil {
+		t.Error("trailing content should be rejected")
+	}
+}
+
 func TestKeepRulesFromImageList(t *testing.T) {
 	input := strings.Join([]string{
 		"myreg.azurecr.io/app:v1",
@@ -138,7 +185,10 @@ func TestKeepRulesFromImageList(t *testing.T) {
 		"myreg.azurecr.io/no-tag",
 	}, "\n")
 
-	specs := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(specs) != 2 {
 		t.Fatalf("expected 2 repo rules, got %d", len(specs))
 	}
@@ -166,9 +216,85 @@ func TestKeepRulesFromImageList(t *testing.T) {
 	}
 }
 
+// TestKeepRulesFromImageListGroupsRepositories covers an image list that is
+// not sorted by repository. A second rule for a repository would never be
+// reached — pruning applies only the first rule matching a repository — so its
+// tags would fall through to the first rule's catch-all and be deleted while
+// still running.
+func TestKeepRulesFromImageListGroupsRepositories(t *testing.T) {
+	input := strings.Join([]string{
+		"myreg.azurecr.io/app:v1",
+		"myreg.azurecr.io/other:x",
+		"myreg.azurecr.io/app:v2",
+		"myreg.azurecr.io/app:v1", // duplicate, e.g. the same image on two pods
+	}, "\n")
+
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("expected one rule per repository, got %d: %+v", len(specs), specs)
+	}
+	if specs[0].RepoRegex != "^app$" {
+		t.Fatalf("rule 0 repo = %q, want ^app$ (first-seen order)", specs[0].RepoRegex)
+	}
+
+	var kept []string
+	for _, tagged := range specs[0].Tagged {
+		if *tagged.Keep {
+			kept = append(kept, *tagged.TagRegex)
+		}
+	}
+	if strings.Join(kept, ",") != "^v1$,^v2$" {
+		t.Errorf("kept tags for app = %v, want both v1 and v2, deduplicated", kept)
+	}
+}
+
 func TestKeepRulesFromImageListFullLoginServer(t *testing.T) {
-	specs := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.cn/app:v1\n"), "myreg.azurecr.cn")
+	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.cn/app:v1\n"), "myreg.azurecr.cn")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(specs) != 1 || specs[0].RepoRegex != "^app$" {
 		t.Errorf("full login server input not handled: %+v", specs)
+	}
+}
+
+func TestSplitImageRef(t *testing.T) {
+	const prefix = "myreg.azurecr.io/"
+	tests := []struct {
+		line, repository, tag string
+		ok                    bool
+	}{
+		{"myreg.azurecr.io/app:v1", "app", "v1", true},
+		{"myreg.azurecr.io/team/app:1.2.3", "team/app", "1.2.3", true},
+		// A pinned digest must not be read as part of the tag.
+		{"myreg.azurecr.io/app:v1@sha256:abc", "app", "v1", true},
+		{"myreg.azurecr.io/app@sha256:abc", "", "", false}, // no tag to keep
+		{"myreg.azurecr.io/app", "", "", false},
+		{"myreg.azurecr.io/app:", "", "", false},
+		{"myreg.azurecr.io/:v1", "", "", false},
+		{"otherreg.azurecr.io/app:v1", "", "", false},
+		{"", "", "", false},
+	}
+	for _, tt := range tests {
+		repository, tag, ok := splitImageRef(tt.line, prefix)
+		if repository != tt.repository || tag != tt.tag || ok != tt.ok {
+			t.Errorf("splitImageRef(%q) = %q, %q, %v; want %q, %q, %v",
+				tt.line, repository, tag, ok, tt.repository, tt.tag, tt.ok)
+		}
+	}
+}
+
+// TestKeepRulesCompile makes sure generated rules survive compilation, which
+// now rejects an empty repo pattern.
+func TestKeepRulesCompile(t *testing.T) {
+	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(specs); err != nil {
+		t.Errorf("generated rules should compile: %v", err)
 	}
 }
