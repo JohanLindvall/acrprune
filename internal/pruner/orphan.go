@@ -44,10 +44,18 @@ func markOrphans(manifests map[string]*registry.Manifest) {
 }
 
 // hasBrokenChild reports whether the manifest references one that is missing
-// from the repository or already known to be orphaned.
+// from the repository or already known to be orphaned. A referrer's subject
+// counts as a reference: a signature whose subject is gone is as broken as an
+// index with a missing child.
 func hasBrokenChild(m *registry.Manifest, manifests map[string]*registry.Manifest) bool {
 	for _, child := range m.Manifests {
 		dep, ok := manifests[string(child.Digest)]
+		if !ok || dep.Orphaned {
+			return true
+		}
+	}
+	if m.Subject != nil {
+		dep, ok := manifests[string(m.Subject.Digest)]
 		if !ok || dep.Orphaned {
 			return true
 		}

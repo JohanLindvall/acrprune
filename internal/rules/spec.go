@@ -11,6 +11,8 @@ import (
 // CommonRuleSpec holds the match criteria shared by tagged and untagged rules.
 type CommonRuleSpec struct {
 	ArchitectureRegex *string   `json:"arch,omitempty"`
+	OSRegex           *string   `json:"os,omitempty"`
+	DigestRegex       *string   `json:"digest,omitempty"`
 	MatchNewest       *int      `json:"newest,omitempty"`
 	MatchNewerThan    *Duration `json:"match_newer,omitempty"`
 	MatchOlderThan    *Duration `json:"match_older,omitempty"`

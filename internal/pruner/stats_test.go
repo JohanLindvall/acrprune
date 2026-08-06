@@ -135,3 +135,29 @@ func TestCountRunning(t *testing.T) {
 		t.Errorf("countRunning for unmatched repo = %d, want 0", got)
 	}
 }
+
+// TestCountRunningDigestPinned covers digest-pinned pod images: the pinned
+// manifest counts as running whether tagged or untagged, and — because digest
+// keep rules constrain no tag — other manifests must not ride along.
+func TestCountRunningDigestPinned(t *testing.T) {
+	now := time.Now()
+	pinnedTagged := testManifest("sha256:aaa", now, "v1")
+	pinnedUntagged := testManifest("sha256:bbb", now)
+	otherTagged := testManifest("sha256:ccc", now, "v9")
+	otherUntagged := testManifest("sha256:ddd", now)
+	manifests := byDigest(pinnedTagged, pinnedUntagged, otherTagged, otherUntagged)
+
+	input := "myreg.azurecr.io/app@sha256:aaa\nmyreg.azurecr.io/app@sha256:bbb\n"
+	specs, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleSet, err := rules.Compile(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := countRunning(manifests, "app", ruleSet); got != 2 {
+		t.Errorf("countRunning = %d, want 2 (both pinned manifests, nothing else)", got)
+	}
+}

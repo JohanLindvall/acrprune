@@ -8,6 +8,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
@@ -146,6 +147,45 @@ func TestCommonRuleMatches(t *testing.T) {
 	}
 	if matches(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("amd64")}, arm) {
 		t.Error("arm64 manifest should not match arch regex amd64")
+	}
+
+	windows := testManifest("win", now)
+	windows.Azure.OperatingSystem = to.Ptr(azcontainerregistry.ArtifactOperatingSystemWindows)
+	if !matches(rules.CommonRuleSpec{OSRegex: to.Ptr("windows")}, windows) {
+		t.Error("windows manifest should match os regex windows")
+	}
+	if matches(rules.CommonRuleSpec{OSRegex: to.Ptr("linux")}, windows) {
+		t.Error("windows manifest should not match os regex linux")
+	}
+
+	pinned := testManifest("sha256:pinned", now)
+	if !matches(rules.CommonRuleSpec{DigestRegex: to.Ptr("^sha256:pinned$")}, pinned) {
+		t.Error("manifest should match its own digest")
+	}
+	if matches(rules.CommonRuleSpec{DigestRegex: to.Ptr("^sha256:other$")}, pinned) {
+		t.Error("manifest should not match a different digest")
+	}
+}
+
+// TestReferrersDontConsumeNewestSlots: signatures are decided by their
+// subject, so their tags must not displace images from a `newest` window.
+func TestReferrersDontConsumeNewestSlots(t *testing.T) {
+	now := time.Now()
+	sig := testManifest("sig", now, "sha256-a.sig") // newest of all
+	sig.Subject = &v1.Descriptor{Digest: "a"}
+	a := testManifest("a", now.Add(-time.Hour), "v2")
+	b := testManifest("b", now.Add(-2*time.Hour), "v1")
+
+	rule := compileRule(t, &rules.RepoRuleSpec{
+		RepoRegex: ".+",
+		Tagged: []*rules.TaggedRuleSpec{
+			{CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: to.Ptr(2), Keep: to.Ptr(true)}},
+			{TagRegex: to.Ptr(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}},
+		},
+	})
+	e := newEvaluator(rule, []*registry.Manifest{sig, a, b}, now)
+	if !e.keep(a) || !e.keep(b) {
+		t.Error("both images should occupy the 2 newest slots; the signature must not consume one")
 	}
 }
 

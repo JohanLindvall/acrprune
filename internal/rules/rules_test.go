@@ -88,6 +88,14 @@ func TestCompileRejectsBadRegex(t *testing.T) {
 	if _, err := spec.Compile(); err == nil {
 		t.Error("invalid arch regex should fail to compile")
 	}
+	spec = &RepoRuleSpec{RepoRegex: ".+", Untagged: []*UntaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{OSRegex: to.Ptr("[")}}}}
+	if _, err := spec.Compile(); err == nil {
+		t.Error("invalid os regex should fail to compile")
+	}
+	spec = &RepoRuleSpec{RepoRegex: ".+", Tagged: []*TaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{DigestRegex: to.Ptr("[")}}}}
+	if _, err := spec.Compile(); err == nil {
+		t.Error("invalid digest regex should fail to compile")
+	}
 }
 
 // TestCompileRejectsEmptyRepo guards a destructive default: the empty pattern
@@ -264,26 +272,94 @@ func TestKeepRulesFromImageListFullLoginServer(t *testing.T) {
 func TestSplitImageRef(t *testing.T) {
 	const prefix = "myreg.azurecr.io/"
 	tests := []struct {
-		line, repository, tag string
-		ok                    bool
+		line, repository, tag, digest string
+		ok                            bool
 	}{
-		{"myreg.azurecr.io/app:v1", "app", "v1", true},
-		{"myreg.azurecr.io/team/app:1.2.3", "team/app", "1.2.3", true},
-		// A pinned digest must not be read as part of the tag.
-		{"myreg.azurecr.io/app:v1@sha256:abc", "app", "v1", true},
-		{"myreg.azurecr.io/app@sha256:abc", "", "", false}, // no tag to keep
-		{"myreg.azurecr.io/app", "", "", false},
-		{"myreg.azurecr.io/app:", "", "", false},
-		{"myreg.azurecr.io/:v1", "", "", false},
-		{"otherreg.azurecr.io/app:v1", "", "", false},
-		{"", "", "", false},
+		{"myreg.azurecr.io/app:v1", "app", "v1", "", true},
+		{"myreg.azurecr.io/team/app:1.2.3", "team/app", "1.2.3", "", true},
+		// A pinned digest must not be read as part of the tag; a reference
+		// carrying both yields both.
+		{"myreg.azurecr.io/app:v1@sha256:abc", "app", "v1", "sha256:abc", true},
+		{"myreg.azurecr.io/app@sha256:abc", "app", "", "sha256:abc", true},
+		{"myreg.azurecr.io/app", "", "", "", false},
+		{"myreg.azurecr.io/app:", "", "", "", false},
+		{"myreg.azurecr.io/app@", "", "", "", false},
+		{"myreg.azurecr.io/:v1", "", "", "", false},
+		{"otherreg.azurecr.io/app:v1", "", "", "", false},
+		{"", "", "", "", false},
 	}
 	for _, tt := range tests {
-		repository, tag, ok := splitImageRef(tt.line, prefix)
-		if repository != tt.repository || tag != tt.tag || ok != tt.ok {
-			t.Errorf("splitImageRef(%q) = %q, %q, %v; want %q, %q, %v",
-				tt.line, repository, tag, ok, tt.repository, tt.tag, tt.ok)
+		repository, tag, digest, ok := splitImageRef(tt.line, prefix)
+		if repository != tt.repository || tag != tt.tag || digest != tt.digest || ok != tt.ok {
+			t.Errorf("splitImageRef(%q) = %q, %q, %q, %v; want %q, %q, %q, %v",
+				tt.line, repository, tag, digest, ok, tt.repository, tt.tag, tt.digest, tt.ok)
 		}
+	}
+}
+
+// TestKeepRulesFromImageListDigestPinned covers pods that run digest-pinned
+// images: the pin must be kept whether or not the manifest is tagged in the
+// registry, so digest keep rules go in both the tagged and untagged lists.
+// These references used to be silently ignored, so the generated catch-alls
+// deleted running images.
+func TestKeepRulesFromImageListDigestPinned(t *testing.T) {
+	input := strings.Join([]string{
+		"myreg.azurecr.io/app@sha256:pinned",
+		"myreg.azurecr.io/app:v1",
+		"myreg.azurecr.io/app@sha256:pinned", // duplicate
+		"myreg.azurecr.io/app:v2@sha256:other",
+	}, "\n")
+
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(specs))
+	}
+	app := specs[0]
+
+	var taggedDigests, untaggedDigests, tags []string
+	for _, r := range app.Tagged {
+		if r.DigestRegex != nil {
+			taggedDigests = append(taggedDigests, *r.DigestRegex)
+			if r.TagRegex != nil {
+				t.Errorf("digest keep should not constrain the tag: %+v", r)
+			}
+		} else if r.TagRegex != nil && *r.Keep {
+			tags = append(tags, *r.TagRegex)
+		}
+	}
+	for _, r := range app.Untagged {
+		if r.DigestRegex != nil {
+			untaggedDigests = append(untaggedDigests, *r.DigestRegex)
+		}
+	}
+
+	wantDigests := `^sha256:pinned$,^sha256:other$`
+	if strings.Join(taggedDigests, ",") != wantDigests {
+		t.Errorf("tagged digest keeps = %v, want %s (deduplicated, in order)", taggedDigests, wantDigests)
+	}
+	if strings.Join(untaggedDigests, ",") != wantDigests {
+		t.Errorf("untagged digest keeps = %v, want %s", untaggedDigests, wantDigests)
+	}
+	// v2 came pinned; its tag is kept as well as its digest.
+	if strings.Join(tags, ",") != "^v1$,^v2$" {
+		t.Errorf("tag keeps = %v, want v1 and v2", tags)
+	}
+
+	// The catch-alls still close both lists.
+	last := app.Tagged[len(app.Tagged)-1]
+	if last.TagRegex == nil || *last.TagRegex != ".+" || *last.Keep {
+		t.Errorf("tagged catch-all = %+v", last)
+	}
+	lastUntagged := app.Untagged[len(app.Untagged)-1]
+	if lastUntagged.DigestRegex != nil || *lastUntagged.Keep {
+		t.Errorf("untagged catch-all = %+v", lastUntagged)
+	}
+
+	if _, err := Compile(specs); err != nil {
+		t.Errorf("generated rules should compile: %v", err)
 	}
 }
 

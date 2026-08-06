@@ -2,8 +2,10 @@ package pruner
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
@@ -29,17 +31,36 @@ type RepositoryStats struct {
 // runningRules, typically generated from a pod image list, mark manifests as
 // running. onUpdate, if non-nil, receives the stats collected so far after
 // each repository.
+//
+// Repositories the caller has no permission for (ABAC scoping) are skipped;
+// when any were, the collected stats are returned together with a non-nil
+// error naming them, so partial results remain usable.
 func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRules []*rules.RepoRule, onUpdate func([]RepositoryStats) error) ([]RepositoryStats, error) {
 	repositories, err := reg.ListRepositories(ctx)
 	if err != nil {
+		if registry.IsPermissionError(err) {
+			return nil, fmt.Errorf("%w (listing the catalog requires the Container Registry Repository Catalog Lister role)", err)
+		}
 		return nil, err
 	}
 
+	logger := reg.Logger()
 	stats := []RepositoryStats{}
 	seen := map[string]struct{}{}
-	for _, repository := range repositories {
+	var denied []string
+	for i, repository := range repositories {
 		manifests, found, err := reg.FetchRepositoryManifests(ctx, repository, true)
 		if err != nil {
+			// Same tolerance as pruning: on an ABAC registry the catalog can
+			// list repositories the caller cannot read. Skip them, keep the
+			// partial statistics useful, and report at the end.
+			if registry.IsPermissionError(err) {
+				denied = append(denied, repository)
+				logger.Warn("Insufficient permission to scan repository; skipping",
+					"repository", repository, "scanned", len(stats), "denied", len(denied),
+					"remaining", len(repositories)-i-1, "err", err)
+				continue
+			}
 			return nil, err
 		}
 		if !found {
@@ -55,35 +76,49 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 		}
 	}
 
+	if len(denied) > 0 {
+		return stats, fmt.Errorf("insufficient permission to scan %d of %d repositories: %s",
+			len(denied), len(repositories), strings.Join(denied, ", "))
+	}
 	return stats, nil
 }
 
-// countRunning counts tagged manifests whose first matching tag rule keeps
-// them, i.e. images that appear in the running set. Only the tag is consulted,
-// which is all the rules generated from an image list constrain.
+// countRunning counts manifests whose first matching rule keeps them, i.e.
+// images that appear in the running set. Only tags and digests are consulted —
+// all that rules generated from an image list constrain.
 func countRunning(manifests map[string]*registry.Manifest, repository string, ruleSet []*rules.RepoRule) int {
 	running := 0
 	for _, m := range manifests {
-		tags := m.Tags()
-		if len(tags) == 0 {
+		if runningMatch(m, repository, ruleSet) {
+			running++
+		}
+	}
+	return running
+}
+
+// runningMatch reports whether the manifest's first matching rule keeps it.
+func runningMatch(m *registry.Manifest, repository string, ruleSet []*rules.RepoRule) bool {
+	tags := m.Tags()
+	digest := []string{m.Digest}
+	for _, rule := range ruleSet {
+		if !rule.Repo.MatchString(repository) {
 			continue
 		}
-	match:
-		for _, rule := range ruleSet {
-			if !rule.Repo.MatchString(repository) {
-				continue
+		if len(tags) > 0 {
+			for _, r := range rule.Tagged {
+				if matchAny(r.Tag, tags) && matchAny(r.Digest, digest) {
+					return r.Keep
+				}
 			}
-			for _, taggedRule := range rule.Tagged {
-				if matchAny(taggedRule.Tag, tags) {
-					if taggedRule.Keep {
-						running++
-					}
-					break match
+		} else {
+			for _, r := range rule.Untagged {
+				if matchAny(r.Digest, digest) {
+					return r.Keep
 				}
 			}
 		}
 	}
-	return running
+	return false
 }
 
 // calculateStats summarizes manifests without cross-repository blob

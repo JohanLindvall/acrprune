@@ -42,25 +42,34 @@ func TestVerboseOwnsShortV(t *testing.T) {
 	}
 }
 
-// TestVersionFlag confirms --version still prints the version and short-circuits
-// before any command runs (no registry/Azure access).
-func TestVersionFlag(t *testing.T) {
-	version = "test-1.2.3"
-
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what
+// it printed alongside fn's error.
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	orig := os.Stdout
 	os.Stdout = w
-	runErr := newCommand().Run(context.Background(), []string{"acrprune", "--version"})
+	runErr := fn()
 	os.Stdout = orig
 	_ = w.Close()
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out), runErr
+}
 
-	buf := make([]byte, 4096)
-	n, _ := r.Read(buf)
-	got := string(buf[:n])
+// TestVersionFlag confirms --version still prints the version and short-circuits
+// before any command runs (no registry/Azure access).
+func TestVersionFlag(t *testing.T) {
+	version = "test-1.2.3"
 
+	got, runErr := captureStdout(t, func() error {
+		return newCommand().Run(context.Background(), []string{"acrprune", "--version"})
+	})
 	if runErr != nil {
 		t.Fatalf("--version returned error: %v", runErr)
 	}
@@ -85,19 +94,9 @@ func TestTopRunsWithoutRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	orig := os.Stdout
-	os.Stdout = w
-	runErr := newCommand().Run(context.Background(), []string{"acrprune", "top", "--input", statsFile, "-k", "1"})
-	os.Stdout = orig
-	_ = w.Close()
-
-	out, _ := io.ReadAll(r)
-	got := string(out)
-
+	got, runErr := captureStdout(t, func() error {
+		return newCommand().Run(context.Background(), []string{"acrprune", "top", "--input", statsFile, "-k", "1"})
+	})
 	if runErr != nil {
 		t.Fatalf("top returned error: %v", runErr)
 	}
@@ -106,5 +105,26 @@ func TestTopRunsWithoutRegistry(t *testing.T) {
 	}
 	if !strings.Contains(got, "2.8 GB") || !strings.Contains(got, "12.7%") {
 		t.Fatalf("expected humanized size and percent, got:\n%s", got)
+	}
+}
+
+// TestTopRejectsAmbiguousInputs pins the argument validation: extra inputs
+// used to be silently ignored, making it look like the wrong file was ranked.
+func TestTopRejectsAmbiguousInputs(t *testing.T) {
+	statsFile := filepath.Join(t.TempDir(), "stats.json")
+	if err := os.WriteFile(statsFile, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, args := range map[string][]string{
+		"two positional files":    {"acrprune", "top", statsFile, statsFile},
+		"--input plus positional": {"acrprune", "top", "--input", statsFile, statsFile},
+	} {
+		_, runErr := captureStdout(t, func() error {
+			return newCommand().Run(context.Background(), args)
+		})
+		if runErr == nil {
+			t.Errorf("%s: expected an error", name)
+		}
 	}
 }

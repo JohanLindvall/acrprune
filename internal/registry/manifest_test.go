@@ -81,6 +81,28 @@ func TestArchitectures(t *testing.T) {
 	}
 }
 
+func TestOperatingSystems(t *testing.T) {
+	m := &Manifest{
+		Azure: &azcontainerregistry.ManifestAttributes{
+			OperatingSystem: to.Ptr(azcontainerregistry.ArtifactOperatingSystemLinux),
+		},
+		OCIManifest: OCIManifest{
+			Manifests: []v1.Descriptor{
+				{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}},
+				{Platform: &v1.Platform{OS: "windows", Architecture: "amd64"}},
+				{Platform: &v1.Platform{OS: "unknown"}},
+				{Platform: nil},
+			},
+		},
+	}
+	if got := m.OperatingSystems(); strings.Join(got, ",") != "linux,windows" {
+		t.Errorf("OperatingSystems = %v, want [linux windows]", got)
+	}
+	if got := (&Manifest{}).OperatingSystems(); len(got) != 0 {
+		t.Errorf("manifest without platforms should yield no OS, got %v", got)
+	}
+}
+
 func TestLogValueIncludesUpdated(t *testing.T) {
 	now := time.Now()
 	m := &Manifest{Repository: "r", Digest: "d", Azure: &azcontainerregistry.ManifestAttributes{LastUpdatedOn: &now}}

@@ -14,17 +14,17 @@ import (
 func (r *Registry) ListTagLocks(ctx context.Context, repository string) (map[string]bool, error) {
 	lockedTags := map[string]bool{}
 	pager := r.client.NewListTagsPager(repository, &azcontainerregistry.ClientListTagsOptions{MaxNum: to.Ptr(r.pageSize)})
-	for pager.More() {
-		page, err := pager.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list tags for %s: %w", repository, err)
-		}
+	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListTagsResponse) error {
 		for _, t := range page.Tags {
 			c := t.ChangeableAttributes
 			if t.Name != nil && c != nil && locked(c.CanDelete, c.CanWrite) {
 				lockedTags[*t.Name] = true
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list tags for %s: %w", repository, err)
 	}
 	return lockedTags, nil
 }

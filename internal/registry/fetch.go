@@ -35,24 +35,13 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	manifests = map[string]*Manifest{}
 	attributes := map[string]*azcontainerregistry.ManifestAttributes{}
 
-	for page := 0; pager.More(); page++ {
+	page := 0
+	pageErr := forEachPage(groupCtx, pager, func(attributePage azcontainerregistry.ClientListManifestsResponse) error {
 		r.logger.Debug("Fetching manifest attributes", "page", page, "repository", repository)
-		attributePage, pageErr := pager.NextPage(groupCtx)
-		if pageErr != nil {
-			// A download failure cancels groupCtx and so surfaces here as
-			// well; report the original error from Wait in that case.
-			if waitErr := group.Wait(); waitErr != nil {
-				return nil, false, waitErr
-			}
-			if ignoreMissing && hasStatus(pageErr, http.StatusNotFound) {
-				r.logger.Warn("Repository missing", "repository", repository)
-				return nil, false, nil
-			}
-			return nil, false, fmt.Errorf("failed to list manifests for %s: %w", repository, pageErr)
-		}
+		page++
 		for _, attrs := range attributePage.Attributes {
 			if attrs == nil || attrs.Digest == nil {
-				return nil, false, fmt.Errorf("registry returned a manifest without a digest for %s", repository)
+				return fmt.Errorf("listing returned a manifest without a digest")
 			}
 			digest := *attrs.Digest
 			attributes[digest] = attrs
@@ -67,6 +56,19 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 				return nil
 			})
 		}
+		return nil
+	})
+	if pageErr != nil {
+		// A download failure cancels groupCtx and so surfaces from paging as
+		// well; report the original error from Wait in that case.
+		if waitErr := group.Wait(); waitErr != nil {
+			return nil, false, waitErr
+		}
+		if ignoreMissing && hasStatus(pageErr, http.StatusNotFound) {
+			r.logger.Warn("Repository missing", "repository", repository)
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("failed to list manifests for %s: %w", repository, pageErr)
 	}
 	if err := group.Wait(); err != nil {
 		return nil, false, err
@@ -99,7 +101,12 @@ func (r *Registry) fetchManifest(ctx context.Context, repository, digest string,
 		if res.DockerContentDigest == nil {
 			return nil, fmt.Errorf("manifest %s: registry returned no content digest to validate against", ref)
 		}
-		reader, err := azcontainerregistry.NewDigestValidationReader(*res.DockerContentDigest, res.ManifestData)
+		// Validate against the digest we asked for, not the one the server
+		// claims: content is stored in the cache under the requested digest.
+		if *res.DockerContentDigest != digest {
+			return nil, fmt.Errorf("manifest %s: registry returned content digest %s", ref, *res.DockerContentDigest)
+		}
+		reader, err := azcontainerregistry.NewDigestValidationReader(digest, res.ManifestData)
 		if err != nil {
 			return nil, fmt.Errorf("failed to validate manifest %s: %w", ref, err)
 		}

@@ -31,6 +31,12 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 
 	var tagged, untagged []*registry.Manifest
 	for _, m := range manifests {
+		if m.Subject != nil {
+			// Referrers (signatures, attestations) follow their subject's
+			// fate instead of matching rules, and must not consume `newest`
+			// ranking slots meant for images.
+			continue
+		}
 		if len(m.Tags()) > 0 {
 			tagged = append(tagged, m)
 		} else {
@@ -108,6 +114,12 @@ func (e *evaluator) matches(positions map[*registry.Manifest]int, rule rules.Com
 // candidate set is known.
 func (e *evaluator) matchesCriteria(rule rules.CommonRule, m *registry.Manifest) bool {
 	if !matchAny(rule.Architecture, m.Architectures()) {
+		return false
+	}
+	if !matchAny(rule.OS, m.OperatingSystems()) {
+		return false
+	}
+	if !matchAny(rule.Digest, []string{m.Digest}) {
 		return false
 	}
 	if rule.MatchNewerThan != 0 && !m.LastUpdated().Add(rule.MatchNewerThan).After(e.now) {

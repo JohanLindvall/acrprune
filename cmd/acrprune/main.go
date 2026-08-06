@@ -79,13 +79,14 @@ func newCommand() *cli.Command {
 						return err
 					}
 
-					var out *os.File
+					outPath := cmd.String("output")
+					out, closeOut, err := openOutput(outPath)
+					if err != nil {
+						return err
+					}
+					defer closeOut()
 					var onUpdate func([]pruner.RepositoryStats) error
-					if outPath := cmd.String("output"); outPath != "" {
-						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
-							return err
-						}
-						defer func() { _ = out.Close() }()
+					if outPath != "" {
 						// Rewrite the file after each repository so partial
 						// results survive an interrupted run.
 						onUpdate = func(stats []pruner.RepositoryStats) error {
@@ -93,16 +94,18 @@ func newCommand() *cli.Command {
 						}
 					}
 
+					// Denied repositories yield partial stats and an error;
+					// write what was collected either way.
 					stats, err := pruner.CollectRegistryStats(ctx, reg, runningRules, onUpdate)
-					if err != nil {
+					if stats == nil {
 						return err
 					}
-					if out == nil {
-						return writeJSON(os.Stdout, stats)
+					if outPath == "" {
+						return errors.Join(writeJSON(out, stats), err)
 					}
 					// Write once more so an empty registry still leaves valid
 					// JSON behind rather than an empty file.
-					return rewriteJSON(out, stats)
+					return errors.Join(rewriteJSON(out, stats), err)
 				},
 			},
 			{
@@ -163,13 +166,11 @@ func newCommand() *cli.Command {
 						return err
 					}
 					logger.Debug("Built rules", "rules", len(specs))
-					out := os.Stdout
-					if outPath := cmd.String("output"); outPath != "" {
-						if out, err = os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644); err != nil {
-							return err
-						}
-						defer func() { _ = out.Close() }()
+					out, closeOut, err := openOutput(cmd.String("output"))
+					if err != nil {
+						return err
 					}
+					defer closeOut()
 					return writeJSON(out, specs)
 				},
 			},
@@ -183,7 +184,14 @@ func newCommand() *cli.Command {
 				},
 				ArgsUsage: "[stats.json]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					// Refuse ambiguity instead of silently ignoring an input.
+					if cmd.Args().Len() > 1 {
+						return fmt.Errorf("expected at most one stats file argument, got %d", cmd.Args().Len())
+					}
 					inPath := cmd.String("input")
+					if inPath != "" && cmd.Args().Len() > 0 {
+						return errors.New("--input and a stats file argument are mutually exclusive")
+					}
 					if inPath == "" {
 						inPath = cmd.Args().First()
 					}
@@ -276,6 +284,20 @@ func openInput(path string) (io.Reader, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
+// openOutput opens path for writing, creating or truncating it, and falls
+// back to stdout when path is empty. The returned function closes the file,
+// and does nothing for stdout.
+func openOutput(path string) (*os.File, func(), error) {
+	if path == "" {
+		return os.Stdout, func() {}, nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { _ = f.Close() }, nil
+}
+
 // loadRunningRules compiles the keep-rules describing the images listed in
 // path, or returns nil when no file was given.
 func loadRunningRules(path, registryName string) ([]*rules.RepoRule, error) {
@@ -295,14 +317,11 @@ func loadRunningRules(path, registryName string) ([]*rules.RepoRule, error) {
 	return rules.Compile(specs)
 }
 
-// loginServerURL turns a bare registry name into its azurecr.io login server
-// URL; names containing a dot are treated as complete login servers, so
-// sovereign-cloud registries can be passed directly.
+// loginServerURL turns a registry name into its login server URL; names
+// containing a dot are treated as complete login servers, so sovereign-cloud
+// registries can be passed directly.
 func loginServerURL(registryName string) string {
-	if strings.Contains(registryName, ".") {
-		return "https://" + registryName
-	}
-	return fmt.Sprintf("https://%s.azurecr.io", registryName)
+	return "https://" + registry.LoginServer(registryName)
 }
 
 func writeJSON(w io.Writer, v any) error {

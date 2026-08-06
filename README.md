@@ -19,7 +19,7 @@ acrprune works with [ABAC-enabled registries](https://learn.microsoft.com/azure/
 Two things follow from this:
 
 - **Catalog listing is only used when needed.** When every rule targets a literal repository (`^name$`), acrprune addresses those repositories directly and never lists the catalog, so the `Container Registry Repository Catalog Lister` role is not required. It is only needed when a rule uses a repository regex; if listing is denied, acrprune reports the missing role and suggests switching to literal patterns.
-- **Partial access is tolerated.** If a repository-regex rule matches repositories the caller cannot access, acrprune skips each denied repository (logging which were pruned, denied and remaining) instead of aborting the whole run, and exits non-zero at the end with the list of repositories that were denied. To purge only what you own, prefer literal `^repo$` patterns.
+- **Partial access is tolerated.** If a repository-regex rule matches repositories the caller cannot access, acrprune skips each denied repository (logging which were pruned, denied and remaining) instead of aborting the whole run, and exits non-zero at the end with the list of repositories that were denied. When *every* repository is denied, the error suggests checking the credential itself. The `statistics` command behaves the same way: denied repositories are skipped, the statistics for the accessible ones are still written, and the exit code is non-zero. To purge only what you own, prefer literal `^repo$` patterns.
 
 ## Global Flags
 
@@ -96,11 +96,11 @@ The output is a JSON array with one object per repository:
 | `count` | int | Total number of manifests |
 | `newest` | timestamp | Last-updated time of the newest manifest |
 | `oldest` | timestamp | Last-updated time of the oldest manifest |
-| `running` | int | Number of tagged manifests matching a keep rule from `--running` (always `0` without it) |
+| `running` | int | Number of manifests (tagged or digest-pinned) matching a keep rule from `--running` (always `0` without it) |
 
 ### `generate`
 
-Reads a list of `registry.azurecr.io/repo:tag` image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos). References for other registries, and untagged (digest-only) references, are ignored. The input need not be sorted or deduplicated: each repository yields exactly one rule listing all of its tags.
+Reads a list of image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos). Tag references (`registry.azurecr.io/repo:tag`) are kept by tag; digest-pinned references (`registry.azurecr.io/repo@sha256:…`) are kept by digest, whether or not the manifest is tagged in the registry; a reference carrying both keeps both, since the digest pins what is actually running even if the tag has been moved. References for other registries are ignored. The input need not be sorted or deduplicated: each repository yields exactly one rule.
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
@@ -112,7 +112,7 @@ scripts/get_pod_images.sh | acrprune -r myregistry generate | acrprune -r myregi
 
 ### `top`
 
-Reads a statistics JSON file (as produced by `statistics`) and prints the top repositories as an aligned table, with sizes in human-readable form and `shared` as a percentage. Runs entirely locally — no registry access or `--registry` flag needed. The input file may also be given as a positional argument.
+Reads a statistics JSON file (as produced by `statistics`) and prints the top repositories as an aligned table, with sizes in human-readable form and `shared` as a percentage. Runs entirely locally — no registry access or `--registry` flag needed. The input file may also be given as a positional argument (but not both, and at most one).
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
@@ -173,6 +173,8 @@ Rules are a JSON array of repository rules. Each rule matches repositories by re
 |-------|------|---------|-------------|
 | `tag` | string | *(match all)* | Regex to match tag names |
 | `arch` | string | *(match all)* | Regex to match architecture (e.g. `amd64`, `arm64`) |
+| `os` | string | *(match all)* | Regex to match operating system (e.g. `linux`, `windows`) |
+| `digest` | string | *(match all)* | Regex to match the manifest digest (e.g. `^sha256:3b1a…$`), for keeping digest-pinned images |
 | `newest` | int | | Match only the N newest of the manifests this rule matches. Negative value excludes the N newest |
 | `match_newer` | string | | Match manifests newer than this duration (e.g. `24h`, `30d`) |
 | `match_older` | string | | Match manifests older than this duration |
@@ -210,10 +212,12 @@ Manifests of equal age are ranked by digest, so repeated runs over an unchanged 
 ## Behaviour Notes
 
 - Repositories that have no manifests after download are deleted entirely (respecting `--dry-run`).
-- Manifests with a `subject` field (e.g. signatures, attestations) are always kept.
-- The `--keep-younger` grace period overrides rule decisions — recently updated manifests are never deleted.
+- Manifests with a `subject` field (signatures, attestations, SBOMs) follow their subject instead of matching rules: they are kept exactly as long as the subject is kept, deleted along with it, and deleted when the subject is already gone. They do not occupy `newest` ranking slots, and they do not count as "kept" for `must_delete_everything`, so signed repositories can still be bulk-deleted.
+- The `--keep-younger` grace period overrides rule decisions — recently updated manifests are never deleted. This holds for subject-bearing manifests too, so a dangling signature outlives its subject by at most the grace period.
+- Listings are a point-in-time snapshot: tags moved or manifests pushed while a prune is running are not observed. New pushes are protected by `--keep-younger`; avoid retagging old manifests during a run.
+- The per-repository byte counts logged by `prune` deduplicate blobs within the repository only; layers shared with other repositories may not actually be freed by the registry's garbage collector.
 - A manifest the registry reports no last-updated time for is never deleted, since every age-based rule would otherwise read it as infinitely old.
-- A manifest is orphaned when something it references is missing, and the flag propagates both up to the indexes referencing it and down to its children — but a child still reachable through a healthy index is not orphaned by a broken sibling.
+- A manifest is orphaned when something it references is missing — an index child or a `subject` alike — and the flag propagates both up to the indexes referencing it and down to its children. A child still reachable through a healthy index is not orphaned by a broken sibling.
 - When every rule targets a literal repository name (`^name$`), only those repositories are fetched instead of listing the whole registry. A pattern containing an active metacharacter is not a literal name: `^my.repo$` matches `myXrepo` too, so it is resolved by listing the catalog. Write `^my\.repo$` (what `generate` emits) to address a repository with a dot in its name directly.
 - Cached manifests are stored under `<cache>/<registry>/` and are removed from cache when deleted from the registry.
 

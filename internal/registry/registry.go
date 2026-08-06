@@ -9,12 +9,39 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"golang.org/x/sync/errgroup"
 )
+
+// LoginServer returns the registry's login server host name: the name itself
+// when it already contains a dot (a full login server, e.g. a sovereign
+// cloud's), otherwise the public-cloud host <name>.azurecr.io.
+func LoginServer(name string) string {
+	if strings.Contains(name, ".") {
+		return name
+	}
+	return name + ".azurecr.io"
+}
+
+// forEachPage advances the pager to exhaustion, invoking fn on every page.
+// Errors from paging and from fn alike abort the walk.
+func forEachPage[T any](ctx context.Context, pager *runtime.Pager[T], fn func(T) error) error {
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		if err := fn(page); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 type Registry struct {
 	client      *azcontainerregistry.Client
@@ -44,6 +71,12 @@ func New(client *azcontainerregistry.Client, logger *slog.Logger, pageSize, para
 	}, nil
 }
 
+// Logger returns the logger the registry was built with, for callers that
+// iterate over registry data and want consistent log output.
+func (r *Registry) Logger() *slog.Logger {
+	return r.logger
+}
+
 // group returns an errgroup limited to the configured parallelism, along with
 // the context its tasks must use so a failure cancels its siblings.
 func (r *Registry) group(ctx context.Context) (*errgroup.Group, context.Context) {
@@ -56,17 +89,17 @@ func (r *Registry) group(ctx context.Context) (*errgroup.Group, context.Context)
 func (r *Registry) ListRepositories(ctx context.Context) ([]string, error) {
 	repositories := []string{}
 	pager := r.client.NewListRepositoriesPager(&azcontainerregistry.ClientListRepositoriesOptions{MaxNum: to.Ptr(r.pageSize)})
-	for page := 0; pager.More(); page++ {
-		r.logger.Debug("Fetching ACR repositories", "page", page)
-		repositoryPage, err := pager.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to advance repository page: %w", err)
-		}
-		for _, repository := range repositoryPage.Names {
+	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListRepositoriesResponse) error {
+		r.logger.Debug("Fetching ACR repositories", "count", len(repositories))
+		for _, repository := range page.Names {
 			if repository != nil {
 				repositories = append(repositories, *repository)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to advance repository page: %w", err)
 	}
 
 	r.logger.Debug("Fetched repositories", "count", len(repositories))

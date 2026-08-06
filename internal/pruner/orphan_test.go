@@ -65,6 +65,31 @@ func TestMarkOrphansKeepsSharedChildren(t *testing.T) {
 	}
 }
 
+// TestMarkOrphansFlagsDanglingSubject: a referrer whose subject is missing or
+// orphaned is as broken as an index with a missing child.
+func TestMarkOrphansFlagsDanglingSubject(t *testing.T) {
+	now := time.Now()
+	dangling := testManifest("dangling", now)
+	dangling.Subject = &v1.Descriptor{Digest: "gone"}
+
+	image := testManifest("img", now, "v1")
+	attached := testManifest("attached", now)
+	attached.Subject = &v1.Descriptor{Digest: "img"}
+
+	manifests := byDigest(dangling, image, attached)
+	markOrphans(manifests)
+
+	if !dangling.Orphaned {
+		t.Error("a referrer with a missing subject should be orphaned")
+	}
+	if attached.Orphaned {
+		t.Error("a referrer with a present subject should not be orphaned")
+	}
+	if image.Orphaned {
+		t.Error("the subject itself should not be orphaned")
+	}
+}
+
 // TestMarkOrphansCycle checks the fixpoint terminates on a reference cycle.
 func TestMarkOrphansCycle(t *testing.T) {
 	now := time.Now()

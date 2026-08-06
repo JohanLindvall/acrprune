@@ -92,11 +92,7 @@ func (m *Manifest) HasTimestamp() bool {
 // for an index, of the manifests it references.
 func (m *Manifest) Architectures() []string {
 	var result []string
-	add := func(arch string) {
-		if arch != "" && arch != "unknown" && !slices.Contains(result, arch) {
-			result = append(result, arch)
-		}
-	}
+	add := addKnown(&result)
 	if m.Azure != nil && m.Azure.Architecture != nil {
 		add(string(*m.Azure.Architecture))
 	}
@@ -106,6 +102,33 @@ func (m *Manifest) Architectures() []string {
 		}
 	}
 	return result
+}
+
+// OperatingSystems returns the distinct known operating systems of the
+// manifest and, for an index, of the manifests it references.
+func (m *Manifest) OperatingSystems() []string {
+	var result []string
+	add := addKnown(&result)
+	if m.Azure != nil && m.Azure.OperatingSystem != nil {
+		add(string(*m.Azure.OperatingSystem))
+	}
+	for _, child := range m.Manifests {
+		if child.Platform != nil {
+			add(child.Platform.OS)
+		}
+	}
+	return result
+}
+
+// addKnown appends platform values to *result, dropping empty and "unknown"
+// entries (attestation manifests in an index report unknown/unknown) and
+// duplicates.
+func addKnown(result *[]string) func(string) {
+	return func(value string) {
+		if value != "" && value != "unknown" && !slices.Contains(*result, value) {
+			*result = append(*result, value)
+		}
+	}
 }
 
 // LogValue makes manifests log as a compact attribute group.

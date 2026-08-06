@@ -11,6 +11,8 @@ import (
 // anything.
 type CommonRule struct {
 	Architecture *regexp.Regexp
+	OS           *regexp.Regexp
+	Digest       *regexp.Regexp
 	// MatchNewest ranks a manifest against the other manifests this same rule
 	// matches: >0 selects the N newest of them, <0 selects all but the N
 	// newest, 0 imposes no constraint.
@@ -100,12 +102,15 @@ func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
 
 func (s *CommonRuleSpec) compile() (CommonRule, error) {
 	rule := CommonRule{Keep: true}
-	if s.ArchitectureRegex != nil && *s.ArchitectureRegex != "" {
-		re, err := regexp.Compile(*s.ArchitectureRegex)
-		if err != nil {
-			return rule, fmt.Errorf("invalid arch regex %q: %w", *s.ArchitectureRegex, err)
-		}
-		rule.Architecture = re
+	var err error
+	if rule.Architecture, err = compileOptional("arch", s.ArchitectureRegex); err != nil {
+		return rule, err
+	}
+	if rule.OS, err = compileOptional("os", s.OSRegex); err != nil {
+		return rule, err
+	}
+	if rule.Digest, err = compileOptional("digest", s.DigestRegex); err != nil {
+		return rule, err
 	}
 	if s.MatchNewest != nil {
 		rule.MatchNewest = *s.MatchNewest
@@ -120,4 +125,17 @@ func (s *CommonRuleSpec) compile() (CommonRule, error) {
 		rule.Keep = *s.Keep
 	}
 	return rule, nil
+}
+
+// compileOptional compiles an optional regex field; nil or empty means no
+// constraint and compiles to a nil (match-all) regexp.
+func compileOptional(field string, pattern *string) (*regexp.Regexp, error) {
+	if pattern == nil || *pattern == "" {
+		return nil, nil
+	}
+	re, err := regexp.Compile(*pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s regex %q: %w", field, *pattern, err)
+	}
+	return re, nil
 }

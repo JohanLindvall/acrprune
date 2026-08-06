@@ -98,8 +98,14 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 	}
 
 	if len(denied) > 0 {
-		return fmt.Errorf("insufficient permission to prune %d of %d repositories (pruned %d): %s",
-			len(denied), len(repositories), len(pruned), strings.Join(denied, ", "))
+		hint := ""
+		if len(pruned) == 0 {
+			// Partial denial is normal ABAC scoping; blanket denial usually
+			// means the credential itself is wrong for this registry.
+			hint = " — every repository was denied; check that the credential is valid for this registry"
+		}
+		return fmt.Errorf("insufficient permission to prune %d of %d repositories (pruned %d)%s: %s",
+			len(denied), len(repositories), len(pruned), hint, strings.Join(denied, ", "))
 	}
 	return nil
 }
@@ -235,6 +241,9 @@ func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry
 
 	kept := map[string]struct{}{}
 	for _, m := range all {
+		if m.Subject != nil {
+			continue // referrers follow their subject; decided below
+		}
 		if !p.shouldKeep(m, evaluator, rule) {
 			continue
 		}
@@ -244,31 +253,67 @@ func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry
 	}
 
 	// A must-delete-everything rule is all-or-nothing: keeping one manifest
-	// keeps the whole repository.
+	// keeps the whole repository. Referrers do not count as keeps here — they
+	// only ever live on their subject's account.
 	if rule.MustDeleteEverything && len(kept) > 0 {
 		for digest := range manifests {
 			kept[digest] = struct{}{}
 		}
+		return kept, nil
+	}
+
+	if err := p.keepReferrers(all, manifests, kept, rule, evaluator.now); err != nil {
+		return nil, err
 	}
 
 	return kept, nil
 }
 
+// keepReferrers settles the fate of subject-bearing manifests (signatures,
+// attestations, SBOMs): a referrer is kept exactly when its subject is kept,
+// and deleted along with it — including referrers whose subject is already
+// gone, which are otherwise unreachable garbage. Iterates to a fixpoint so
+// chains (a signature on an attestation on an image) follow the image.
+func (p *Pruner) keepReferrers(all []*registry.Manifest, manifests map[string]*registry.Manifest, kept map[string]struct{}, rule *rules.RepoRule, now time.Time) error {
+	for changed := true; changed; {
+		changed = false
+		for _, m := range all {
+			if m.Subject == nil {
+				continue
+			}
+			if _, ok := kept[m.Digest]; ok {
+				continue
+			}
+			_, keep := kept[string(m.Subject.Digest)]
+			if rule.DeleteOrphanedManifests && m.Orphaned {
+				keep = false
+			}
+			if !keep && p.KeepYounger != 0 {
+				// The grace period holds for referrers too; a dangling one
+				// outlives its subject by at most the grace period.
+				keep = m.LastUpdated().Add(p.KeepYounger).After(now)
+			}
+			if !keep {
+				continue
+			}
+			p.Logger.Debug("Keeping referrer", "manifest", m, "subject", string(m.Subject.Digest))
+			if err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
+				return err
+			}
+			changed = true
+		}
+	}
+	return nil
+}
+
 // shouldKeep applies the first matching tagged/untagged rule, then the
-// overrides that can only save a manifest: orphan deletion, subject retention,
-// the grace period and a missing timestamp.
+// overrides: orphan deletion, the grace period and a missing timestamp.
+// Referrers never come through here — keepReferrers decides them.
 func (p *Pruner) shouldKeep(m *registry.Manifest, evaluator *evaluator, rule *rules.RepoRule) bool {
 	keep := evaluator.keep(m)
 
 	if rule.DeleteOrphanedManifests && m.Orphaned {
 		keep = false
-	}
-
-	if m.Subject != nil {
-		// Signatures and attestations are deleted along with their subject,
-		// not on their own account.
-		keep = true
-		p.Logger.Info("Keeping manifest with subject", "manifest", m)
 	}
 
 	if !keep && !m.HasTimestamp() {
