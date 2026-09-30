@@ -1,5 +1,6 @@
 .cache
 /acrprune
+/bin/
 /images
 /stats.json
 /dist/

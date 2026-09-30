@@ -7,7 +7,7 @@ import (
 )
 
 // TestShippedRuleFiles ensures every example rule file in rules/ parses and
-// compiles.
+// compiles, without unreachable rules.
 func TestShippedRuleFiles(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join("..", "..", "rules", "*.json"))
 	if err != nil {
@@ -27,8 +27,13 @@ func TestShippedRuleFiles(t *testing.T) {
 			t.Errorf("%s: parse failed: %v", file, err)
 			continue
 		}
-		if _, err := Compile(specs); err != nil {
+		ruleSet, err := Compile(specs)
+		if err != nil {
 			t.Errorf("%s: compile failed: %v", file, err)
+			continue
+		}
+		if warnings := Warnings(ruleSet); len(warnings) != 0 {
+			t.Errorf("%s: unreachable rules: %q", file, warnings)
 		}
 	}
 }

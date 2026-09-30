@@ -1,6 +1,7 @@
 package pruner
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/JohanLindvall/acrprune/internal/imageref"
+	"github.com/JohanLindvall/acrprune/internal/jsonpos"
 	"github.com/dustin/go-humanize"
 )
 
@@ -37,11 +40,23 @@ func StatSortKeys() []string {
 }
 
 // ReadStats parses statistics JSON as written by the statistics command.
+// Malformed JSON is reported with its line and column where encoding/json
+// gives its offset, a mistyped value at the value's start. ReadStats rejects
+// entries whose name is no valid repository name, which a statistics file
+// from elsewhere could use to smuggle terminal escape sequences into the
+// table.
 func ReadStats(r io.Reader) ([]RepositoryStats, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read statistics: %w", err)
+	}
 	var stats []RepositoryStats
-	dec := json.NewDecoder(r)
+	// The offsets of type errors count from the first byte of the value.
+	value := bytes.TrimLeft(data, " \t\r\n")
+	base := int64(len(data) - len(value))
+	dec := json.NewDecoder(bytes.NewReader(value))
 	if err := dec.Decode(&stats); err != nil {
-		return nil, fmt.Errorf("failed to parse statistics JSON: %w", err)
+		return nil, jsonError(data, base, "failed to parse statistics JSON", err)
 	}
 	if stats == nil {
 		return nil, errors.New("statistics must be a JSON array, not null")
@@ -50,9 +65,23 @@ func ReadStats(r io.Reader) ([]RepositoryStats, error) {
 		if err == nil {
 			return nil, errors.New("unexpected trailing content after statistics JSON")
 		}
-		return nil, fmt.Errorf("after statistics JSON: %w", err)
+		return nil, jsonError(data, base, "after statistics JSON", err)
+	}
+	for i, s := range stats {
+		if !imageref.ValidRepository(s.Name) {
+			return nil, fmt.Errorf("statistics entry %d: invalid repository name %q", i+1, s.Name)
+		}
 	}
 	return stats, nil
+}
+
+// jsonError prefixes err, from decoding data[base:], with the line and column
+// it points at, or with what failed when it points nowhere.
+func jsonError(data []byte, base int64, what string, err error) error {
+	if offset, ok := jsonpos.Offset(data, base, err); ok {
+		return jsonpos.At(data, offset, err)
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 // SortStatsBy sorts stats in place by the given key.

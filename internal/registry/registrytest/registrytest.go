@@ -32,6 +32,10 @@ type Backend struct {
 	// last tagged manifest of a repository, and report so through
 	// ProtectsLastTag.
 	ProtectLastTag bool
+	// EnforceLocks makes the backend refuse, as ACR does, to delete a locked
+	// manifest or one carrying a locked tag, and a repository containing
+	// either, with a 405 response. Without it, locks are only recorded.
+	EnforceLocks bool
 	// Fail, when set, is called before every operation with the operation's
 	// method name and repository ("" for ListRepositories), and may return
 	// an error for the operation to fail with.
@@ -45,6 +49,7 @@ type Backend struct {
 	deleted      []string
 	deletedRepos []string
 	unlocked     []string
+	relocked     []string
 }
 
 type repository struct {
@@ -188,6 +193,14 @@ func (b *Backend) Unlocked() []string {
 	return slices.Sorted(slices.Values(b.unlocked))
 }
 
+// Relocked returns what was locked again through a registry.Relock returned by
+// UnlockManifest or UnlockTag, sorted like Unlocked.
+func (b *Backend) Relocked() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Sorted(slices.Values(b.relocked))
+}
+
 // Digests returns the digests remaining in the repository, sorted.
 func (b *Backend) Digests(repository string) []string {
 	b.mu.Lock()
@@ -287,9 +300,24 @@ func (b *Backend) DeleteManifest(_ context.Context, m *registry.Manifest) error 
 		return &registry.ResponseError{StatusCode: http.StatusBadRequest,
 			Err: fmt.Errorf("deleting %s: you cannot delete the last tagged version of a package; you must delete the package instead", m.Ref())}
 	}
+	if b.EnforceLocks && b.locked(m.Repository, r.manifests[m.Digest]) {
+		return lockedError(m.Ref())
+	}
 	delete(r.manifests, m.Digest)
 	b.deleted = append(b.deleted, m.Ref())
 	return nil
+}
+
+// locked reports whether an entry or one of its tags is locked. b.mu must be
+// held.
+func (b *Backend) locked(repository string, e *entry) bool {
+	return e.attrs.Locked || slices.ContainsFunc(e.attrs.Tags, func(tag string) bool { return b.lockedTags[repository][tag] })
+}
+
+// lockedError returns the error the backend refuses to delete something
+// locked with, as ACR does.
+func lockedError(what string) error {
+	return &registry.ResponseError{StatusCode: http.StatusMethodNotAllowed, Err: fmt.Errorf("%s is locked: the operation is disallowed", what)}
 }
 
 // tagged counts the tagged manifests of a repository.
@@ -309,44 +337,91 @@ func (b *Backend) DeleteRepository(_ context.Context, repository string) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if r := b.repositories[repository]; r != nil && b.EnforceLocks {
+		for _, e := range r.manifests {
+			if b.locked(repository, e) {
+				return lockedError("content of repository " + repository)
+			}
+		}
+	}
 	delete(b.repositories, repository)
 	b.deletedRepos = append(b.deletedRepos, repository)
 	return nil
 }
 
+// LockedTags returns the locked tags of an existing repository.
 func (b *Backend) LockedTags(_ context.Context, repository string) (map[string]bool, error) {
 	if err := b.begin("LockedTags", repository); err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.repositories[repository] == nil {
+		return nil, NotFound("repository " + repository)
+	}
 	return maps.Clone(b.lockedTags[repository]), nil
 }
 
-func (b *Backend) UnlockManifest(_ context.Context, m *registry.Manifest) error {
+// UnlockManifest unlocks a manifest. The Relock it returns for a manifest that
+// was locked fails when Fail fails "RelockManifest".
+func (b *Backend) UnlockManifest(_ context.Context, m *registry.Manifest) (registry.Relock, error) {
 	if err := b.begin("UnlockManifest", m.Repository); err != nil {
-		return err
+		return nil, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if r := b.repositories[m.Repository]; r != nil {
-		if e := r.manifests[m.Digest]; e != nil {
-			e.attrs.Locked = false
-		}
-	}
 	b.unlocked = append(b.unlocked, m.Ref())
+	e := b.lookup(m.Repository, m.Digest)
+	if e == nil || !e.attrs.Locked {
+		return nil, nil
+	}
+	e.attrs.Locked = false
+	return func(context.Context) error {
+		if err := b.begin("RelockManifest", m.Repository); err != nil {
+			return err
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if e := b.lookup(m.Repository, m.Digest); e != nil {
+			e.attrs.Locked = true
+		}
+		b.relocked = append(b.relocked, m.Ref())
+		return nil
+	}, nil
+}
+
+// lookup returns the manifest with the digest in the repository, or nil. b.mu
+// must be held.
+func (b *Backend) lookup(repository, digest string) *entry {
+	if r := b.repositories[repository]; r != nil {
+		return r.manifests[digest]
+	}
 	return nil
 }
 
-func (b *Backend) UnlockTag(_ context.Context, repository, tag string) error {
+// UnlockTag unlocks a tag. The Relock it returns for a tag that was locked
+// fails when Fail fails "RelockTag".
+func (b *Backend) UnlockTag(_ context.Context, repository, tag string) (registry.Relock, error) {
 	if err := b.begin("UnlockTag", repository); err != nil {
-		return err
+		return nil, err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.lockedTags[repository], tag)
 	b.unlocked = append(b.unlocked, repository+":"+tag)
-	return nil
+	if !b.lockedTags[repository][tag] {
+		return nil, nil
+	}
+	delete(b.lockedTags[repository], tag)
+	return func(context.Context) error {
+		if err := b.begin("RelockTag", repository); err != nil {
+			return err
+		}
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.lockedTags[repository][tag] = true
+		b.relocked = append(b.relocked, repository+":"+tag)
+		return nil
+	}, nil
 }
 
 func (b *Backend) ProtectsLastTag() bool {

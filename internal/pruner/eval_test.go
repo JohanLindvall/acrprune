@@ -3,36 +3,42 @@ package pruner
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
 
-// keepsWithNewest builds a rule matching untagged manifests with the given
-// `newest` constraint and reports which of them it keeps.
+// keepsWithNewest builds a rule deleting untagged manifests with the given
+// `newest` constraint and reports which of them it keeps. The rule is built
+// directly rather than compiled, since rule files may not say `newest: 0`.
 func keepsWithNewest(t *testing.T, manifests []*registry.Manifest, newest int, now time.Time) []string {
 	t.Helper()
-	rule := compileRule(t, &rules.RepoRuleSpec{
-		RepoRegex: ".+",
-		Untagged: []*rules.UntaggedRuleSpec{
-			{CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: to.Ptr(newest), Keep: to.Ptr(false)}},
-		},
-	})
+	rule := &rules.RepoRule{
+		Repo:     regexp.MustCompile(".+"),
+		Untagged: []rules.UntaggedRule{{CommonRule: rules.CommonRule{MatchNewest: newest, Keep: false}}},
+	}
 	e := newEvaluator(rule, manifests, now)
 	var kept []string
 	for _, m := range manifests {
-		if e.keep(m) {
+		if keeps(e, m) {
 			kept = append(kept, m.Digest)
 		}
 	}
 	slices.Sort(kept)
 	return kept
+}
+
+// keeps reports whether the evaluator keeps the manifest.
+func keeps(e *evaluator, m *registry.Manifest) bool {
+	keep, _ := e.keep(m)
+	return keep
 }
 
 func TestMatchNewest(t *testing.T) {
@@ -70,9 +76,9 @@ func TestPlatformCriteriaMatchOnePlatform(t *testing.T) {
 	}
 	for _, arch := range []string{"amd64", "arm64"} {
 		rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", Tagged: []*rules.TaggedRuleSpec{{
-			CommonRuleSpec: rules.CommonRuleSpec{OSRegex: to.Ptr("^linux$"), ArchitectureRegex: to.Ptr("^" + arch + "$"), Keep: to.Ptr(false)},
+			CommonRuleSpec: rules.CommonRuleSpec{OSRegex: new("^linux$"), ArchitectureRegex: new("^" + arch + "$"), Keep: new(false)},
 		}}})
-		got := newEvaluator(rule, []*registry.Manifest{m}, time.Now()).keep(m)
+		got := keeps(newEvaluator(rule, []*registry.Manifest{m}, time.Now()), m)
 		if want := arch == "amd64"; got != want {
 			t.Errorf("linux/%s rule keeps index = %v, want %v", arch, got, want)
 		}
@@ -101,20 +107,20 @@ func TestNewestRanksWithinRuleMatches(t *testing.T) {
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
 		Tagged: []*rules.TaggedRuleSpec{
-			{TagRegex: to.Ptr("^release-"), CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: to.Ptr(2), Keep: to.Ptr(true)}},
-			{TagRegex: to.Ptr(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}},
+			{TagRegex: new("^release-"), CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: new(2), Keep: new(true)}},
+			{TagRegex: new(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: new(false)}},
 		},
 	})
 	e := newEvaluator(rule, all, now)
 
-	if !e.keep(releases[0]) || !e.keep(releases[1]) {
+	if !keeps(e, releases[0]) || !keeps(e, releases[1]) {
 		t.Error("the 2 newest releases should be kept despite 5 newer feature images")
 	}
-	if e.keep(releases[2]) {
+	if keeps(e, releases[2]) {
 		t.Error("the 3rd newest release should fall through to the catch-all delete rule")
 	}
 	for _, m := range features {
-		if e.keep(m) {
+		if keeps(e, m) {
 			t.Errorf("feature image %s should be deleted", m.Digest)
 		}
 	}
@@ -160,27 +166,27 @@ func TestCommonRuleMatches(t *testing.T) {
 
 	arm := testManifest("arm", now)
 	arm.Architecture = "arm64"
-	if !matches(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("arm64")}, arm) {
+	if !matches(rules.CommonRuleSpec{ArchitectureRegex: new("arm64")}, arm) {
 		t.Error("arm64 manifest should match arch regex arm64")
 	}
-	if matches(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("amd64")}, arm) {
+	if matches(rules.CommonRuleSpec{ArchitectureRegex: new("amd64")}, arm) {
 		t.Error("arm64 manifest should not match arch regex amd64")
 	}
 
 	windows := testManifest("win", now)
 	windows.OS = "windows"
-	if !matches(rules.CommonRuleSpec{OSRegex: to.Ptr("windows")}, windows) {
+	if !matches(rules.CommonRuleSpec{OSRegex: new("windows")}, windows) {
 		t.Error("windows manifest should match os regex windows")
 	}
-	if matches(rules.CommonRuleSpec{OSRegex: to.Ptr("linux")}, windows) {
+	if matches(rules.CommonRuleSpec{OSRegex: new("linux")}, windows) {
 		t.Error("windows manifest should not match os regex linux")
 	}
 
 	pinned := testManifest("sha256:pinned", now)
-	if !matches(rules.CommonRuleSpec{DigestRegex: to.Ptr("^sha256:pinned$")}, pinned) {
+	if !matches(rules.CommonRuleSpec{DigestRegex: new("^sha256:pinned$")}, pinned) {
 		t.Error("manifest should match its own digest")
 	}
-	if matches(rules.CommonRuleSpec{DigestRegex: to.Ptr("^sha256:other$")}, pinned) {
+	if matches(rules.CommonRuleSpec{DigestRegex: new("^sha256:other$")}, pinned) {
 		t.Error("manifest should not match a different digest")
 	}
 }
@@ -197,12 +203,12 @@ func TestReferrersDontConsumeNewestSlots(t *testing.T) {
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
 		Tagged: []*rules.TaggedRuleSpec{
-			{CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: to.Ptr(2), Keep: to.Ptr(true)}},
-			{TagRegex: to.Ptr(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}},
+			{CommonRuleSpec: rules.CommonRuleSpec{MatchNewest: new(2), Keep: new(true)}},
+			{TagRegex: new(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: new(false)}},
 		},
 	})
 	e := newEvaluator(rule, []*registry.Manifest{sig, a, b}, now)
-	if !e.keep(a) || !e.keep(b) {
+	if !keeps(e, a) || !keeps(e, b) {
 		t.Error("both images should occupy the 2 newest slots; the signature must not consume one")
 	}
 }
@@ -231,7 +237,7 @@ func TestMatchAny(t *testing.T) {
 	}
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
-		Tagged:    []*rules.TaggedRuleSpec{{TagRegex: to.Ptr("^v")}},
+		Tagged:    []*rules.TaggedRuleSpec{{TagRegex: new("^v")}},
 	})
 	if !matchAny(rule.Tagged[0].Tag, []string{"latest", "v1"}) {
 		t.Error("should match when any value matches")
@@ -241,5 +247,124 @@ func TestMatchAny(t *testing.T) {
 	}
 	if matchAny(rule.Tagged[0].Tag, nil) {
 		t.Error("should not match an empty value list")
+	}
+}
+
+// TestKeepDecidesTagByTag: deleting a manifest deletes all of its tags, so a
+// rule deleting one tag cannot delete the manifest while another tag is kept
+// by a rule, or matched by none. The tag keeping it is reported.
+func TestKeepDecidesTagByTag(t *testing.T) {
+	now := time.Now()
+	rule := ruleSet(t, `[{"repo": ".+", "tagged": [
+		{"tag": "^release-", "keep": true},
+		{"tag": "^feature-", "keep": false}
+	]}]`)[0]
+	tests := []struct {
+		tags         []string
+		want         bool
+		wantSparedBy string
+	}{
+		{[]string{"feature-a"}, false, ""},
+		{[]string{"feature-a", "feature-b"}, false, ""},
+		{[]string{"feature-a", "release-1"}, true, "release-1"},
+		{[]string{"feature-a", "sha-1234"}, true, "sha-1234"},
+		{[]string{"release-1", "sha-1234"}, true, ""},
+	}
+	for _, tt := range tests {
+		m := testManifest("m", now, tt.tags...)
+		keep, sparedBy := newEvaluator(rule, []*registry.Manifest{m}, now).keep(m)
+		if keep != tt.want || sparedBy != tt.wantSparedBy {
+			t.Errorf("tags %v: keep = %v, %q; want %v, %q", tt.tags, keep, sparedBy, tt.want, tt.wantSparedBy)
+		}
+	}
+}
+
+// TestNewestRanksManifestsByAnyTag: a ranked rule ranks the manifests any of
+// whose tags it matches, and then decides each tag it matches by the
+// manifest's rank.
+func TestNewestRanksManifestsByAnyTag(t *testing.T) {
+	now := time.Now()
+	newest := testManifest("newest", now, "v2", "latest")
+	older := testManifest("older", now.Add(-time.Hour), "v1")
+	rule := ruleSet(t, `[{"repo": ".+", "tagged": [
+		{"tag": "^v", "newest": 1, "keep": true},
+		{"tag": ".+", "keep": false}
+	]}]`)[0]
+	e := newEvaluator(rule, []*registry.Manifest{newest, older}, now)
+	if keep, sparedBy := e.keep(newest); !keep || sparedBy != "v2" {
+		t.Errorf("newest: keep = %v, %q; want it kept by v2 despite latest", keep, sparedBy)
+	}
+	if keeps(e, older) {
+		t.Error("older: the second newest v tag should fall through to the catch-all")
+	}
+}
+
+// TestNewestWithOtherCriteria: `newest` ranks only the manifests matching the
+// rule's other criteria, so its window shifts neither with manifests those
+// criteria exclude nor with rules earlier in the list.
+func TestNewestWithOtherCriteria(t *testing.T) {
+	now := time.Now()
+	manifest := func(digest string, age time.Duration, arch string) *registry.Manifest {
+		m := testManifest(digest, now.Add(-age))
+		m.Architecture = arch
+		return m
+	}
+	tests := []struct {
+		name      string
+		untagged  string // the untagged rules, as JSON
+		manifests []*registry.Manifest
+		wantKept  string
+	}{
+		{
+			name:     "ranks only manifests old enough",
+			untagged: `[{"newest": 2, "match_older": "1h", "keep": false}]`,
+			manifests: []*registry.Manifest{
+				manifest("fresh1", 10*time.Minute, ""), manifest("fresh2", 20*time.Minute, ""),
+				manifest("old1", 2*time.Hour, ""), manifest("old2", 3*time.Hour, ""), manifest("old3", 4*time.Hour, ""),
+			},
+			wantKept: "fresh1,fresh2,old3",
+		},
+		{
+			name:     "excludes the newest of the architecture",
+			untagged: `[{"newest": -1, "arch": "^amd64$", "keep": false}]`,
+			manifests: []*registry.Manifest{
+				manifest("arm", 0, "arm64"),
+				manifest("amd1", time.Hour, "amd64"), manifest("amd2", 2*time.Hour, "amd64"), manifest("amd3", 3*time.Hour, "amd64"),
+			},
+			wantKept: "amd1,arm",
+		},
+		{
+			// The newest manifest, kept by the earlier rule, still takes
+			// the first slot of the window.
+			name:     "ranked and unranked rules mixed",
+			untagged: `[{"digest": "^pinned$", "keep": true}, {"newest": 2, "keep": true}, {"keep": false}]`,
+			manifests: []*registry.Manifest{
+				manifest("pinned", 0, ""),
+				manifest("new1", time.Hour, ""), manifest("new2", 2*time.Hour, ""), manifest("new3", 3*time.Hour, ""),
+			},
+			wantKept: "new1,pinned",
+		},
+		{
+			name:     "equal ages rank by reference",
+			untagged: `[{"newest": -1, "keep": false}]`,
+			manifests: []*registry.Manifest{
+				manifest("c", time.Hour, ""), manifest("a", time.Hour, ""), manifest("b", time.Hour, ""),
+			},
+			wantKept: "a",
+		},
+	}
+	for _, tt := range tests {
+		rule := ruleSet(t, `[{"repo": ".+", "untagged": `+tt.untagged+`}]`)[0]
+		e := newEvaluator(rule, tt.manifests, now)
+		var kept []string
+		for _, m := range tt.manifests {
+			if keeps(e, m) {
+				kept = append(kept, m.Digest)
+			}
+		}
+		slices.Sort(kept)
+		if got := strings.Join(kept, ","); got != tt.wantKept {
+			t.Errorf("%s: kept %s, want %s", tt.name, got, tt.wantKept)
+		}
 	}
 }

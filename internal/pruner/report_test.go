@@ -1,6 +1,8 @@
 package pruner
 
 import (
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -82,6 +84,34 @@ func TestReadStatsRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+// TestReadStatsReportsPositions: a hand-edited statistics file is hard to fix
+// from encoding/json's message alone, which gives no position.
+func TestReadStatsReportsPositions(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"[\n  {\"name\": \"a\",}\n]", "line 2, column 16: invalid character '}'"},
+		{"[\n  {\"name\": \"a\"},\n  {\"name\": \"b\", \"count\": \"two\"}\n]", "line 3, column 26: json: cannot unmarshal string"},
+		{"\n  [{\"name\": \"a\", \"tagged\": {}}]", "line 2, column 28: json: cannot unmarshal object"},
+		{"[]\n\n  x", "line 3, column 3: invalid character 'x'"},
+		{"[\n  {\"name\": \"a\"}", "failed to parse statistics JSON: unexpected EOF"},
+	} {
+		_, err := ReadStats(strings.NewReader(tt.input))
+		if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+			t.Errorf("%q: error = %v, want it to start with %q", tt.input, err, tt.want)
+		}
+	}
+}
+
+// TestReadStatsRejectsInvalidNames: top prints names to the terminal, so a
+// statistics file from elsewhere must not carry escape sequences in them.
+func TestReadStatsRejectsInvalidNames(t *testing.T) {
+	for _, name := range []string{"", `x\u001b]0;title\u0007\u001b[2J`, "Upper", "a b"} {
+		_, err := ReadStats(strings.NewReader(`[{"name": "app"}, {"name": "` + name + `"}]`))
+		if err == nil || !strings.Contains(err.Error(), "statistics entry 2: invalid repository name") {
+			t.Errorf("name %q: error = %v", name, err)
+		}
+	}
+}
+
 func TestSortStatsBy(t *testing.T) {
 	cases := []struct {
 		key  string
@@ -90,6 +120,8 @@ func TestSortStatsBy(t *testing.T) {
 		{"unique", []string{"alloy", "binfmt", "authservice"}},
 		{"total", []string{"alloy", "binfmt", "authservice"}},
 		{"shared", []string{"authservice", "alloy", "binfmt"}},
+		{"tagged", []string{"alloy", "binfmt", "authservice"}},
+		{"untagged", []string{"alloy", "binfmt", "authservice"}},
 		{"count", []string{"alloy", "binfmt", "authservice"}},
 		{"running", []string{"authservice", "alloy", "binfmt"}},
 		{"name", []string{"alloy", "authservice", "binfmt"}},
@@ -164,5 +196,30 @@ func TestStatSortKeysCoverFields(t *testing.T) {
 		if !strings.Contains(strings.Join(keys, ","), want) {
 			t.Fatalf("missing sort key %q in %v", want, keys)
 		}
+	}
+}
+
+// TestWriteStatsTableUnknownDates: a repository whose manifests carry no
+// timestamps shows dashes rather than the year 1.
+func TestWriteStatsTableUnknownDates(t *testing.T) {
+	var buf strings.Builder
+	if err := WriteStatsTable(&buf, []RepositoryStats{{Name: "undated"}}, 0); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if fields := strings.Fields(lines[len(lines)-1]); len(lines) != 2 || !slices.Equal(fields[len(fields)-2:], []string{"-", "-"}) {
+		t.Errorf("table = %q, want dashes for the dates", buf.String())
+	}
+}
+
+// failingWriter fails every write.
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestWriteStatsTableReportsWriteErrors(t *testing.T) {
+	boom := errors.New("boom")
+	if err := WriteStatsTable(failingWriter{boom}, readTestStats(t), 0); !errors.Is(err, boom) {
+		t.Errorf("error = %v, want the write failure", err)
 	}
 }

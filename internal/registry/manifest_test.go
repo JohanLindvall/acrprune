@@ -96,3 +96,44 @@ func TestLogValue(t *testing.T) {
 		t.Error("a manifest without a timestamp should not log one")
 	}
 }
+
+func TestSubjectDigest(t *testing.T) {
+	if got := (&Manifest{}).SubjectDigest(); got != "" {
+		t.Errorf("an image's SubjectDigest = %q, want none", got)
+	}
+	byTag := &Manifest{TagSubject: "sha256:tagged"}
+	if got := byTag.SubjectDigest(); got != "sha256:tagged" {
+		t.Errorf("SubjectDigest = %q, want the subject the tags name", got)
+	}
+	// The OCI subject, recorded in the document itself, wins.
+	byTag.Subject = &v1.Descriptor{Digest: "sha256:declared"}
+	if got := byTag.SubjectDigest(); got != "sha256:declared" {
+		t.Errorf("SubjectDigest = %q, want the OCI subject", got)
+	}
+}
+
+func TestIsLocked(t *testing.T) {
+	tests := []struct {
+		name string
+		m    Manifest
+		want bool
+	}{
+		{"unlocked", Manifest{Attributes: Attributes{Tags: []string{"v1"}}}, false},
+		{"tag locks loaded, none locked", Manifest{Attributes: Attributes{Tags: []string{"v1"}}, LockedTags: []string{}}, false},
+		{"manifest locked", Manifest{Attributes: Attributes{Locked: true}}, true},
+		{"tag locked", Manifest{Attributes: Attributes{Tags: []string{"v1"}}, LockedTags: []string{"v1"}}, true},
+	}
+	for _, tt := range tests {
+		if got := tt.m.IsLocked(); got != tt.want {
+			t.Errorf("%s: IsLocked = %v, want %v", tt.name, got, tt.want)
+		}
+		// The dry run's locked=true annotation covers tag locks too.
+		logged := false
+		for _, a := range tt.m.LogValue().Group() {
+			logged = logged || a.Key == "locked" && a.Value.Bool()
+		}
+		if logged != tt.want {
+			t.Errorf("%s: logged locked=%v, want %v", tt.name, logged, tt.want)
+		}
+	}
+}

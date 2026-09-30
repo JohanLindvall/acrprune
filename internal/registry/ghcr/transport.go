@@ -2,7 +2,6 @@ package ghcr
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
@@ -25,42 +25,37 @@ const maxErrorBody = 64 << 10
 //
 // GitHub signals rate limiting with a 403 or 429 and asks clients to wait for
 // as long as Retry-After says, until X-RateLimit-Reset when the limit is used
-// up, and otherwise at least a minute. Waiting that out is bounded by time
-// rather than attempts, so a long cleanup rides out hourly limits instead of
-// failing halfway; transient failures get a few attempts with backoff.
+// up, and otherwise at least a minute, exponentially longer while the limit
+// persists. One rate-limited response pauses all of the backend's requests,
+// so that parallel workers do not each run into the limit again. Waiting that
+// out is bounded by time rather than attempts, so a long cleanup rides out
+// hourly limits instead of failing halfway; transient failures get a few
+// attempts with backoff.
 func (b *Backend) send(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	req.Header.Set("User-Agent", userAgent)
 	// Copy the client so a caller's redirect policy is preserved without
-	// mutating a shared client. Go otherwise forwards credentials to
-	// subdomains and across scheme/port changes on the same hostname.
+	// mutating a shared client.
 	client := *b.client
 	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		if next.URL.User != nil || (next.URL.Scheme != "https" && next.URL.Scheme != "http") ||
-			(via[0].URL.Scheme == "https" && next.URL.Scheme != "https") {
-			return errors.New("refusing an unsafe redirect")
-		}
-		if b.client.CheckRedirect != nil {
-			if err := b.client.CheckRedirect(next, via); err != nil {
-				return err
-			}
-		}
-		if !sameOrigin(next.URL, via[0].URL) {
-			if via[0].Method != http.MethodGet && via[0].Method != http.MethodHead {
-				return errors.New("refusing to redirect a mutation to another origin")
-			}
-			next.Header.Del("Authorization")
-			next.Header.Del("Proxy-Authorization")
-			next.Header.Del("Cookie")
+		if err := b.checkRedirect(next, via); err != nil {
+			return &redirectError{err}
 		}
 		return nil
 	}
 	failures := 0
 	var throttled time.Duration
 	for {
+		if wait := b.throttle.pause(b.now()); wait > 0 {
+			if wait > b.maxThrottle-throttled {
+				return nil, fmt.Errorf("rate limit exceeded: %s %s would wait %s more for GitHub's rate limit to lift", req.Method, registry.RedactURL(req.URL), wait.Round(time.Second))
+			}
+			throttled += wait
+			if err := b.sleep(ctx, wait); err != nil {
+				return nil, err
+			}
+		}
+		sent := b.now()
 		resp, err := client.Do(req.Clone(ctx))
 		var delay time.Duration
 		var reason string
@@ -68,15 +63,16 @@ func (b *Backend) send(req *http.Request) (*http.Response, error) {
 		case err != nil:
 			err = redactError(err)
 			failures++
-			if ctx.Err() != nil || failures >= b.maxAttempts {
+			if _, refused := errors.AsType[*redirectError](err); refused || ctx.Err() != nil || failures >= b.maxAttempts {
 				return nil, err
 			}
 			delay, reason = backoff(failures), err.Error()
 		case !retryable(resp):
+			b.throttle.passed(sent)
 			return resp, nil
 		case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests:
 			// retryable only passes a 403 or 429 when it is rate limiting.
-			delay = rateLimitDelay(resp, time.Now())
+			delay = b.throttle.limited(resp, sent, b.now(), b.maxThrottle)
 			if delay > b.maxThrottle-throttled {
 				return resp, nil
 			}
@@ -91,11 +87,106 @@ func (b *Backend) send(req *http.Request) (*http.Response, error) {
 			delay, reason = backoff(failures), resp.Status
 			_ = discard(resp)
 		}
-		b.logger.Warn("Retrying request", "method", req.Method, "url", redact(req.URL),
-			"reason", reason, "delay", delay, "resume", time.Now().Add(delay).Format(time.TimeOnly))
+		registry.LogRetry(b.logger, req.Method, req.URL, reason, delay, b.now())
 		if err := b.sleep(ctx, delay); err != nil {
 			return nil, err
 		}
+	}
+}
+
+// checkRedirect is the redirect policy. Go otherwise forwards credentials to
+// subdomains and across scheme/port changes on the same hostname, and follows
+// a DELETE redirected with a 301, 302 or 303 as a GET, whose success would
+// then pass for the deletion's.
+func (b *Backend) checkRedirect(next *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if next.URL.User != nil || (next.URL.Scheme != "https" && next.URL.Scheme != "http") ||
+		(via[0].URL.Scheme == "https" && next.URL.Scheme != "https") {
+		return errors.New("refusing an unsafe redirect")
+	}
+	if next.Method != via[0].Method {
+		return fmt.Errorf("refusing a redirect that turns %s into %s", via[0].Method, next.Method)
+	}
+	if b.client.CheckRedirect != nil {
+		if err := b.client.CheckRedirect(next, via); err != nil {
+			return err
+		}
+	}
+	if !sameOrigin(next.URL, via[0].URL) {
+		if via[0].Method != http.MethodGet && via[0].Method != http.MethodHead {
+			return errors.New("refusing to redirect a mutation to another origin")
+		}
+		next.Header.Del("Authorization")
+		next.Header.Del("Proxy-Authorization")
+		next.Header.Del("Cookie")
+	}
+	return nil
+}
+
+// redirectError is a redirect the policy refused, which retrying the request
+// cannot change.
+type redirectError struct{ err error }
+
+func (e *redirectError) Error() string { return e.err.Error() }
+func (e *redirectError) Unwrap() error { return e.err }
+
+// throttle is the rate limiting a backend's requests share: when GitHub turns
+// one away, they all wait until the limit lifts instead of each running into
+// it. A secondary limit that comes without saying how long to wait is waited
+// out exponentially longer each time it persists.
+type throttle struct {
+	mu sync.Mutex
+	// until is when requests may resume, and hit when rate limiting was
+	// last noticed.
+	until, hit time.Time
+	// streak counts the unguided limits hit since a request last got
+	// through.
+	streak int
+}
+
+// pause returns how long requests must still wait at now.
+func (t *throttle) pause(now time.Time) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.until.Sub(now)
+}
+
+// limited records a rate-limited response to a request sent at sent, and
+// returns how long from now to wait before retrying it. A response to a
+// request sent before the latest limit was noticed is part of the same burst,
+// which the pause already covers unless the response asks for longer. Unguided
+// waits are capped at maxDelay.
+func (t *throttle) limited(resp *http.Response, sent, now time.Time, maxDelay time.Duration) time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	burst := sent.Before(t.hit)
+	delay, guided := rateLimitDelay(resp, now)
+	switch {
+	case guided:
+	case burst:
+		delay = 0
+	default:
+		t.streak++
+		delay = min(delay<<min(t.streak-1, 16), maxDelay)
+	}
+	if !burst {
+		t.hit = now
+	}
+	if resume := now.Add(delay); resume.After(t.until) {
+		t.until = resume
+	}
+	return max(t.until.Sub(now), 0)
+}
+
+// passed records that a request sent at sent got through, so that an unguided
+// limit hit after it waits the shortest time again.
+func (t *throttle) passed(sent time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !sent.Before(t.hit) {
+		t.streak = 0
 	}
 }
 
@@ -129,44 +220,38 @@ func rateLimited(resp *http.Response, message string) bool {
 	return false
 }
 
-// rateLimitDelay returns how long a rate-limited response asks to wait.
-func rateLimitDelay(resp *http.Response, now time.Time) time.Duration {
+// rateLimitDelay returns how long a rate-limited response asks to wait, and
+// whether it says at all; otherwise it returns a minute. The times a response
+// names are measured against its Date header when it has one, so that a local
+// clock running ahead does not cut the wait short.
+func rateLimitDelay(resp *http.Response, now time.Time) (time.Duration, bool) {
+	if date, err := http.ParseTime(resp.Header.Get("Date")); err == nil {
+		now = date
+	}
 	if s := resp.Header.Get("Retry-After"); s != "" {
 		if seconds, err := strconv.ParseInt(s, 10, 64); err == nil {
 			if seconds > math.MaxInt64/int64(time.Second) {
-				return time.Duration(math.MaxInt64)
+				return time.Duration(math.MaxInt64), true
 			}
-			return time.Duration(max(seconds, 1)) * time.Second
+			return time.Duration(max(seconds, 1)) * time.Second, true
 		}
 		if t, err := http.ParseTime(s); err == nil {
-			return max(t.Sub(now), time.Second)
+			return max(t.Sub(now), time.Second), true
 		}
 	}
 	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
 		if reset, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
 			// The primary limit resets hourly; a later reset is bogus.
-			return min(max(time.Unix(reset, 0).Sub(now), 0), time.Hour-time.Second) + time.Second
+			return min(max(time.Unix(reset, 0).Sub(now), 0), time.Hour-time.Second) + time.Second, true
 		}
 	}
-	return time.Minute
+	return time.Minute, false
 }
 
 // backoff returns an exponentially growing delay for retrying after the
 // given number of transient failures.
 func backoff(failures int) time.Duration {
 	return min(time.Second<<min(max(failures-1, 0), 5), 30*time.Second)
-}
-
-// sleep waits for d or until ctx is done.
-func sleep(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // check turns a response that is not a success into an error, consuming its
@@ -184,7 +269,7 @@ func check(resp *http.Response) error {
 	if message != "" {
 		status += ": " + message
 	}
-	err := fmt.Errorf("%s %s: %s", resp.Request.Method, redact(resp.Request.URL), status)
+	err := fmt.Errorf("%s %s: %s", resp.Request.Method, registry.RedactURL(resp.Request.URL), status)
 	if rateLimited(resp, message) {
 		return fmt.Errorf("rate limit exceeded: %w", err)
 	}
@@ -227,27 +312,17 @@ func discard(resp *http.Response) error {
 	return resp.Body.Close()
 }
 
-// redact strips the query, which carries signatures on blob storage URLs, and
-// any credentials from a URL for display.
-func redact(u *url.URL) string {
-	clean := *u
-	clean.User = nil
-	clean.RawQuery = ""
-	clean.ForceQuery = false
-	clean.Fragment, clean.RawFragment = "", ""
-	return clean.String()
-}
-
 func sameOrigin(a, b *url.URL) bool {
 	return a.Scheme == b.Scheme && strings.EqualFold(a.Host, b.Host)
 }
 
+// redactURL is registry.RedactURL for a URL in text form.
 func redactURL(s string) string {
 	u, err := url.Parse(s)
 	if err != nil {
 		return "(unparsable URL)"
 	}
-	return redact(u)
+	return registry.RedactURL(u)
 }
 
 // redactError redacts the URL a failed request names. After a redirect it is

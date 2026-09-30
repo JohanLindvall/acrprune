@@ -18,7 +18,11 @@ func stackPruner(t *testing.T, b *Backend, dryRun bool) *pruner.Pruner {
 	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
 	b.logger = logger
-	reg, err := registry.New(b, logger, 4, registry.NewCache(t.TempDir()))
+	cache, err := registry.NewCache(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := registry.New(b, logger, 4, cache)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +147,36 @@ func TestPruneGHCRKeepsLastTag(t *testing.T) {
 	slices.Sort(want)
 	if got := f.remaining("app"); !slices.Equal(got, want) {
 		t.Errorf("remaining = %v, want the pinned image and the newest tagged one", got)
+	}
+}
+
+// TestPruneGHCRDeleteDenied: GitHub answers a token that may read a package
+// but not delete from it with 404, as if the versions were already gone. The
+// package is reported as denied and the run fails, instead of succeeding with
+// deletions that never happened.
+func TestPruneGHCRDeleteDenied(t *testing.T) {
+	for name, doc := range map[string]string{
+		"versions": `[{"repo": "^app$", "untagged": [{"keep": false}]}]`,
+		"package":  `[{"repo": "^app$", "untagged": [{"keep": false}], "tagged": [{"keep": false}]}]`,
+	} {
+		f, b := newFakeGitHub(t, true)
+		old := time.Now().Add(-10 * 24 * time.Hour)
+		config := f.pushBlob([]byte(`{"architecture":"amd64","os":"linux"}`))
+		f.push("app", imageDoc("v1", config), old, "v1")
+		f.push("app", imageDoc("leftover", config), old)
+		want := f.remaining("app")
+		f.denyDeletes = true
+
+		err := stackPruner(t, b, false).Prune(ctx, compile(t, doc))
+		if err == nil || !strings.Contains(err.Error(), "insufficient permission to prune 1 of 1 repositories") {
+			t.Errorf("%s: error = %v, want the package reported as denied", name, err)
+		}
+		if got := f.remaining("app"); !slices.Equal(got, want) {
+			t.Errorf("%s: remaining = %v, want %v", name, got, want)
+		}
+		if got := f.requested("DELETE"); len(got) != 1 {
+			t.Errorf("%s: deletes = %v, want the first refused one only", name, got)
+		}
 	}
 }
 

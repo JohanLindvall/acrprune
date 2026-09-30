@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
@@ -52,7 +51,7 @@ func compileRule(t *testing.T, spec *rules.RepoRuleSpec) *rules.RepoRule {
 func decideDigests(t *testing.T, p *Pruner, manifests map[string]*registry.Manifest, rule *rules.RepoRule) []string {
 	t.Helper()
 	all := slices.SortedFunc(maps.Values(manifests), byNewest)
-	kept, err := p.decide(all, manifests, rule)
+	kept, err := p.decide(all, manifests, rule, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,10 +71,10 @@ func TestShouldKeep(t *testing.T) {
 
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
-		Untagged:  []*rules.UntaggedRuleSpec{{CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}}},
+		Untagged:  []*rules.UntaggedRuleSpec{{CommonRuleSpec: rules.CommonRuleSpec{Keep: new(false)}}},
 		Tagged: []*rules.TaggedRuleSpec{
-			{TagRegex: to.Ptr("^release-"), CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(true)}},
-			{TagRegex: to.Ptr(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}},
+			{TagRegex: new("^release-"), CommonRuleSpec: rules.CommonRuleSpec{Keep: new(true)}},
+			{TagRegex: new(".+"), CommonRuleSpec: rules.CommonRuleSpec{Keep: new(false)}},
 		},
 	})
 
@@ -128,7 +127,7 @@ func TestShouldKeep(t *testing.T) {
 	p.KeepYounger = 0
 
 	// Orphan deletion overrides a keep decision.
-	orphanRule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", DeleteOrphanedManifests: to.Ptr(true)})
+	orphanRule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", DeleteOrphanedManifests: new(true)})
 	orphan := testManifest("7", old, "release-1.0")
 	orphan.Orphaned = true
 	if shouldKeep(orphan, orphanRule, []*registry.Manifest{orphan}) {
@@ -145,7 +144,7 @@ func TestShouldKeepWithoutTimestamp(t *testing.T) {
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
 		Untagged: []*rules.UntaggedRuleSpec{
-			{CommonRuleSpec: rules.CommonRuleSpec{MatchOlderThan: &rules.Duration{Duration: time.Hour}, Keep: to.Ptr(false)}},
+			{CommonRuleSpec: rules.CommonRuleSpec{MatchOlderThan: &rules.Duration{Duration: time.Hour}, Keep: new(false)}},
 		},
 	})
 
@@ -181,7 +180,7 @@ func TestKeepWithDependencies(t *testing.T) {
 
 	// A missing dependency fails unless ignore_missing_manifests is set.
 	index.Manifests = append(index.Manifests, v1.Descriptor{Digest: "gone"})
-	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false)})
+	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: new(false)})
 	if _, err := p.keepWithDependencies(index.Digest, manifests, map[string]struct{}{}, strict); err == nil {
 		t.Error("missing dependency should fail in strict mode")
 	}
@@ -228,7 +227,7 @@ func TestDecideKeepsDependencies(t *testing.T) {
 
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex: ".+",
-		Untagged:  []*rules.UntaggedRuleSpec{{CommonRuleSpec: rules.CommonRuleSpec{Keep: to.Ptr(false)}}},
+		Untagged:  []*rules.UntaggedRuleSpec{{CommonRuleSpec: rules.CommonRuleSpec{Keep: new(false)}}},
 	})
 
 	got := decideDigests(t, p, byDigest(index, child), rule)
@@ -247,10 +246,10 @@ func TestDecideMustDeleteEverything(t *testing.T) {
 
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex:            ".+",
-		MustDeleteEverything: to.Ptr(true),
+		MustDeleteEverything: new(true),
 		Tagged: []*rules.TaggedRuleSpec{
-			{CommonRuleSpec: rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("arm64"), Keep: to.Ptr(true)}},
-			{CommonRuleSpec: rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("amd64"), Keep: to.Ptr(false)}},
+			{CommonRuleSpec: rules.CommonRuleSpec{ArchitectureRegex: new("arm64"), Keep: new(true)}},
+			{CommonRuleSpec: rules.CommonRuleSpec{ArchitectureRegex: new("amd64"), Keep: new(false)}},
 		},
 	})
 

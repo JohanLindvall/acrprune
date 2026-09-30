@@ -35,11 +35,20 @@ type Backend interface {
 type Unlocker interface {
 	// LockedTags returns the names of the repository's tags that are locked.
 	LockedTags(ctx context.Context, repository string) (map[string]bool, error)
-	// UnlockManifest re-enables delete and write on a manifest.
-	UnlockManifest(ctx context.Context, m *Manifest) error
-	// UnlockTag re-enables delete and write on a tag.
-	UnlockTag(ctx context.Context, repository, tag string) error
+	// UnlockManifest re-enables delete and write on a manifest. It returns a
+	// Relock restoring exactly the attributes it changed, or nil when there
+	// was nothing to unlock. When the change fails once it was attempted, it
+	// returns the Relock along with the error: the registry may have applied
+	// the change all the same, so the caller relocks as after a success.
+	UnlockManifest(ctx context.Context, m *Manifest) (Relock, error)
+	// UnlockTag re-enables delete and write on a tag, returning a Relock like
+	// UnlockManifest.
+	UnlockTag(ctx context.Context, repository, tag string) (Relock, error)
 }
+
+// Relock restores a lock an Unlocker removed, for when the deletion it made
+// way for failed.
+type Relock func(ctx context.Context) error
 
 // BlobGetter is implemented by backends whose listings report no platform
 // (GHCR). Registry then reads the platform of an image from its config blob.
@@ -55,6 +64,20 @@ type BlobGetter interface {
 type LastTagProtector interface {
 	ProtectsLastTag() bool
 }
+
+var (
+	// ErrRepositoryChanged reports that a repository changed while it was
+	// being inspected — a manifest was pushed, deleted, retagged, updated or
+	// (un)locked — so that decisions made from the inspection are unsafe.
+	ErrRepositoryChanged = errors.New("repository changed during inspection")
+	// ErrRepositoryGone reports that a repository was deleted after it was
+	// inspected.
+	ErrRepositoryGone = errors.New("repository no longer exists")
+	// ErrUnsupportedManifest reports a manifest document in a format that
+	// cannot be decoded, such as Docker schema 1 or an unknown media type, so
+	// that nothing is known about what it references.
+	ErrUnsupportedManifest = errors.New("unsupported manifest format")
+)
 
 // ResponseError is an error response from a registry API.
 type ResponseError struct {

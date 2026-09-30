@@ -1,6 +1,8 @@
 package ghcr
 
 import (
+	"context"
+	"errors"
 	"maps"
 	"net/http"
 	"net/url"
@@ -54,6 +56,68 @@ func TestParseChallenge(t *testing.T) {
 		if _, _, err := b.parseChallenge(bad); err == nil {
 			t.Errorf("parseChallenge(%q) should be refused", bad)
 		}
+	}
+}
+
+// TestRegistryRefusesForeignChallenge: a live challenge naming a token
+// endpoint off the registry's origin, or another scheme, gets no GitHub
+// token.
+func TestRegistryRefusesForeignChallenge(t *testing.T) {
+	for _, challenge := range []string{
+		`Bearer realm="https://evil.example/token",service="ghcr.io"`,
+		`Basic realm="ghcr.io"`,
+	} {
+		f, b := newFakeGitHub(t, true)
+		digest := f.push("app", manifestDoc("a"), time.Now(), "v1")
+		f.before = func(w http.ResponseWriter, r *http.Request) bool {
+			if !strings.HasPrefix(r.URL.Path, "/v2/") {
+				return false
+			}
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.WriteHeader(http.StatusUnauthorized)
+			return true
+		}
+		if _, err := b.GetManifest(ctx, "app", digest); err == nil || !strings.Contains(err.Error(), "authenticat") {
+			t.Errorf("%s: error = %v, want the challenge refused", challenge, err)
+		}
+		if got := f.tokenExchanges(); got != 0 {
+			t.Errorf("%s: the token was exchanged %d times", challenge, got)
+		}
+	}
+}
+
+// TestTokenExchangeWaitHonorsContext: a request waiting for another's token
+// exchange stops waiting when its context ends, and the exchange completes
+// for the other.
+func TestTokenExchangeWaitHonorsContext(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	first := f.push("app", manifestDoc("a"), time.Now(), "v1")
+	other := f.push("team/api", manifestDoc("b"), time.Now(), "v1")
+	if _, err := b.GetManifest(ctx, "app", first); err != nil { // learns the token endpoint
+		t.Fatal(err)
+	}
+	exchanging, release := make(chan struct{}), make(chan struct{})
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/token" && strings.Contains(r.URL.Query().Get("scope"), "team/api") {
+			close(exchanging)
+			<-release
+		}
+		return false
+	}
+	held := make(chan error, 1)
+	go func() {
+		_, err := b.GetManifest(ctx, "team/api", other)
+		held <- err
+	}()
+	<-exchanging
+	waiting, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := b.GetManifest(waiting, "team/api", other); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("waiting request: error = %v, want its deadline", err)
+	}
+	close(release)
+	if err := <-held; err != nil {
+		t.Errorf("the exchanging request failed: %v", err)
 	}
 }
 

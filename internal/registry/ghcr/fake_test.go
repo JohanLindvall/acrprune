@@ -36,6 +36,12 @@ type fakeGitHub struct {
 	// blobStorage, when set, is where blob downloads are redirected instead
 	// of the fake itself.
 	blobStorage string
+	// scopes, when not nil, are the token's scopes, reported in
+	// X-OAuth-Scopes as GitHub does for classic personal access tokens.
+	scopes []string
+	// denyDeletes answers every DELETE with 404, as GitHub answers a token
+	// that may read a package but not delete from it.
+	denyDeletes bool
 
 	mu        sync.Mutex
 	packages  map[string][]*fakeVersion // name -> versions, newest first
@@ -94,14 +100,22 @@ func (f *fakeGitHub) backend(t *testing.T, pageSize int) *Backend {
 	return b
 }
 
-// recordSleeps makes b's retries return at once, recording their delays.
+// recordSleeps makes b's retries return at once, recording their delays, and
+// gives b a clock that only its sleeps advance.
 func recordSleeps(b *Backend) *[]time.Duration {
 	var mu sync.Mutex
 	delays := new([]time.Duration)
+	clock := time.Now()
+	b.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
 	b.sleep = func(_ context.Context, d time.Duration) error {
 		mu.Lock()
 		defer mu.Unlock()
 		*delays = append(*delays, d)
+		clock = clock.Add(d)
 		return nil
 	}
 	return delays
@@ -240,6 +254,9 @@ func (f *fakeGitHub) serveAPI(w http.ResponseWriter, r *http.Request, path strin
 		apiError(w, http.StatusBadRequest, "missing API version or user agent")
 		return
 	}
+	if f.scopes != nil {
+		w.Header().Set("X-OAuth-Scopes", strings.Join(f.scopes, ", "))
+	}
 	if path == "/users/"+testOwner && r.Method == http.MethodGet {
 		kind := "User"
 		if f.orgs {
@@ -280,11 +297,20 @@ func (f *fakeGitHub) serveAPI(w http.ResponseWriter, r *http.Request, path strin
 	}
 	pkg, err := url.PathUnescape(segments[1])
 	versions, exists := f.packages[pkg]
-	if err != nil || !exists {
+	if err != nil || !exists || f.denyDeletes && r.Method == http.MethodDelete {
 		apiError(w, http.StatusNotFound, "Package not found.")
 		return
 	}
 	switch {
+	case len(segments) == 2 && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"name": pkg, "package_type": "container", "version_count": len(versions)})
+	case len(segments) == 4 && segments[2] == "versions" && r.Method == http.MethodGet:
+		i := slices.IndexFunc(versions, func(v *fakeVersion) bool { return strconv.FormatInt(v.id, 10) == segments[3] })
+		if i < 0 {
+			apiError(w, http.StatusNotFound, "Package version not found.")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": versions[i].id, "name": versions[i].digest})
 	case len(segments) == 2 && r.Method == http.MethodDelete:
 		delete(f.packages, pkg)
 		w.WriteHeader(http.StatusNoContent)

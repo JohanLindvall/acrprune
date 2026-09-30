@@ -198,21 +198,10 @@ func TestRetryStopsWithContext(t *testing.T) {
 	cancelled, cancel := context.WithCancel(ctx)
 	b.sleep = func(ctx context.Context, d time.Duration) error {
 		cancel()
-		return sleep(ctx, d)
+		return registry.Sleep(ctx, d)
 	}
 	if _, err := b.ListRepositories(cancelled); !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want the cancellation", err)
-	}
-}
-
-func TestSleep(t *testing.T) {
-	if err := sleep(ctx, time.Millisecond); err != nil {
-		t.Errorf("sleep = %v", err)
-	}
-	cancelled, cancel := context.WithCancel(ctx)
-	cancel()
-	if err := sleep(cancelled, time.Hour); !errors.Is(err, context.Canceled) {
-		t.Errorf("sleep with a cancelled context = %v", err)
 	}
 }
 
@@ -255,23 +244,168 @@ func TestRateLimitDelay(t *testing.T) {
 		}
 		return resp
 	}
+	// GitHub's clock is ten minutes behind the local one.
+	serverNow := now.Add(-10 * time.Minute)
+	serverDate := serverNow.Format(http.TimeFormat)
 	tests := []struct {
-		name string
-		resp *http.Response
-		want time.Duration
+		name   string
+		resp   *http.Response
+		want   time.Duration
+		guided bool
 	}{
-		{"Retry-After seconds", response(http.StatusForbidden, "Retry-After", "30"), 30 * time.Second},
-		{"Retry-After zero waits a second", response(http.StatusTooManyRequests, "Retry-After", "0"), time.Second},
-		{"Retry-After date", response(http.StatusTooManyRequests, "Retry-After", now.Add(45*time.Second).Format(http.TimeFormat)), 45 * time.Second},
-		{"reset", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(time.Minute).Unix(), 10)), time.Minute + time.Second},
-		{"bogus reset is capped", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(24*time.Hour).Unix(), 10)), time.Hour},
-		{"past reset waits a second", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(-time.Minute).Unix(), 10)), time.Second},
-		{"no guidance waits a minute", response(http.StatusForbidden), time.Minute},
+		{"Retry-After seconds", response(http.StatusForbidden, "Retry-After", "30"), 30 * time.Second, true},
+		{"Retry-After zero waits a second", response(http.StatusTooManyRequests, "Retry-After", "0"), time.Second, true},
+		{"Retry-After date", response(http.StatusTooManyRequests, "Retry-After", now.Add(45*time.Second).Format(http.TimeFormat)), 45 * time.Second, true},
+		{"Retry-After date on the server's clock", response(http.StatusTooManyRequests, "Date", serverDate, "Retry-After", serverNow.Add(45*time.Second).Format(http.TimeFormat)), 45 * time.Second, true},
+		{"reset", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(time.Minute).Unix(), 10)), time.Minute + time.Second, true},
+		{"reset on the server's clock", response(http.StatusForbidden, "Date", serverDate, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(serverNow.Add(time.Minute).Unix(), 10)), time.Minute + time.Second, true},
+		{"unparsable date", response(http.StatusForbidden, "Date", "yesterday", "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(time.Minute).Unix(), 10)), time.Minute + time.Second, true},
+		{"bogus reset is capped", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(24*time.Hour).Unix(), 10)), time.Hour, true},
+		{"past reset waits a second", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(-time.Minute).Unix(), 10)), time.Second, true},
+		{"no guidance waits a minute", response(http.StatusForbidden, "Date", serverDate), time.Minute, false},
 	}
 	for _, tt := range tests {
-		if got := rateLimitDelay(tt.resp, now); got != tt.want {
-			t.Errorf("%s: rateLimitDelay = %v, want %v", tt.name, got, tt.want)
+		if got, guided := rateLimitDelay(tt.resp, now); got != tt.want || guided != tt.guided {
+			t.Errorf("%s: rateLimitDelay = %v, %v; want %v, %v", tt.name, got, guided, tt.want, tt.guided)
 		}
+	}
+}
+
+// TestThrottle: an unguided limit is waited out exponentially longer while it
+// persists, up to a cap, but not for every response of one burst of requests;
+// a request getting through starts over.
+func TestThrottle(t *testing.T) {
+	var th throttle
+	secondary := &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{}}
+	start := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) time.Time { return start.Add(d) }
+
+	if got := th.limited(secondary, at(0), at(time.Second), time.Hour); got != time.Minute {
+		t.Fatalf("first wait = %v, want a minute", got)
+	}
+	// Sent together with the first, answered a little later.
+	if got := th.limited(secondary, at(0), at(2*time.Second), time.Hour); got != time.Minute-time.Second || th.streak != 1 {
+		t.Fatalf("same burst: wait %v, streak %d; want the rest of the pause", got, th.streak)
+	}
+	if got := th.pause(at(31 * time.Second)); got != 30*time.Second {
+		t.Fatalf("pause = %v, want the 30s left", got)
+	}
+	if got := th.limited(secondary, at(time.Minute+time.Second), at(time.Minute+2*time.Second), time.Hour); got != 2*time.Minute {
+		t.Fatalf("persisting limit: wait %v, want two minutes", got)
+	}
+	for i := range 10 {
+		now := at(time.Duration(i+2) * time.Hour)
+		th.limited(secondary, now, now, time.Hour)
+	}
+	if got := th.limited(secondary, at(20*time.Hour), at(20*time.Hour), time.Hour); got != time.Hour {
+		t.Fatalf("wait = %v, want it capped at an hour", got)
+	}
+	th.passed(at(19 * time.Hour)) // sent before the latest limit
+	if th.streak == 0 {
+		t.Fatal("a request sent before the latest limit does not show that it lifted")
+	}
+	th.passed(at(21 * time.Hour))
+	if got := th.limited(secondary, at(22*time.Hour), at(22*time.Hour), time.Hour); got != time.Minute {
+		t.Fatalf("wait after a request got through = %v, want a minute", got)
+	}
+	guided := &http.Response{StatusCode: http.StatusForbidden, Header: http.Header{"Retry-After": {"5"}}}
+	if got := th.limited(guided, at(23*time.Hour), at(23*time.Hour), time.Hour); got != 5*time.Second || th.streak != 1 {
+		t.Fatalf("guided wait = %v, streak %d", got, th.streak)
+	}
+}
+
+// TestRateLimitPausesEveryRequest: a request starting while another waits
+// out a rate limit waits too, instead of running into the limit itself.
+func TestRateLimitPausesEveryRequest(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	sleeps := recordSleeps(b)
+	failFirst(f, 1, rateLimit("30"))
+	record := b.sleep
+	var other error
+	started := false
+	b.sleep = func(ctx context.Context, d time.Duration) error {
+		if !started {
+			// The first wait: start another request before any time passes.
+			started = true
+			_, other = b.ListRepositories(ctx)
+		}
+		return record(ctx, d)
+	}
+
+	if _, err := b.ListRepositories(ctx); err != nil || other != nil {
+		t.Fatalf("errors: %v, %v", err, other)
+	}
+	if !slices.Equal(*sleeps, []time.Duration{30 * time.Second, 30 * time.Second}) {
+		t.Errorf("waits = %v, want both requests to wait for the limit to lift", *sleeps)
+	}
+	// The fake records the listings it serves, not the one it turned away.
+	if got := f.requested("GET /orgs/" + testOwner + "/packages"); len(got) != 2 {
+		t.Errorf("listings = %v, want one from each request after the pause", got)
+	}
+}
+
+// TestRateLimitPauseOutlastingBudget: a request that would have to wait for
+// the shared pause longer than it may wait fails without being sent.
+func TestRateLimitPauseOutlastingBudget(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	recordSleeps(b)
+	b.throttle.until = b.now().Add(3 * time.Hour)
+	_, err := b.ListRepositories(ctx)
+	if err == nil || registry.IsPermissionError(err) || !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Errorf("error = %v, want a rate limit error", err)
+	}
+	if got := f.requested("GET /orgs/"); len(got) != 0 {
+		t.Errorf("requests sent during the pause: %v", got)
+	}
+
+	// Waiting for the pause to end stops with the request's context.
+	b.throttle.until = b.now().Add(time.Minute)
+	b.sleep = registry.Sleep
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := b.ListRepositories(cancelled); !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want the cancellation", err)
+	}
+}
+
+// TestSecondaryRateLimitBackoff: GitHub asks to wait exponentially longer
+// while a secondary limit persists without saying how long.
+func TestSecondaryRateLimitBackoff(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	sleeps := recordSleeps(b)
+	secondary := func(w http.ResponseWriter) {
+		apiError(w, http.StatusForbidden, "You have exceeded a secondary rate limit.")
+	}
+	failFirst(f, 4, secondary)
+	if _, err := b.ListRepositories(ctx); err != nil {
+		t.Fatal(err)
+	}
+	failFirst(f, 1, secondary)
+	if _, err := b.ListRepositories(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, time.Minute}
+	if !slices.Equal(*sleeps, want) {
+		t.Errorf("waits = %v, want %v", *sleeps, want)
+	}
+}
+
+// TestServerErrorsExhausted: a server error persisting through every attempt
+// fails the request with its status, which is not a permission error.
+func TestServerErrorsExhausted(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	sleeps := recordSleeps(b)
+	failFirst(f, 1000, serverError)
+	_, err := b.ListRepositories(ctx)
+	var responseErr *registry.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusBadGateway || registry.IsPermissionError(err) {
+		t.Errorf("error = %v, want a 502 response error", err)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
+	if !slices.Equal(*sleeps, want) {
+		t.Errorf("backoff = %v, want %v", *sleeps, want)
 	}
 }
 
@@ -376,16 +510,6 @@ func TestBlobRedirectDropsAuthorization(t *testing.T) {
 	}
 	if *seen != "" {
 		t.Errorf("the storage host received Authorization %q", *seen)
-	}
-}
-
-func TestRedact(t *testing.T) {
-	u, err := url.Parse("https://user:pass@storage.example/blob?signature=secret")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := redact(u); got != "https://storage.example/blob" {
-		t.Errorf("redact = %q", got)
 	}
 }
 

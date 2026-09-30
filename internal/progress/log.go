@@ -52,30 +52,44 @@ func (h *logHandler) Handle(_ context.Context, record slog.Record) error {
 		add("", attr)
 	}
 	record.Attrs(func(attr slog.Attr) bool { add(h.group, attr); return true })
-	h.tracker.appendLog(Entry{Time: record.Time, Level: record.Level, Text: clean(text.String())}, retryUntil)
+	h.tracker.appendLog(Entry{Time: record.Time, Level: record.Level, Text: truncate(clean(text.String()), maxEntryText)}, retryUntil)
 	return nil
 }
 
 func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	copy := *h
-	copy.attrs = slices.Clone(h.attrs)
+	clone := *h
+	clone.attrs = slices.Clone(h.attrs)
 	if h.group != "" {
 		for _, attr := range attrs {
 			attr.Key = h.group + attr.Key
-			copy.attrs = append(copy.attrs, attr)
+			clone.attrs = append(clone.attrs, attr)
 		}
 	} else {
-		copy.attrs = append(copy.attrs, attrs...)
+		clone.attrs = append(clone.attrs, attrs...)
 	}
-	return &copy
+	return &clone
 }
 
 func (h *logHandler) WithGroup(name string) slog.Handler {
-	copy := *h
+	clone := *h
 	if name != "" {
-		copy.group += name + "."
+		clone.group += name + "."
 	}
-	return &copy
+	return &clone
+}
+
+// maxEntryText bounds the bytes of text an entry keeps, so that the retained
+// log stays small whatever is logged: orphan warnings, for one, carry whole
+// manifests.
+const maxEntryText = 4 << 10
+
+// truncate shortens valid UTF-8 text to at most limit bytes and an ellipsis,
+// without splitting a character.
+func truncate(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return strings.ToValidUTF8(s[:limit], "") + "…"
 }
 
 // clean prevents control characters and bidi formatting in remote messages

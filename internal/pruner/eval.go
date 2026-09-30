@@ -39,10 +39,13 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 
 	var tagged, untagged []*registry.Manifest
 	for _, m := range manifests {
-		if m.Subject != nil {
+		if m.SubjectDigest() != "" || m.HasOwner {
 			// Referrers (signatures, attestations) follow their subject's
-			// fate instead of matching rules, and must not consume `newest`
-			// ranking slots meant for images.
+			// fate instead of matching rules, and the platform images and
+			// attestations of an index, tagged or not, are kept whenever
+			// the index is. Neither must consume `newest` ranking slots
+			// meant for images: every signed or multi-platform build would
+			// otherwise fill the window meant for rollbacks.
 			continue
 		}
 		if len(m.Tags) > 0 {
@@ -75,23 +78,75 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 	return e
 }
 
-// keep reports whether the first rule matching the manifest keeps it. A
-// manifest no rule matches is kept.
-func (e *evaluator) keep(m *registry.Manifest) bool {
-	if m.Subject != nil {
-		return true // subject-bearing manifests are decided by keepReferrers
+// keep reports whether the rules keep the manifest. A manifest no rule
+// matches is kept.
+//
+// Deleting a tagged manifest deletes every one of its tags, so a tagged
+// manifest is decided tag by tag: each tag gets the first rule matching it and
+// the manifest, and the manifest is deleted only when each of those rules
+// deletes it. A tag no rule matches keeps the manifest. When some tag's rule
+// deletes the manifest and another tag keeps it, sparedBy names the tag keeping
+// it; it is empty otherwise.
+func (e *evaluator) keep(m *registry.Manifest) (keep bool, sparedBy string) {
+	if m.SubjectDigest() != "" {
+		return true, "" // referrers are decided by keepReferrers
 	}
 	if len(m.Tags) == 0 {
-		for i, r := range e.rule.Untagged {
-			if e.matches(e.untagged[i], r.CommonRule, m) {
-				return r.Keep
-			}
+		return e.keepUntagged(m), ""
+	}
+	condemned := false
+	for _, tag := range m.Tags {
+		if !e.keepTag(m, tag) {
+			condemned = true
+		} else if !keep {
+			keep, sparedBy = true, tag
 		}
-	} else {
-		for i, r := range e.rule.Tagged {
-			if matchAny(r.Tag, m.Tags) && e.matches(e.tagged[i], r.CommonRule, m) {
-				return r.Keep
+	}
+	if !condemned {
+		sparedBy = "" // nothing needed sparing
+	}
+	return keep, sparedBy
+}
+
+// keepTag reports whether the first tagged rule matching the tag and the
+// manifest keeps the manifest, or whether no rule matches. `newest` ranks the
+// manifest among those the rule matches by any of their tags; the manifests
+// of an index are left to it, as keepUntagged explains.
+func (e *evaluator) keepTag(m *registry.Manifest, tag string) bool {
+	for i, r := range e.rule.Tagged {
+		if !matchString(r.Tag, tag) {
+			continue
+		}
+		if r.MatchNewest != 0 && m.HasOwner {
+			if e.matchesCriteria(r.CommonRule, m) {
+				return false
 			}
+			continue
+		}
+		if e.matches(e.tagged[i], r.CommonRule, m) {
+			return r.Keep
+		}
+	}
+	return true
+}
+
+// keepUntagged reports whether the first untagged rule matching the manifest
+// keeps it, or whether no rule matches.
+func (e *evaluator) keepUntagged(m *registry.Manifest) bool {
+	for i, r := range e.rule.Untagged {
+		if r.MatchNewest != 0 && m.HasOwner {
+			// An index's manifests are not ranked. One the rule matches
+			// otherwise is left to the indexes referencing it, which keep
+			// it whenever one of them is kept: kept on its own it could
+			// outlive them, and passed on to a later rule it could match
+			// none and outlive them all the same.
+			if e.matchesCriteria(r.CommonRule, m) {
+				return false
+			}
+			continue
+		}
+		if e.matches(e.untagged[i], r.CommonRule, m) {
+			return r.Keep
 		}
 	}
 	return true
@@ -119,15 +174,11 @@ func (e *evaluator) matches(positions map[*registry.Manifest]int, rule rules.Com
 	if !ok {
 		return false
 	}
-	switch {
-	case rule.MatchNewest > 0:
+	if rule.MatchNewest > 0 {
 		return position < rule.MatchNewest
-	case rule.MatchNewest < 0:
-		// Negate the non-negative position, not the possibly minimum int.
-		return -position <= rule.MatchNewest
-	default:
-		return true
 	}
+	// Negate the non-negative position, not the possibly minimum int.
+	return -position <= rule.MatchNewest
 }
 
 // matchesCriteria reports whether the manifest satisfies every criterion of
@@ -179,6 +230,12 @@ func matchAny(re *regexp.Regexp, values []string) bool {
 		return true
 	}
 	return slices.ContainsFunc(values, re.MatchString)
+}
+
+// matchString reports whether the value matches the regexp; a nil regexp
+// matches unconditionally.
+func matchString(re *regexp.Regexp, value string) bool {
+	return re == nil || re.MatchString(value)
 }
 
 // byNewest orders manifests newest first, breaking ties on the reference so

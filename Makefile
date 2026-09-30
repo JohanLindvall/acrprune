@@ -10,16 +10,17 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 # OS/ARCH pairs to cross-compile for `dist-all`.
 PLATFORMS := linux/amd64 linux/arm64
 
-# Pinned golangci-lint; bootstrapped into GOPATH/bin if not already present.
+# Pinned golangci-lint, installed into ./bin under a versioned name so that
+# changing the version installs it again instead of using an older binary.
 GOLANGCI_LINT_VERSION := v2.14.0
-GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
+GOLANGCI_LINT         := $(CURDIR)/bin/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
 .PHONY: all build test test-race test-scripts coverage vet lint clean dist-all
 
 all: build
 
 build:
-	go build -ldflags '$(LDFLAGS)' -o $(BINARY) $(PKG)
+	go build -trimpath -ldflags '$(LDFLAGS)' -o $(BINARY) $(PKG)
 
 test:
 	go test ./...
@@ -44,7 +45,8 @@ lint: $(GOLANGCI_LINT)
 
 # Install the pinned golangci-lint if it is missing.
 $(GOLANGCI_LINT):
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	GOBIN=$(CURDIR)/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv $(CURDIR)/bin/golangci-lint $@
 
 # Cross-compile every entry in PLATFORMS into $(DISTDIR) as a .tar.gz, then
 # write a sha256 checksum file covering all archives.
@@ -55,7 +57,7 @@ dist-all:
 	  os=$${p%/*}; arch=$${p#*/}; \
 	  echo "building $$os/$$arch"; \
 	  GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
-	    go build -ldflags '$(LDFLAGS)' -o $(DISTDIR)/$(BINARY) $(PKG) || exit 1; \
+	    go build -trimpath -ldflags '$(LDFLAGS)' -o $(DISTDIR)/$(BINARY) $(PKG) || exit 1; \
 	  tar -czf $(DISTDIR)/$(BINARY)-$(VERSION)-$$os-$$arch.tar.gz -C $(DISTDIR) $(BINARY); \
 	  rm -f $(DISTDIR)/$(BINARY); \
 	done

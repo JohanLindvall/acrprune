@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/rules"
@@ -130,14 +129,14 @@ func TestReportOrphans(t *testing.T) {
 	orphan.Orphaned = true
 	manifests := byDigest(orphan)
 
-	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false)})
+	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: new(false)})
 	if err := p.reportOrphans(manifests, strict); err == nil {
 		t.Error("orphans should be reported when neither ignored nor deleted")
 	}
 
 	tolerant := []*rules.RepoRuleSpec{
-		{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(true)},
-		{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false), DeleteOrphanedManifests: to.Ptr(true)},
+		{RepoRegex: ".+", IgnoreMissingManifests: new(true)},
+		{RepoRegex: ".+", IgnoreMissingManifests: new(false), DeleteOrphanedManifests: new(true)},
 	}
 	for _, spec := range tolerant {
 		if err := p.reportOrphans(manifests, compileRule(t, spec)); err != nil {

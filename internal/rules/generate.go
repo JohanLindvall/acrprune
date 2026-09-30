@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/JohanLindvall/acrprune/internal/imageref"
 )
 
@@ -18,6 +17,15 @@ type repoKeeps struct {
 	seen          map[string]bool // "t:"+tag / "d:"+digest already recorded
 }
 
+// ImageListCounts says how much of an image list KeepRulesFromImageList used.
+type ImageListCounts struct {
+	// Lines is the number of non-empty lines read.
+	Lines int
+	// Matched is the number of those lines naming an image of the registry;
+	// the others were ignored.
+	Matched int
+}
+
 // KeepRulesFromImageList reads image references (one per line, e.g. from a pod
 // image dump) and produces rules that keep exactly those images, deleting
 // everything else in the referenced repositories. Both tag references
@@ -25,16 +33,20 @@ type repoKeeps struct {
 // (`myreg.azurecr.io/repo@sha256:…`, with or without a tag) are kept; lines
 // not naming an image below location are ignored. location is what the
 // registry's image references start with: a login server such as
-// myreg.azurecr.io, or ghcr.io/<owner> on GHCR.
+// myreg.azurecr.io, or ghcr.io/<owner> on GHCR. It is compared
+// case-insensitively, as host names are, so `MyReg.azurecr.io/app:v1` is one
+// of myreg.azurecr.io's images. The counts say how many lines were read and
+// how many of them named an image below location.
 //
 // A repository yields exactly one rule however often it appears in the input.
 // Pruning applies only the first rule matching a repository, so a second rule
 // for the same repository would be unreachable and its images would instead be
 // deleted by the first rule's catch-all — that is, an unsorted image list would
 // delete running images.
-func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, error) {
+func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, ImageListCounts, error) {
+	var counts ImageListCounts
 	if location == "" {
-		return nil, errors.New("no registry location to match image references against")
+		return nil, counts, errors.New("no registry location to match image references against")
 	}
 	prefix := strings.TrimSuffix(location, "/") + "/"
 
@@ -46,13 +58,20 @@ func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, erro
 	for scanner.Scan() {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
-		name, matches := strings.CutPrefix(line, prefix)
-		if !matches {
+		if line == "" {
 			continue
 		}
-		repository, tag, digest, err := imageref.Split(name)
+		counts.Lines++
+		// Host names are case-insensitive. Registry locations are ASCII, so
+		// comparing the first len(prefix) bytes finds the host (and owner)
+		// in any case.
+		if len(line) < len(prefix) || !strings.EqualFold(line[:len(prefix)], prefix) {
+			continue
+		}
+		counts.Matched++
+		repository, tag, digest, err := imageref.Split(line[len(prefix):])
 		if err != nil {
-			return nil, fmt.Errorf("image list line %d: %w", lineNumber, err)
+			return nil, ImageListCounts{}, fmt.Errorf("image list line %d: %w", lineNumber, err)
 		}
 		k := keeps[repository]
 		if k == nil {
@@ -72,7 +91,7 @@ func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, erro
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read image list: %w", err)
+		return nil, ImageListCounts{}, fmt.Errorf("failed to read image list: %w", err)
 	}
 
 	specs := make([]*RepoRuleSpec, 0, len(order))
@@ -80,31 +99,31 @@ func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, erro
 		k := keeps[repository]
 		spec := &RepoRuleSpec{
 			RepoRegex:               anchored(repository),
-			IgnoreMissingManifests:  to.Ptr(true),
-			DeleteOrphanedManifests: to.Ptr(false),
+			IgnoreMissingManifests:  new(true),
+			DeleteOrphanedManifests: new(false),
 		}
 		// Digest-pinned images may or may not be tagged in the registry, so
 		// digest keeps go in both lists, ahead of the catch-alls.
 		for _, digest := range k.digests {
-			keep := CommonRuleSpec{DigestRegex: to.Ptr(anchored(digest)), Keep: to.Ptr(true)}
+			keep := CommonRuleSpec{DigestRegex: new(anchored(digest)), Keep: new(true)}
 			spec.Tagged = append(spec.Tagged, &TaggedRuleSpec{CommonRuleSpec: keep})
 			spec.Untagged = append(spec.Untagged, &UntaggedRuleSpec{CommonRuleSpec: keep})
 		}
 		for _, tag := range k.tags {
 			spec.Tagged = append(spec.Tagged, &TaggedRuleSpec{
-				TagRegex:       to.Ptr(anchored(tag)),
-				CommonRuleSpec: CommonRuleSpec{Keep: to.Ptr(true)},
+				TagRegex:       new(anchored(tag)),
+				CommonRuleSpec: CommonRuleSpec{Keep: new(true)},
 			})
 		}
 		// Everything not explicitly kept above is deleted.
 		spec.Tagged = append(spec.Tagged, &TaggedRuleSpec{
-			TagRegex:       to.Ptr(".+"),
-			CommonRuleSpec: CommonRuleSpec{Keep: to.Ptr(false)},
+			TagRegex:       new(".+"),
+			CommonRuleSpec: CommonRuleSpec{Keep: new(false)},
 		})
-		spec.Untagged = append(spec.Untagged, &UntaggedRuleSpec{CommonRuleSpec: CommonRuleSpec{Keep: to.Ptr(false)}})
+		spec.Untagged = append(spec.Untagged, &UntaggedRuleSpec{CommonRuleSpec: CommonRuleSpec{Keep: new(false)}})
 		specs = append(specs, spec)
 	}
-	return specs, nil
+	return specs, counts, nil
 }
 
 // anchored turns a literal name into a regex matching exactly that name.

@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -42,15 +43,19 @@ func TestParseManifestSizeIsDocumentOnly(t *testing.T) {
 }
 
 func TestParseManifestRejectsBadDocuments(t *testing.T) {
+	valid := `"sha256:` + strings.Repeat("a", 64) + `"`
 	tests := []struct {
 		name, raw, wantErr string
+		unsupported        bool
 	}{
-		{"malformed JSON", `{"schemaVersion": 2`, "failed to decode"},
-		{"schema version 1", `{"schemaVersion": 1}`, "unsupported schema version"},
-		{"no schema version", `{}`, "unsupported schema version"},
-		{"unknown format", `{"schemaVersion":2,"mediaType":"unknown"}`, "unsupported media type"},
-		{"bad dependency", `{"schemaVersion":2,"manifests":[{"digest":"../escape"}]}`, "invalid descriptor digest"},
-		{"negative size", `{"schemaVersion":2,"layers":[{"digest":"sha256:` + strings.Repeat("a", 64) + `","size":-1}]}`, "negative descriptor size"},
+		{"malformed JSON", `{"schemaVersion": 2`, "failed to decode", false},
+		{"schema version 1", `{"schemaVersion": 1}`, "schema version 1 (Docker image manifest schema 1)", true},
+		{"no schema version", `{}`, "schema version 0", true},
+		{"unknown format", `{"schemaVersion":2,"mediaType":"application/vnd.oci.artifact.manifest.v1+json"}`, `media type "application/vnd.oci.artifact.manifest.v1+json"`, true},
+		{"bad dependency", `{"schemaVersion":2,"manifests":[{"digest":"../escape"}]}`, "invalid descriptor digest", false},
+		{"bad config", `{"schemaVersion":2,"config":{"digest":"sha256:short"}}`, "invalid descriptor digest", false},
+		{"bad subject", `{"schemaVersion":2,"config":{"digest":` + valid + `},"subject":{"digest":"md5:x"}}`, "invalid descriptor digest", false},
+		{"negative size", `{"schemaVersion":2,"layers":[{"digest":` + valid + `,"size":-1}]}`, "negative descriptor size", false},
 	}
 	for _, tt := range tests {
 		_, err := parseManifest("myrepo", "sha256:abc", []byte(tt.raw))
@@ -58,8 +63,57 @@ func TestParseManifestRejectsBadDocuments(t *testing.T) {
 			t.Errorf("%s: expected an error", tt.name)
 			continue
 		}
-		if !strings.Contains(err.Error(), tt.wantErr) {
-			t.Errorf("%s: error = %v, want it to mention %q", tt.name, err, tt.wantErr)
+		if !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "myrepo@sha256:abc") {
+			t.Errorf("%s: error = %v, want it to name the manifest and mention %q", tt.name, err, tt.wantErr)
+		}
+		if got := errors.Is(err, ErrUnsupportedManifest); got != tt.unsupported {
+			t.Errorf("%s: errors.Is(ErrUnsupportedManifest) = %v, want %v", tt.name, got, tt.unsupported)
+		}
+	}
+}
+
+// TestCheckFormat: the format is judged from the document alone, ahead of
+// digest verification; what is not JSON is left to verification to reject.
+func TestCheckFormat(t *testing.T) {
+	for raw, unsupported := range map[string]bool{
+		`{"schemaVersion": 1, "signatures": []}`:                                                    true,
+		`{"schemaVersion": 2, "mediaType": "application/vnd.oci.artifact.manifest.v1+json"}`:        true,
+		`{"schemaVersion": 2, "mediaType": "application/vnd.docker.distribution.manifest.v2+json"}`: false,
+		`{"schemaVersion": 2}`: false,
+		`not json`:             false,
+		`["schemaVersion", 1]`: false,
+	} {
+		err := checkFormat("app@sha256:abc", []byte(raw))
+		if got := errors.Is(err, ErrUnsupportedManifest); got != unsupported || !unsupported && err != nil {
+			t.Errorf("checkFormat(%s) = %v, want unsupported=%v", raw, err, unsupported)
+		}
+	}
+}
+
+func TestTagSchemeSubject(t *testing.T) {
+	hex := strings.Repeat("ab", 32)
+	long := strings.Repeat("cd", 64)
+	tests := []struct {
+		name string
+		tags []string
+		want string
+	}{
+		{"cosign signature", []string{"sha256-" + hex + ".sig"}, "sha256:" + hex},
+		{"attestation and SBOM", []string{"sha256-" + hex + ".att", "sha256-" + hex + ".sbom"}, "sha256:" + hex},
+		{"referrers tag schema", []string{"sha256-" + hex}, "sha256:" + hex},
+		{"sha512", []string{"sha512-" + long + ".sig"}, "sha512:" + long},
+		{"untagged", nil, ""},
+		{"ordinary tag too", []string{"sha256-" + hex + ".sig", "latest"}, ""},
+		{"two subjects", []string{"sha256-" + hex + ".sig", "sha256-" + strings.Repeat("0", 64) + ".sig"}, ""},
+		{"uppercase hex", []string{"sha256-" + strings.ToUpper(hex) + ".sig"}, ""},
+		{"short hex", []string{"sha256-" + hex[:63] + ".sig"}, ""},
+		{"sha512 length for sha256", []string{"sha256-" + long}, ""},
+		{"unknown suffix", []string{"sha256-" + hex + ".cert"}, ""},
+		{"unknown algorithm", []string{"md5-" + hex[:32] + ".sig"}, ""},
+	}
+	for _, tt := range tests {
+		if got := tagSchemeSubject(tt.tags); got != tt.want {
+			t.Errorf("%s: tagSchemeSubject(%v) = %q, want %q", tt.name, tt.tags, got, tt.want)
 		}
 	}
 }

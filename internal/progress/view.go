@@ -11,7 +11,8 @@ import (
 	"github.com/rivo/uniseg"
 )
 
-func draw(screen tcell.Screen, s Snapshot, opts Options, v viewState, now time.Time) {
+// draw renders a snapshot, recording the activity panel's geometry in v.
+func draw(screen tcell.Screen, s Snapshot, opts Options, v *viewState, now time.Time) {
 	screen.Clear()
 	w, h := screen.Size()
 	if w < 1 || h < 1 {
@@ -77,10 +78,10 @@ func draw(screen tcell.Screen, s Snapshot, opts Options, v viewState, now time.T
 		lines := []string{
 			"KEYBOARD", "q / Ctrl-C  Cancel safely and wait for active requests to stop",
 			"l           Show or hide activity", "w           Toggle warnings-only activity",
-			"↑ ↓ / j k   Scroll activity; PgUp/PgDn move ten entries",
+			"↑ ↓ / j k   Scroll activity; PgUp/PgDn move a page",
 			"Home / End  Oldest activity / follow latest", "? / Esc     Show / close help",
 			"JSON stays on stdout. Progress uses the controlling terminal.",
-			"Only the latest 200 messages are retained. --progress=plain keeps full logs.",
+			fmt.Sprintf("Retains the latest %d messages and %d warnings; --progress=plain keeps all.", logLimit, warningLimit),
 		}
 		for i, line := range lines {
 			if y := 15 + i; y < h-2 {
@@ -89,24 +90,18 @@ func draw(screen tcell.Screen, s Snapshot, opts Options, v viewState, now time.T
 		}
 	} else if v.logs && h > 18 {
 		title := "ACTIVITY"
+		entries, first := s.Logs, s.DroppedLogs
 		if v.warningsOnly {
 			title += " · warnings only"
+			entries, first = s.WarningLogs, s.DroppedWarnings
 		}
-		if v.offset > 0 {
+		rows := h - 18
+		end := v.pin(first, first+len(entries), rows) - first
+		if v.scrolled {
 			title += " · scrolled (End to follow)"
 		}
 		put(15, accent, title)
-		var entries []Entry
-		for _, entry := range s.Logs {
-			if !v.warningsOnly || entry.Level >= slog.LevelWarn {
-				entries = append(entries, entry)
-			}
-		}
-		rows := h - 18
-		end := max(rows, len(entries)-v.offset)
-		end = min(end, len(entries))
-		start := max(0, end-rows)
-		for i, entry := range entries[start:end] {
+		for i, entry := range entries[max(0, end-rows):end] {
 			style := base
 			if entry.Level >= slog.LevelWarn {
 				style = warn
@@ -117,6 +112,8 @@ func draw(screen tcell.Screen, s Snapshot, opts Options, v viewState, now time.T
 	screen.Show()
 }
 
+// drawText writes one line of text from x, clipped to width cells and to the
+// screen, and ends it with an ellipsis when it does not fit.
 func drawText(screen tcell.Screen, x, y, width int, style tcell.Style, text string) {
 	w, h := screen.Size()
 	if y < 0 || y >= h || width < 1 {

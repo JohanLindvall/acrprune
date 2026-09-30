@@ -119,7 +119,7 @@ func TestCountRunning(t *testing.T) {
 	untagged := testManifest("3", now)
 	manifests := byDigest(running, stopped, untagged)
 
-	specs, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
+	specs, _, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestCountRunningDigestPinned(t *testing.T) {
 	manifests := byDigest(pinnedTagged, pinnedUntagged, otherTagged, otherUntagged)
 
 	input := "myreg.azurecr.io/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmyreg.azurecr.io/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
-	specs, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
+	specs, _, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,5 +159,19 @@ func TestCountRunningDigestPinned(t *testing.T) {
 
 	if got := countRunning(manifests, "app", ruleSet); got != 2 {
 		t.Errorf("countRunning = %d, want 2 (both pinned manifests, nothing else)", got)
+	}
+}
+
+// TestRunningMatchDecidesTagByTag: as in pruning, a manifest counts as running
+// when the first rule matching any one of its tags keeps it, even if an
+// earlier rule matches another of its tags.
+func TestRunningMatchDecidesTagByTag(t *testing.T) {
+	ruleSet := ruleSet(t, `[{"repo": "^app$", "tagged": [{"tag": "^stale$", "keep": false}, {"tag": "^running$", "keep": true}]}]`)
+	now := time.Now()
+	if !runningMatch(testManifest("both", now, "stale", "running"), "app", ruleSet) {
+		t.Error("a manifest with a running tag should count as running")
+	}
+	if runningMatch(testManifest("stale", now, "stale"), "app", ruleSet) {
+		t.Error("a manifest with only a stale tag should not count as running")
 	}
 }

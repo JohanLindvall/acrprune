@@ -3,6 +3,7 @@ package pruner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -10,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	godigest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -42,6 +42,48 @@ func ruleSet(t *testing.T, doc string) []*rules.RepoRule {
 		t.Fatal(err)
 	}
 	return ruleSet
+}
+
+// captureLog makes the pruner log to the returned builder.
+func captureLog(p *Pruner) *strings.Builder {
+	var log strings.Builder
+	p.Logger = slog.New(slog.NewTextHandler(&log, nil))
+	return &log
+}
+
+// generated returns the rules generate writes for the images, which are
+// references below myreg.azurecr.io.
+func generated(t *testing.T, images ...string) []*rules.RepoRule {
+	t.Helper()
+	specs, _, err := rules.KeepRulesFromImageList(strings.NewReader(strings.Join(images, "\n")), "myreg.azurecr.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleSet, err := rules.Compile(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ruleSet
+}
+
+// schemeTag returns the tag naming a referrer of the manifest with the digest
+// by the cosign or OCI referrers tag scheme: sha256-<hex> plus the suffix,
+// such as ".sig".
+func schemeTag(digest, suffix string) string {
+	return strings.Replace(digest, ":", "-", 1) + suffix
+}
+
+// multiArch adds to the repository an image index with untagged amd64 and
+// arm64 images, all updated at the given time. It returns the digests of the
+// index and of its images.
+func multiArch(fake *registrytest.Backend, repository, name string, updated time.Time, tags ...string) (index string, images []string) {
+	amd := fake.Add(repository, registrytest.Image(name+"-amd64"), registry.Attributes{LastUpdated: updated})
+	arm := fake.Add(repository, registrytest.Image(name+"-arm64"), registry.Attributes{LastUpdated: updated})
+	index = fake.Add(repository, registrytest.Index(
+		registrytest.Child(amd, "linux", "amd64"),
+		registrytest.Child(arm, "linux", "arm64"),
+	), registry.Attributes{Tags: tags, LastUpdated: updated})
+	return index, []string{amd, arm}
 }
 
 func refs(repository string, digests ...string) []string {
@@ -100,18 +142,32 @@ func sorted(values ...string) []string {
 	return values
 }
 
+// TestPruneDryRun: a dry run deletes nothing, and its log lists every
+// manifest it would delete, those of a repository it would delete outright
+// included, which it used to name by the repository alone.
 func TestPruneDryRun(t *testing.T) {
 	fake := registrytest.New()
-	buildApp(fake, time.Now())
-	fake.Add("stale", registrytest.Image("stale"), registry.Attributes{LastUpdated: time.Now().Add(-1000 * time.Hour)})
+	_, _, _, oldFeature, _, leftover := buildApp(fake, time.Now())
+	stale := fake.Add("stale", registrytest.Image("stale"), registry.Attributes{LastUpdated: time.Now().Add(-1000 * time.Hour)})
 
 	p := fakePruner(t, fake)
 	p.DryRun = true
+	log := captureLog(p)
 	if err := p.Prune(context.Background(), ruleSet(t, featureCleanup)); err != nil {
 		t.Fatal(err)
 	}
 	if fake.Calls("DeleteManifest") != 0 || fake.Calls("DeleteRepository") != 0 || len(fake.Deleted()) != 0 {
 		t.Error("a dry run must not delete anything")
+	}
+	for _, want := range []string{
+		`msg="Dry-run: deleting manifest" manifest.ref=app@` + oldFeature,
+		`msg="Dry-run: deleting manifest" manifest.ref=app@` + leftover,
+		`msg="Dry-run: deleting repository" repository=stale`,
+		`msg="Dry-run: deleting manifest with the repository" manifest.ref=stale@` + stale,
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("the plan lacks %s:\n%s", want, log)
+		}
 	}
 }
 
@@ -308,7 +364,7 @@ func TestKeepLastTagPrefersImages(t *testing.T) {
 	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
 
 	kept := map[string]struct{}{"untagged": {}}
-	if err := p.keepLastTag(all, manifests, nil, kept, rule); err != nil {
+	if err := p.keepLastTag(all, manifests, kept, rule, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := kept["image"]; !ok {
@@ -321,11 +377,11 @@ func TestKeepLastTagPrefersImages(t *testing.T) {
 	// Nothing changes when a tagged manifest is kept anyway, or when
 	// nothing is tagged.
 	kept = map[string]struct{}{"image": {}}
-	if err := p.keepLastTag(all, manifests, nil, kept, rule); err != nil || len(kept) != 1 {
+	if err := p.keepLastTag(all, manifests, kept, rule, now); err != nil || len(kept) != 1 {
 		t.Errorf("kept = %v, %v; want it unchanged", kept, err)
 	}
 	kept = map[string]struct{}{"untagged": {}}
-	if err := p.keepLastTag([]*registry.Manifest{untagged}, byDigest(untagged), nil, kept, rule); err != nil || len(kept) != 1 {
+	if err := p.keepLastTag([]*registry.Manifest{untagged}, byDigest(untagged), kept, rule, now); err != nil || len(kept) != 1 {
 		t.Errorf("kept = %v, %v; want it unchanged without tagged manifests", kept, err)
 	}
 
@@ -333,9 +389,9 @@ func TestKeepLastTagPrefersImages(t *testing.T) {
 	// image it needs is missing and the rule does not ignore that.
 	index := testManifest("index", now, "v1")
 	index.Manifests = []v1.Descriptor{{Digest: "missing"}}
-	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false)})
+	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: new(false)})
 	kept = map[string]struct{}{"untagged": {}}
-	if err := p.keepLastTag([]*registry.Manifest{index, untagged}, byDigest(index, untagged), nil, kept, strict); err == nil {
+	if err := p.keepLastTag([]*registry.Manifest{index, untagged}, byDigest(index, untagged), kept, strict, now); err == nil {
 		t.Error("a missing dependency of the kept tag should fail a strict rule")
 	}
 }
@@ -352,32 +408,14 @@ func TestKeepLastTagPrefersHealthyImages(t *testing.T) {
 	untagged := testManifest("untagged", now)
 	manifests := byDigest(broken, healthy, untagged)
 	markOrphans(manifests)
-	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false), DeleteOrphanedManifests: to.Ptr(true)})
+	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: new(false), DeleteOrphanedManifests: new(true)})
 
 	kept := map[string]struct{}{"untagged": {}}
-	if err := p.keepLastTag([]*registry.Manifest{broken, untagged, healthy}, manifests, nil, kept, strict); err != nil {
+	if err := p.keepLastTag([]*registry.Manifest{broken, untagged, healthy}, manifests, kept, strict, now); err != nil {
 		t.Fatalf("keepLastTag should keep the healthy image instead of failing on the broken one: %v", err)
 	}
 	if _, ok := kept["healthy"]; !ok || len(kept) != 2 {
 		t.Errorf("kept = %v, want the healthy image added", kept)
-	}
-}
-
-// TestKeepLastTagCountsMissingManifests: a tagged manifest the registry
-// listed but could not serve stays, so nothing needs keeping on its account.
-func TestKeepLastTagCountsMissingManifests(t *testing.T) {
-	p := testPruner()
-	image := testManifest("image", time.Now(), "v1")
-	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
-
-	kept := map[string]struct{}{}
-	missing := []registry.Attributes{{Digest: "gone", Tags: []string{"latest"}}}
-	if err := p.keepLastTag([]*registry.Manifest{image}, byDigest(image), missing, kept, rule); err != nil || len(kept) != 0 {
-		t.Errorf("kept = %v, %v; want nothing kept beside a missing tagged manifest", kept, err)
-	}
-	untaggedMissing := []registry.Attributes{{Digest: "gone"}}
-	if err := p.keepLastTag([]*registry.Manifest{image}, byDigest(image), untaggedMissing, kept, rule); err != nil || len(kept) != 1 {
-		t.Errorf("kept = %v, %v; want the image kept beside an untagged missing manifest", kept, err)
 	}
 }
 
@@ -441,6 +479,172 @@ func TestPruneIncludeLocked(t *testing.T) {
 	}
 }
 
+// TestPruneNewestUntaggedRanksImages: a multi-platform build stores its
+// platform images as untagged manifests. They follow their index and take no
+// `newest` slot, so keeping the 3 newest untagged images keeps 3 rollback
+// builds — not 1 plus the platform images of the tagged latest build — and the
+// platform images of a deleted build go with it rather than stay dangling.
+func TestPruneNewestUntaggedRanksImages(t *testing.T) {
+	for _, doc := range []string{
+		`[{"repo": "^app$", "untagged": [{"newest": 3, "keep": true}, {"keep": false}]}]`,
+		`[{"repo": "^app$", "untagged": [{"newest": -3, "keep": false}]}]`,
+	} {
+		fake := registrytest.New()
+		now := time.Now()
+		latest, images := multiArch(fake, "app", "latest", now.Add(-10*24*time.Hour), "latest")
+		kept := append(images, latest)
+		var deleted []string
+		for i := 1; i <= 4; i++ {
+			rollback, images := multiArch(fake, "app", fmt.Sprint("rollback", i), now.Add(-time.Duration(10+i)*24*time.Hour))
+			if i <= 3 {
+				kept = append(kept, append(images, rollback)...)
+			} else {
+				deleted = append(deleted, append(images, rollback)...)
+			}
+		}
+		if err := fakePruner(t, fake).Prune(context.Background(), ruleSet(t, doc)); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := fake.Deleted(), refs("app", deleted...); !slices.Equal(got, want) {
+			t.Errorf("%s: deleted = %v, want the oldest rollback build: %v", doc, got, want)
+		}
+		if got, want := fake.Digests("app"), sorted(kept...); !slices.Equal(got, want) {
+			t.Errorf("%s: remaining = %v, want latest and 3 rollback builds, whole: %v", doc, got, want)
+		}
+	}
+}
+
+// TestPruneNewestTaggedRanksImages: builds pushed with a tag per architecture
+// and a manifest list over them (docker manifest create app:release-N
+// app:release-N-amd64 app:release-N-arm64) filled 3 `newest` slots each, so
+// the README's rules keeping the three most recent release images kept one
+// build. Platform images take no slot, tagged or not.
+func TestPruneNewestTaggedRanksImages(t *testing.T) {
+	readme := `[{"repo": "^app$", "tagged": [{"tag": "^release-", "newest": 3, "keep": true}, {"tag": ".+", "keep": false}]}]`
+	fake := registrytest.New()
+	now := time.Now()
+	var kept, deleted []string
+	for i := 1; i <= 4; i++ {
+		updated := now.Add(-time.Duration(10-i) * 24 * time.Hour)
+		tag := fmt.Sprint("release-", i)
+		amd := fake.Add("app", registrytest.Image(tag+"-amd64"), registry.Attributes{Tags: []string{tag + "-amd64"}, LastUpdated: updated})
+		arm := fake.Add("app", registrytest.Image(tag+"-arm64"), registry.Attributes{Tags: []string{tag + "-arm64"}, LastUpdated: updated})
+		index := fake.Add("app", registrytest.Index(registrytest.Child(amd, "linux", "amd64"), registrytest.Child(arm, "linux", "arm64")), registry.Attributes{Tags: []string{tag}, LastUpdated: updated})
+		if i == 1 {
+			deleted = append(deleted, index, amd, arm)
+		} else {
+			kept = append(kept, index, amd, arm)
+		}
+	}
+	if err := fakePruner(t, fake).Prune(context.Background(), ruleSet(t, readme)); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fake.Digests("app"), sorted(kept...); !slices.Equal(got, want) {
+		t.Errorf("remaining %v, want the three newest builds, whole: %v", got, want)
+	}
+	if got, want := sorted(fake.Deleted()...), refs("app", deleted...); !slices.Equal(got, want) {
+		t.Errorf("deleted %v, want the oldest build, whole: %v", got, want)
+	}
+}
+
+// TestPruneTaggedPlatformImageFollowsItsIndex: a platform image carrying a
+// tag of its own, retagged more recently than its index, took the first
+// `newest` slot, pushing out a whole build, and could be kept on its own while
+// its index was deleted. It follows its index instead: a ranked rule its tag
+// reaches leaves it to the index rather than to the rules after it.
+func TestPruneTaggedPlatformImageFollowsItsIndex(t *testing.T) {
+	for _, doc := range []string{
+		`[{"repo": "^app$", "tagged": [{"tag": "^release-", "newest": 2, "keep": true}, {"tag": ".+", "keep": false}], "untagged": [{"keep": false}]}]`,
+		`[{"repo": "^app$", "tagged": [{"tag": "^release-", "newest": -2, "keep": false}], "untagged": [{"keep": false}]}]`,
+	} {
+		fake := registrytest.New()
+		now := time.Now()
+		old := now.Add(-30 * 24 * time.Hour)
+		build := func(name string, updated time.Time) []string {
+			index, images := multiArch(fake, "app", name, updated, name)
+			return append(images, index)
+		}
+		kept := append(build("release-3", old.Add(2*time.Hour)), build("release-2", old.Add(time.Hour))...)
+		amd := fake.Add("app", registrytest.Image("release-1-amd64"), registry.Attributes{Tags: []string{"release-1-amd64"}, LastUpdated: now.Add(-48 * time.Hour)})
+		arm := fake.Add("app", registrytest.Image("release-1-arm64"), registry.Attributes{LastUpdated: old})
+		index := fake.Add("app", registrytest.Index(registrytest.Child(amd, "linux", "amd64"), registrytest.Child(arm, "linux", "arm64")), registry.Attributes{Tags: []string{"release-1"}, LastUpdated: old})
+
+		if err := fakePruner(t, fake).Prune(context.Background(), ruleSet(t, doc)); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := fake.Digests("app"), sorted(kept...); !slices.Equal(got, want) {
+			t.Errorf("%s: remaining %v, want the two newest builds, whole: %v", doc, got, want)
+		}
+		if got, want := sorted(fake.Deleted()...), refs("app", index, amd, arm); !slices.Equal(got, want) {
+			t.Errorf("%s: deleted %v, want the oldest build with its tagged platform image: %v", doc, got, want)
+		}
+	}
+}
+
+// TestPruneLogsPlannedDeletions: a dry run's log lines say what would be
+// deleted, never that it was.
+func TestPruneLogsPlannedDeletions(t *testing.T) {
+	for _, dryRun := range []bool{true, false} {
+		fake := registrytest.New()
+		buildApp(fake, time.Now())
+		p := fakePruner(t, fake)
+		p.DryRun = dryRun
+		log := captureLog(p)
+		if err := p.Prune(context.Background(), ruleSet(t, featureCleanup)); err != nil {
+			t.Fatal(err)
+		}
+		planned := strings.Contains(log.String(), "totals.would_delete_manifests=2") && strings.Contains(log.String(), " would_delete=")
+		done := strings.Contains(log.String(), "totals.deleted_manifests=2") && strings.Contains(log.String(), " deleted=")
+		if planned != dryRun || done == dryRun {
+			t.Errorf("dry run %v: log labels deletions wrongly:\n%s", dryRun, log)
+		}
+	}
+}
+
+// TestPruneFailsOnOrphansUnlessTolerated: a rule neither ignoring missing
+// manifests nor deleting orphans stops the run at a broken index, before
+// anything is deleted.
+func TestPruneFailsOnOrphansUnlessTolerated(t *testing.T) {
+	fake := registrytest.New()
+	old := time.Now().Add(-48 * time.Hour)
+	missing := "sha256:" + strings.Repeat("0", 64)
+	fake.Add("app", registrytest.Index(registrytest.Child(missing, "linux", "amd64")), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old})
+	fake.Add("app", registrytest.Image("leftover"), registry.Attributes{LastUpdated: old})
+
+	strict := ruleSet(t, `[{"repo": "^app$", "ignore_missing_manifests": false, "untagged": [{"keep": false}]}]`)
+	if err := fakePruner(t, fake).Prune(context.Background(), strict); err == nil || !strings.Contains(err.Error(), "orphaned") {
+		t.Errorf("error = %v, want the orphan reported", err)
+	}
+	if fake.Calls("DeleteManifest") != 0 || fake.Calls("DeleteRepository") != 0 {
+		t.Error("deleted despite the orphan")
+	}
+}
+
+// TestPruneStopsWhenCanceled: an interrupted run starts no further
+// repository.
+func TestPruneStopsWhenCanceled(t *testing.T) {
+	fake := registrytest.New()
+	old := time.Now().Add(-48 * time.Hour)
+	fake.Add("a", registrytest.Image("a"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old})
+	next := fake.Add("b", registrytest.Image("b"), registry.Attributes{LastUpdated: old})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.Fail = func(op, repository string) error {
+		if op == "GetManifest" && repository == "a" {
+			cancel() // while the first repository is inspected
+		}
+		return nil
+	}
+
+	err := fakePruner(t, fake).Prune(ctx, ruleSet(t, `[{"repo": ".+", "untagged": [{"keep": false}]}]`))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want the cancellation", err)
+	}
+	if got := fake.Digests("b"); !slices.Equal(got, []string{next}) || fake.Calls("DeleteRepository") != 0 {
+		t.Errorf("b = %v, want the repository after the interruption untouched", got)
+	}
+}
+
 // TestPrunePlatformsFromConfig covers registries whose listings report no
 // platform (GHCR): a rule matching on architecture has it read from the image
 // config, and a rule that does not never pays for the download.
@@ -492,7 +696,7 @@ func TestCollectRegistryStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	specs, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
+	specs, _, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -542,5 +746,86 @@ func TestCollectRegistryStats(t *testing.T) {
 	boom := errors.New("write failed")
 	if _, err := CollectRegistryStats(context.Background(), reg, nil, func([]RepositoryStats) error { return boom }); !errors.Is(err, boom) {
 		t.Errorf("an update failure should abort, got %v", err)
+	}
+}
+
+// TestCollectRegistryStatsSucceeds: a scan of repositories that can all be
+// read succeeds. A repository gone between the catalog listing and its scan
+// is left out, and manifests the registry lists but cannot serve are counted
+// like the others, their bytes unknown.
+func TestCollectRegistryStatsSucceeds(t *testing.T) {
+	fake := registrytest.New()
+	now := time.Now()
+	fake.Add("app", registrytest.Image("app"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: now})
+	fake.AddMissing("app", registry.Attributes{Digest: "sha256:" + strings.Repeat("0", 64), Tags: []string{"v0"}, LastUpdated: now})
+	fake.AddMissing("app", registry.Attributes{Digest: "sha256:" + strings.Repeat("1", 64), LastUpdated: now})
+	fake.AddRepository("gone")
+	fake.Fail = func(op, repository string) error {
+		if op == "ListManifests" && repository == "gone" {
+			return registrytest.NotFound("repository " + repository)
+		}
+		return nil
+	}
+	reg, err := registry.New(fake, slog.New(slog.DiscardHandler), 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := CollectRegistryStats(context.Background(), reg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 1 || stats[0].Name != "app" {
+		t.Fatalf("stats = %+v, want app only", stats)
+	}
+	if got := stats[0]; got.Count != 3 || got.Tagged != 2 || got.Untagged != 1 {
+		t.Errorf("app count/tagged/untagged = %d/%d/%d, want 3/2/1 with the missing manifests", got.Count, got.Tagged, got.Untagged)
+	}
+}
+
+// TestCollectRegistryStatsSkipsUnreliableRepositories: a repository that
+// changed during its scan, or holds a manifest in an unsupported format, is
+// skipped; the others are scanned, and the error names the skipped ones.
+func TestCollectRegistryStatsSkipsUnreliableRepositories(t *testing.T) {
+	fake := registrytest.New()
+	now := time.Now()
+	fake.Put("legacy", []byte(`{"schemaVersion": 1, "name": "legacy", "tag": "v1"}`), registry.Attributes{Tags: []string{"v1"}, LastUpdated: now})
+	fake.Add("tools", registrytest.Image("tool"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: now})
+	reg, err := registry.New(fake, slog.New(slog.DiscardHandler), 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := CollectRegistryStats(context.Background(), reg, nil, nil)
+	if !errors.Is(err, registry.ErrUnsupportedManifest) || !strings.Contains(err.Error(), "skipped 1 of 2 repositories that could not be scanned reliably: legacy: ") {
+		t.Errorf("error = %v, want legacy reported", err)
+	}
+	if len(stats) != 1 || stats[0].Name != "tools" {
+		t.Errorf("stats = %+v, want tools scanned", stats)
+	}
+}
+
+// TestCollectRegistryStatsReturnsPartialResultsWhenCanceled: an interrupted
+// scan returns what it collected, with the cancellation.
+func TestCollectRegistryStatsReturnsPartialResultsWhenCanceled(t *testing.T) {
+	fake := registrytest.New()
+	fake.Add("a", registrytest.Image("a"), registry.Attributes{LastUpdated: time.Now()})
+	fake.Add("b", registrytest.Image("b"), registry.Attributes{LastUpdated: time.Now()})
+	reg, err := registry.New(fake, slog.New(slog.DiscardHandler), 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stats, err := CollectRegistryStats(ctx, reg, nil, func([]RepositoryStats) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want the cancellation", err)
+	}
+	if len(stats) != 1 || stats[0].Name != "a" {
+		t.Errorf("stats = %+v, want the first repository's", stats)
 	}
 }

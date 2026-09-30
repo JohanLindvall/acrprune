@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +88,50 @@ func TestNewErrors(t *testing.T) {
 	}
 }
 
+// TestNewChecksScopes: GitHub reports the scopes of classic and OAuth tokens,
+// so one that cannot do the job fails before any scan; other tokens report
+// none and are not checked.
+func TestNewChecksScopes(t *testing.T) {
+	tests := []struct {
+		name       string
+		scopes     []string
+		needDelete bool
+		want       string // the error, or "" for none
+	}{
+		{"fine-grained token", nil, true, ""},
+		{"read", []string{"repo", "read:packages"}, false, ""},
+		{"write includes read", []string{"write:packages"}, false, ""},
+		{"read and delete", []string{"read:packages", "delete:packages"}, true, ""},
+		{"no packages scope", []string{"repo", "workflow"}, false, "lacks the read:packages scope (it has: repo, workflow)"},
+		{"no scopes", []string{}, false, "lacks the read:packages scope (it has: none)"},
+		{"no delete", []string{"read:packages"}, true, "lacks the delete:packages scope"},
+		{"neither", []string{"gist"}, true, "lacks the read:packages and delete:packages scopes"},
+	}
+	for _, tt := range tests {
+		f, _ := newFakeGitHub(t, true)
+		f.scopes = tt.scopes
+		_, err := New(ctx, Options{Owner: testOwner, Token: testToken, PageSize: 10, APIURL: f.url, RegistryURL: f.url, NeedDelete: tt.needDelete})
+		switch {
+		case tt.want == "" && err != nil:
+			t.Errorf("%s: %v", tt.name, err)
+		case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "gh auth refresh --scopes read:packages,delete:packages")):
+			t.Errorf("%s: error = %v, want it to say %q and how to fix it", tt.name, err, tt.want)
+		}
+	}
+}
+
+// TestNewDecodeFailure: an account lookup that is not JSON fails New.
+func TestNewDecodeFailure(t *testing.T) {
+	f, _ := newFakeGitHub(t, true)
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = w.Write([]byte("<html>"))
+		return true
+	}
+	if _, err := New(ctx, Options{Owner: testOwner, Token: testToken, PageSize: 10, APIURL: f.url, RegistryURL: f.url}); err == nil || !strings.Contains(err.Error(), "failed to decode GitHub account") {
+		t.Errorf("error = %v", err)
+	}
+}
+
 func TestNewDefaults(t *testing.T) {
 	f, _ := newFakeGitHub(t, true)
 	b, err := New(ctx, Options{Owner: testOwner, Token: testToken, PageSize: 500, APIURL: f.url, RegistryURL: f.url})
@@ -163,12 +209,16 @@ func TestListManifests(t *testing.T) {
 		t.Errorf("version listing requests = %v", got)
 	}
 
-	if err := b.ListManifests(ctx, "gone", func(registry.Attributes) error { return nil }); !registry.IsNotFound(err) {
-		t.Errorf("missing package error = %v, want not found", err)
+	// GitHub hides private packages a token may not read the same way.
+	if err := b.ListManifests(ctx, "gone", func(registry.Attributes) error { return nil }); !registry.IsNotFound(err) || !strings.Contains(err.Error(), "not visible to this token") {
+		t.Errorf("missing package error = %v, want not found, naming the possible lack of access", err)
 	}
 	boom := errors.New("boom")
 	if err := b.ListManifests(ctx, "team/app", func(registry.Attributes) error { return boom }); !errors.Is(err, boom) {
 		t.Errorf("fn error = %v, want %v", err, boom)
+	}
+	if err := b.ListManifests(ctx, "team/../app", func(registry.Attributes) error { return nil }); err == nil || !strings.Contains(err.Error(), "invalid repository name") {
+		t.Errorf("unsafe repository name: error = %v", err)
 	}
 }
 
@@ -317,9 +367,13 @@ func TestDeleteManifest(t *testing.T) {
 		t.Errorf("delete requests = %v", f.requested("DELETE"))
 	}
 
-	// Deleting what is already gone succeeds, as it does on ACR.
+	// Deleting what is already gone succeeds, as it does on ACR, once a GET
+	// confirms it is gone.
 	if err := b.DeleteManifest(ctx, m); err != nil {
 		t.Errorf("deleting a deleted version: %v", err)
+	}
+	if got := f.requested("GET /orgs/" + testOwner + "/packages/container/team%2Fapp/versions/" + id); len(got) != 1 {
+		t.Errorf("confirming requests = %v", got)
 	}
 
 	for _, bad := range []string{"", "12/../34", "-1"} {
@@ -327,6 +381,130 @@ func TestDeleteManifest(t *testing.T) {
 		if err := b.DeleteManifest(ctx, m); err == nil || !strings.Contains(err.Error(), "package version id") {
 			t.Errorf("ID %q: error = %v, want a missing-id error", bad, err)
 		}
+	}
+	m.ID, m.Repository = id, "../escape"
+	if err := b.DeleteManifest(ctx, m); err == nil || !strings.Contains(err.Error(), "invalid repository name") {
+		t.Errorf("unsafe repository name: error = %v", err)
+	}
+	if err := b.DeleteRepository(ctx, "Team/App"); err == nil || !strings.Contains(err.Error(), "invalid repository name") {
+		t.Errorf("unsafe repository name: error = %v", err)
+	}
+	if got := f.requested("DELETE"); len(got) != 2 {
+		t.Errorf("refused names still made requests: %v", got)
+	}
+}
+
+// TestDeleteDeniedAsNotFound: GitHub answers a DELETE the token may not make
+// with 404, as if the resource were gone. One that still exists is reported
+// as a permission error, so the package counts as denied rather than pruned.
+func TestDeleteDeniedAsNotFound(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("keep"), time.Now(), "v1")
+	drop := f.push("app", manifestDoc("drop"), time.Now())
+	want := f.remaining("app")
+	f.denyDeletes = true
+
+	err := b.DeleteManifest(ctx, &registry.Manifest{Repository: "app", Attributes: registry.Attributes{Digest: drop, ID: f.versionID("app", drop)}})
+	if !registry.IsPermissionError(err) || registry.IsNotFound(err) || !strings.Contains(err.Error(), "delete:packages") {
+		t.Errorf("DeleteManifest error = %v, want a permission error naming the scope", err)
+	}
+	err = b.DeleteRepository(ctx, "app")
+	if !registry.IsPermissionError(err) || !strings.Contains(err.Error(), "still exists") {
+		t.Errorf("DeleteRepository error = %v, want a permission error", err)
+	}
+	if got := f.remaining("app"); !slices.Equal(got, want) {
+		t.Errorf("remaining = %v, want %v", got, want)
+	}
+}
+
+// TestDeleteUnconfirmed: a DELETE answered with 404 whose resource cannot be
+// looked up is not taken for deleted.
+func TestDeleteUnconfirmed(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	drop := f.push("app", manifestDoc("drop"), time.Now())
+	id := f.versionID("app", drop)
+	recordSleeps(b)
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method == http.MethodDelete {
+			apiError(w, http.StatusNotFound, "Package not found.")
+		} else {
+			serverError(w)
+		}
+		return true
+	}
+	err := b.DeleteManifest(ctx, &registry.Manifest{Repository: "app", Attributes: registry.Attributes{Digest: drop, ID: id}})
+	var responseErr *registry.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusBadGateway || !strings.Contains(err.Error(), "checking whether it still exists failed") {
+		t.Errorf("error = %v, want the failed check", err)
+	}
+}
+
+// TestDeleteRefusesRewritingRedirect: Go follows a DELETE redirected with 301
+// as a GET, whose success must not pass for a deletion. The refusal is final,
+// not retried.
+func TestDeleteRefusesRewritingRedirect(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("keep"), time.Now(), "v1")
+	drop := f.push("app", manifestDoc("drop"), time.Now())
+	want := f.remaining("app")
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodDelete {
+			return false
+		}
+		http.Redirect(w, r, "/users/"+testOwner, http.StatusMovedPermanently)
+		return true
+	}
+	err := b.DeleteManifest(ctx, &registry.Manifest{Repository: "app", Attributes: registry.Attributes{Digest: drop, ID: f.versionID("app", drop)}})
+	if err == nil || !strings.Contains(err.Error(), "refusing a redirect that turns DELETE into GET") {
+		t.Errorf("error = %v, want the refused redirect", err)
+	}
+	if got := f.remaining("app"); !slices.Equal(got, want) {
+		t.Errorf("remaining = %v, want %v", got, want)
+	}
+	if got := f.requested("GET /users/"); len(got) != 1 {
+		t.Errorf("the redirect was followed: %v", got)
+	}
+}
+
+// TestListingDecodeFailures: a listing page that is not JSON fails the
+// listing.
+func TestListingDecodeFailures(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		_, _ = w.Write([]byte(`{"not": "a list"}`))
+		return true
+	}
+	if _, err := b.ListRepositories(ctx); err == nil || !strings.Contains(err.Error(), "failed to decode packages") {
+		t.Errorf("ListRepositories error = %v", err)
+	}
+	if err := b.ListManifests(ctx, "app", func(registry.Attributes) error { return nil }); err == nil || !strings.Contains(err.Error(), "failed to decode package versions") {
+		t.Errorf("ListManifests error = %v", err)
+	}
+}
+
+// TestListingStaysOnOrigin: the next page of a live listing is not fetched
+// from another host, which would receive the token.
+func TestListingStaysOnOrigin(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	var foreign atomic.Int32
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreign.Add(1)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer elsewhere.Close()
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasSuffix(r.URL.Path, "/packages") {
+			w.Header().Set("Link", "<"+elsewhere.URL+"/orgs/acme/packages?page=2>; rel=\"next\"")
+		}
+		return false
+	}
+	if _, err := b.ListRepositories(ctx); err == nil || !strings.Contains(err.Error(), "refusing to follow the next page link") {
+		t.Errorf("error = %v", err)
+	}
+	if foreign.Load() != 0 {
+		t.Error("the foreign host was asked for the next page")
 	}
 }
 

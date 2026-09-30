@@ -54,6 +54,9 @@ type Options struct {
 	// Token is a GitHub token with the read:packages scope, and
 	// delete:packages to delete.
 	Token string
+	// NeedDelete makes New also require the delete:packages scope of a token
+	// that reports its scopes. Set it for a run that deletes.
+	NeedDelete bool
 	// Username accompanies Token at the registry's token endpoint. GHCR does
 	// not check it; it defaults to a placeholder.
 	Username string
@@ -88,13 +91,17 @@ type Backend struct {
 	// maxThrottle how long one request waits out rate limiting.
 	maxAttempts int
 	maxThrottle time.Duration
-	// sleep waits before a retry; tests replace it.
+	throttle    throttle
+	// now reads the clock and sleep waits before a retry; tests replace
+	// them.
+	now   func() time.Time
 	sleep func(context.Context, time.Duration) error
 }
 
 // New returns a backend for the owner's container packages. It looks the owner
 // up to learn whether it is a user or an organization, whose packages live
-// under different REST paths, and so also checks the token.
+// under different REST paths, and so also checks the token: its scopes too,
+// when GitHub reports them.
 func New(ctx context.Context, opts Options) (*Backend, error) {
 	if opts.Token == "" {
 		return nil, errors.New("a GitHub token is required")
@@ -125,7 +132,8 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 		tokens:      tokenCache{byScope: map[string]string{}},
 		maxAttempts: 6,
 		maxThrottle: 2 * time.Hour,
-		sleep:       sleep,
+		now:         time.Now,
+		sleep:       registry.Sleep,
 	}
 	if b.username == "" {
 		b.username = defaultUsername
@@ -137,12 +145,53 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 		b.logger = slog.New(slog.DiscardHandler)
 	}
 
-	namespace, err := b.namespace(ctx)
+	namespace, header, err := b.namespace(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkScopes(header, opts.NeedDelete); err != nil {
 		return nil, err
 	}
 	b.packages = b.apiURL.String() + "/" + namespace + "/" + url.PathEscape(b.owner) + "/packages"
 	return b, nil
+}
+
+// checkScopes fails when the headers of a response to the token list its
+// scopes and they lack read:packages, which write:packages includes, or
+// delete:packages when needDelete is set. GitHub lists them in X-OAuth-Scopes
+// for personal access tokens (classic) and OAuth tokens such as the GitHub
+// CLI's; fine-grained and GitHub App tokens, including Actions' GITHUB_TOKEN,
+// have none to list, and what they may do shows only when they are used.
+func checkScopes(header http.Header, needDelete bool) error {
+	values := header.Values("X-OAuth-Scopes")
+	if values == nil {
+		return nil
+	}
+	scopes := map[string]bool{}
+	for _, value := range values {
+		for scope := range strings.SplitSeq(value, ",") {
+			scopes[strings.TrimSpace(scope)] = true
+		}
+	}
+	var missing []string
+	if !scopes["read:packages"] && !scopes["write:packages"] {
+		missing = append(missing, "read:packages")
+	}
+	if needDelete && !scopes["delete:packages"] {
+		missing = append(missing, "delete:packages")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	granted := strings.TrimSpace(strings.Join(values, ", "))
+	if granted == "" {
+		granted = "none"
+	}
+	lacking, it := "the "+missing[0]+" scope", "it"
+	if len(missing) > 1 {
+		lacking, it = "the "+strings.Join(missing, " and ")+" scopes", "them"
+	}
+	return fmt.Errorf("the GitHub token lacks %s (it has: %s); use a token with %s, or for a GitHub CLI login run: gh auth refresh --scopes read:packages,delete:packages", lacking, granted, it)
 }
 
 // baseURL parses a service URL, falling back to def when it is empty.
@@ -158,26 +207,27 @@ func baseURL(s, def string) (*url.URL, error) {
 }
 
 // namespace returns the REST path segment of the owner's kind of account:
-// "orgs" for an organization, "users" otherwise.
-func (b *Backend) namespace(ctx context.Context) (string, error) {
+// "orgs" for an organization, "users" otherwise. It also returns the headers
+// of the response, which describe the token.
+func (b *Backend) namespace(ctx context.Context) (string, http.Header, error) {
 	resp, err := b.api(ctx, http.MethodGet, b.apiURL.String()+"/users/"+url.PathEscape(b.owner))
 	if registry.IsNotFound(err) {
-		return "", fmt.Errorf("no GitHub user or organization named %q", b.owner)
+		return "", nil, fmt.Errorf("no GitHub user or organization named %q", b.owner)
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to look up GitHub account %s: %w", b.owner, err)
+		return "", nil, fmt.Errorf("failed to look up GitHub account %s: %w", b.owner, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	var account struct {
 		Type string `json:"type"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&account); err != nil {
-		return "", fmt.Errorf("failed to decode GitHub account %s: %w", b.owner, err)
+		return "", nil, fmt.Errorf("failed to decode GitHub account %s: %w", b.owner, err)
 	}
 	if account.Type == "Organization" {
-		return "orgs", nil
+		return "orgs", resp.Header, nil
 	}
-	return "users", nil
+	return "users", resp.Header, nil
 }
 
 // ListRepositories returns the names of the owner's container packages.
@@ -238,7 +288,7 @@ func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(
 	if !imageref.ValidRepository(repository) {
 		return fmt.Errorf("invalid repository name %q", repository)
 	}
-	return b.paginate(ctx, b.packageURL(repository)+"/versions?per_page="+strconv.Itoa(b.pageSize), func(body io.Reader) error {
+	err := b.paginate(ctx, b.packageURL(repository)+"/versions?per_page="+strconv.Itoa(b.pageSize), func(body io.Reader) error {
 		var page []packageVersion
 		if err := json.NewDecoder(body).Decode(&page); err != nil {
 			return fmt.Errorf("failed to decode package versions: %w", err)
@@ -250,6 +300,12 @@ func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(
 		}
 		return nil
 	})
+	if registry.IsNotFound(err) {
+		// GitHub answers a token that may not read a private package the
+		// same way, so as not to confirm that it exists.
+		return fmt.Errorf("package %s not found, or not visible to this token: %w", repository, err)
+	}
+	return err
 }
 
 // GetManifest downloads a manifest document from the registry API.
@@ -297,13 +353,26 @@ func (b *Backend) packageURL(repository string) string {
 }
 
 // delete issues a DELETE, treating a resource that is already gone as
-// deleted, as ACR does. That is unusual right after listing it, so it is
-// logged.
+// deleted, as ACR does. GitHub also answers 404 to a DELETE the token may not
+// make, so as not to confirm that a private package exists: a resource counts
+// as deleted only when a GET no longer finds it either, and one still there
+// makes a permission error. Either is unusual right after listing it, so an
+// already deleted resource is logged.
 func (b *Backend) delete(ctx context.Context, u string) error {
 	resp, err := b.api(ctx, http.MethodDelete, u)
 	if registry.IsNotFound(err) {
-		b.logger.Warn("Nothing to delete; treating as already deleted", "err", err)
-		return nil
+		found, getErr := b.api(ctx, http.MethodGet, u)
+		switch {
+		case getErr == nil:
+			_ = discard(found)
+			return &registry.ResponseError{StatusCode: http.StatusForbidden, Err: fmt.Errorf(
+				"GitHub answered 404 to DELETE %s, but it still exists: the token likely lacks the delete:packages scope or admin access to the package", redactURL(u))}
+		case registry.IsNotFound(getErr):
+			b.logger.Warn("Nothing to delete; treating as already deleted", "err", err)
+			return nil
+		default:
+			return fmt.Errorf("GitHub answered 404 to DELETE %s, and checking whether it still exists failed: %w", redactURL(u), getErr)
+		}
 	}
 	if err != nil {
 		return err

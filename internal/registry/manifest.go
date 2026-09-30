@@ -51,6 +51,18 @@ type Manifest struct {
 	OCIManifest
 	Attributes
 	Repository string
+	// TagSubject is the digest of the manifest this one is a referrer of by
+	// naming convention rather than by an OCI subject: cosign tags the
+	// signatures, attestations and SBOMs of <alg>:<hex> as <alg>-<hex>.sig,
+	// .att and .sbom, and the OCI referrers tag schema tags the index of its
+	// referrers <alg>-<hex>. FetchRepositoryManifests sets it only when every
+	// tag names the same manifest listed in the repository; it is empty
+	// otherwise, and always when Subject is set. See SubjectDigest.
+	TagSubject string
+	// LockedTags are the manifest's tags that are locked against deletion or
+	// overwriting, as loaded by Registry.LoadTagLocks: nil until loaded, and
+	// empty but not nil once loaded when none is.
+	LockedTags []string
 	Size       uint64 // size of the manifest document itself
 	Orphaned   bool   // manifest is missing or has a broken dependency chain
 	HasOwner   bool   // referenced by an index manifest
@@ -60,6 +72,24 @@ type Manifest struct {
 // for display and ordering; API calls address Repository and Digest directly.
 func (m *Manifest) Ref() string {
 	return m.Repository + "@" + m.Digest
+}
+
+// SubjectDigest returns the digest of the manifest this one refers to, when it
+// is a referrer such as a signature, attestation or SBOM: its OCI subject, or
+// else the subject its tags name (TagSubject). It returns "" for a manifest
+// that refers to none.
+func (m *Manifest) SubjectDigest() string {
+	if m.Subject != nil {
+		return string(m.Subject.Digest)
+	}
+	return m.TagSubject
+}
+
+// IsLocked reports whether deleting the manifest is prevented by a lock on the
+// manifest itself or on one of its tags. Tag locks are known only once
+// Registry.LoadTagLocks has loaded them.
+func (m *Manifest) IsLocked() bool {
+	return m.Locked || len(m.LockedTags) > 0
 }
 
 // HasTimestamp reports whether the registry told us when the manifest was last
@@ -119,7 +149,7 @@ func (m *Manifest) LogValue() slog.Value {
 	if m.Orphaned {
 		attrs = append(attrs, slog.Bool("orphaned", true))
 	}
-	if m.Locked {
+	if m.IsLocked() {
 		attrs = append(attrs, slog.Bool("locked", true))
 	}
 	if len(m.Tags) > 0 {

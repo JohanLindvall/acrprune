@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,12 +20,18 @@ type Cache struct {
 	dir string
 }
 
-// NewCache returns a cache rooted at dir, or nil when dir is empty.
-func NewCache(dir string) *Cache {
+// NewCache returns a cache rooted at dir, creating the directory, or nil when
+// dir is empty. An unusable dir — a file, or a path that cannot be created —
+// is an error, so that a mistyped --cache fails fast instead of silently
+// caching nothing.
+func NewCache(dir string) (*Cache, error) {
 	if dir == "" {
-		return nil
+		return nil, nil
 	}
-	return &Cache{dir: dir}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("unusable cache directory: %w", err)
+	}
+	return &Cache{dir: dir}, nil
 }
 
 // path returns the file backing digest, or "" when the cache is disabled or
@@ -54,15 +61,17 @@ func (c *Cache) Get(digest string) []byte {
 	return data
 }
 
-// Put stores a document; cache write failures are ignored.
-func (c *Cache) Put(digest string, data []byte) {
+// Put stores a document. Documents the cache does not take — an unsafe digest,
+// an oversized document, or any document when caching is disabled — are
+// skipped without error. The write is atomic but not flushed to disk: every
+// read is verified against the digest, so a document torn by a crash is
+// merely downloaded again.
+func (c *Cache) Put(digest string, data []byte) error {
 	path := c.path(digest)
 	if path == "" || len(data) > MaxDocumentSize {
-		return
+		return nil
 	}
-	if err := os.MkdirAll(c.dir, 0o700); err == nil {
-		_ = fileio.WriteFile(path, data, 0o600)
-	}
+	return fileio.WriteFileNoSync(path, data, 0o600)
 }
 
 // Remove drops a document from the cache.

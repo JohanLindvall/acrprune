@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -33,6 +34,12 @@ var imageConfigTypes = []string{
 	v1.MediaTypeImageConfig,
 	"application/vnd.docker.container.image.v1+json",
 }
+
+// tagSchemePattern matches the tags naming the referrers of the manifest with
+// digest <alg>:<hex>: cosign's <alg>-<hex>.sig, .att and .sbom for signatures,
+// attestations and SBOMs, and the OCI referrers tag schema's <alg>-<hex> for
+// the index listing its referrers on registries without the referrers API.
+var tagSchemePattern = regexp.MustCompile(`^(sha256-[0-9a-f]{64}|sha512-[0-9a-f]{128})(?:\.(?:sig|att|sbom))?$`)
 
 // MaxDocumentSize bounds the manifests and image configs read into memory.
 // Far beyond anything a registry accepts, it only guards against a runaway
@@ -77,7 +84,11 @@ type Contents struct {
 
 // FetchRepositoryManifests downloads every manifest in the repository. found
 // is false when the repository itself does not exist and missing manifests
-// are ignored.
+// are ignored. A manifest listed twice fails with ErrRepositoryChanged, and a
+// manifest in a format that cannot be decoded with ErrUnsupportedManifest.
+//
+// Manifests without an OCI subject whose tags all name another manifest of the
+// repository by the cosign or OCI referrers tag scheme get it as TagSubject.
 func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository string, opts FetchOptions) (contents Contents, found bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return Contents{}, false, err
@@ -110,7 +121,7 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 			return fmt.Errorf("listing returned an invalid manifest digest %q: %w", attrs.Digest, err)
 		}
 		if _, duplicate := seen[attrs.Digest]; duplicate {
-			return fmt.Errorf("manifest %s@%s was listed more than once; the repository may have changed during pagination, rerun the command", repository, attrs.Digest)
+			return fmt.Errorf("%w: manifest %s@%s was listed more than once, as happens when the repository changes during pagination; rerun the command", ErrRepositoryChanged, repository, attrs.Digest)
 		}
 		seen[attrs.Digest] = struct{}{}
 		attrs.Tags = slices.Clone(attrs.Tags)
@@ -140,7 +151,7 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 			return Contents{}, false, waitErr
 		}
 		if opts.IgnoreMissing && IsNotFound(listErr) {
-			r.logger.Warn("Repository missing", "repository", repository)
+			r.logger.Warn("Repository missing", "repository", repository, "err", listErr)
 			return Contents{}, false, nil
 		}
 		return Contents{}, false, fmt.Errorf("failed to list manifests for %s: %w", repository, listErr)
@@ -149,6 +160,7 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 		return Contents{}, false, err
 	}
 
+	r.deriveTagSubjects(manifests, seen)
 	if opts.Platforms {
 		progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Resolving image platforms"})
 	}
@@ -159,6 +171,47 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	return Contents{Manifests: manifests, Missing: missing}, true, nil
 }
 
+// deriveTagSubjects sets the TagSubject of the manifests without an OCI
+// subject whose every tag names, by the cosign or OCI referrers tag scheme, one
+// and the same other manifest listed in the repository. A manifest naming a
+// manifest that is not listed — its signatures kept in a separate
+// COSIGN_REPOSITORY, or already dangling — stays an ordinary tagged manifest.
+func (r *Registry) deriveTagSubjects(manifests map[string]*Manifest, listed map[string]struct{}) {
+	for _, m := range manifests {
+		if m.Subject != nil {
+			continue
+		}
+		subject := tagSchemeSubject(m.Tags)
+		if subject == "" || subject == m.Digest {
+			continue
+		}
+		if _, ok := listed[subject]; !ok {
+			r.logger.Debug("Tag-scheme subject not in repository; treating as an ordinary tagged manifest", "manifest", m, "subject", subject)
+			continue
+		}
+		r.logger.Debug("Treating tag-scheme manifest as a referrer of its subject", "manifest", m, "subject", subject)
+		m.TagSubject = subject
+	}
+}
+
+// tagSchemeSubject returns the digest every one of tags names by the cosign or
+// OCI referrers tag scheme, or "" when there is no such digest.
+func tagSchemeSubject(tags []string) string {
+	subject := ""
+	for _, tag := range tags {
+		match := tagSchemePattern.FindStringSubmatch(tag)
+		if match == nil {
+			return ""
+		}
+		digest := strings.Replace(match[1], "-", ":", 1)
+		if subject != "" && digest != subject {
+			return ""
+		}
+		subject = digest
+	}
+	return subject
+}
+
 // fetchManifest downloads (or loads from cache) a single manifest document.
 // It returns nil without error when the manifest is missing and ignoreMissing
 // is set.
@@ -167,8 +220,13 @@ func (r *Registry) fetchManifest(ctx context.Context, repository, digest string,
 	raw, err := r.fetchDocument(ctx, digest, func() ([]byte, error) {
 		r.logger.Debug("Downloading manifest", "manifest", ref)
 		return r.backend.GetManifest(ctx, repository, digest)
+	}, func(raw []byte) error {
+		return checkFormat(ref, raw)
 	})
 	if err != nil {
+		if errors.Is(err, ErrUnsupportedManifest) {
+			return nil, err
+		}
 		if ignoreMissing && IsNotFound(err) {
 			r.logger.Warn("Manifest missing", "manifest", ref)
 			return nil, nil
@@ -180,8 +238,8 @@ func (r *Registry) fetchManifest(ctx context.Context, repository, digest string,
 
 // fetchDocument returns the cached document for digest, or downloads it,
 // verifies it and caches it. A cached document that fails verification is
-// downloaded afresh.
-func (r *Registry) fetchDocument(ctx context.Context, digest string, download func() ([]byte, error)) ([]byte, error) {
+// downloaded afresh. check, when set, vets a download before verification.
+func (r *Registry) fetchDocument(ctx context.Context, digest string, download func() ([]byte, error), check func([]byte) error) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -196,12 +254,21 @@ func (r *Registry) fetchDocument(ctx context.Context, digest string, download fu
 	if len(raw) > MaxDocumentSize {
 		return nil, fmt.Errorf("document exceeds %d bytes", MaxDocumentSize)
 	}
+	if check != nil {
+		if err := check(raw); err != nil {
+			return nil, err
+		}
+	}
 	// Verify against the digest that was asked for, whatever the server
 	// claims: the content is cached under that digest.
 	if err := verify(digest, raw); err != nil {
 		return nil, err
 	}
-	r.cache.Put(digest, raw)
+	if err := r.cache.Put(digest, raw); err != nil {
+		r.cacheWarning.Do(func() {
+			r.logger.Warn("Failed to write to the cache; further failures are not reported", "err", err)
+		})
+	}
 	return raw, nil
 }
 
@@ -217,6 +284,36 @@ func verify(digest string, content []byte) error {
 	return nil
 }
 
+// checkFormat rejects a manifest document in a format parseManifest cannot
+// decode, with ErrUnsupportedManifest. It runs before digest verification: the
+// digest of a signed Docker schema 1 manifest covers its payload without the
+// signatures, so such a manifest would otherwise read as tampered content.
+// Anything that is not JSON is left to verification and decoding to report.
+func checkFormat(ref string, raw []byte) error {
+	var head struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+	}
+	if json.Unmarshal(raw, &head) != nil {
+		return nil
+	}
+	return formatError(ref, head.SchemaVersion, head.MediaType)
+}
+
+// formatError returns an ErrUnsupportedManifest for a manifest of an
+// undecodable schema version or media type, and nil for a supported one.
+func formatError(ref string, schemaVersion int, mediaType string) error {
+	switch {
+	case schemaVersion == 1:
+		return fmt.Errorf("manifest %s: %w: schema version 1 (Docker image manifest schema 1)", ref, ErrUnsupportedManifest)
+	case schemaVersion != 2:
+		return fmt.Errorf("manifest %s: %w: schema version %d", ref, ErrUnsupportedManifest, schemaVersion)
+	case mediaType != "" && !slices.Contains(strings.Split(ManifestMediaTypes, ","), mediaType):
+		return fmt.Errorf("manifest %s: %w: media type %q", ref, ErrUnsupportedManifest, mediaType)
+	}
+	return nil
+}
+
 // parseManifest decodes a downloaded manifest document.
 //
 // Size covers the document itself and nothing else: the config and layer blobs
@@ -228,11 +325,8 @@ func parseManifest(repository, digest string, raw []byte) (*Manifest, error) {
 	if err := json.Unmarshal(raw, &result.OCIManifest); err != nil {
 		return nil, fmt.Errorf("failed to decode manifest %s@%s: %w", repository, digest, err)
 	}
-	if result.SchemaVersion != 2 {
-		return nil, fmt.Errorf("manifest %s@%s: unsupported schema version %d", repository, digest, result.SchemaVersion)
-	}
-	if result.MediaType != "" && !slices.Contains(strings.Split(ManifestMediaTypes, ","), result.MediaType) {
-		return nil, fmt.Errorf("manifest %s@%s: unsupported media type %q", repository, digest, result.MediaType)
+	if err := formatError(result.Ref(), result.SchemaVersion, result.MediaType); err != nil {
+		return nil, err
 	}
 	check := func(desc v1.Descriptor) error {
 		if err := desc.Digest.Validate(); err != nil {
@@ -326,7 +420,7 @@ func (r *Registry) fetchPlatform(ctx context.Context, blobs BlobGetter, reposito
 	raw, err := r.fetchDocument(ctx, digest, func() ([]byte, error) {
 		r.logger.Debug("Downloading image config", "repository", repository, "digest", digest)
 		return blobs.GetBlob(ctx, repository, digest)
-	})
+	}, nil)
 	if err != nil {
 		if IsNotFound(err) {
 			r.logger.Warn("Image config missing; platform unknown", "repository", repository, "digest", digest)

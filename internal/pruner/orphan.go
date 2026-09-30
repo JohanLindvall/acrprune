@@ -41,8 +41,7 @@ func markOrphans(manifests map[string]*registry.Manifest) {
 				mark(m)
 			}
 		}
-		if m.Subject != nil {
-			digest := string(m.Subject.Digest)
+		if digest := m.SubjectDigest(); digest != "" {
 			if manifests[digest] != nil {
 				parents[digest] = append(parents[digest], m)
 			} else {

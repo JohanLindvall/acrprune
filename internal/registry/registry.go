@@ -9,17 +9,23 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 
 	"github.com/JohanLindvall/acrprune/internal/imageref"
 
 	"golang.org/x/sync/errgroup"
 )
 
+// Registry reads and deletes the manifests of one registry through its
+// Backend, adding parallelism, caching, digest verification and logging.
 type Registry struct {
 	backend     Backend
 	logger      *slog.Logger
 	parallelism int
 	cache       *Cache
+	// cacheWarning logs only the first failure to write to the cache: one
+	// failure typically means all of them fail.
+	cacheWarning sync.Once
 }
 
 // New returns a Registry over the backend, reading through the given cache,
@@ -54,6 +60,15 @@ func (r *Registry) group(ctx context.Context) (*errgroup.Group, context.Context)
 	return group, groupCtx
 }
 
+// pool returns an errgroup limited to the configured parallelism whose tasks
+// do not cancel each other: only the caller's context stops them. Deletions
+// use it, so that one failure does not abort unrelated requests midway.
+func (r *Registry) pool() *errgroup.Group {
+	var group errgroup.Group
+	group.SetLimit(r.parallelism)
+	return &group
+}
+
 // ListRepositories returns the names of all repositories in the registry.
 func (r *Registry) ListRepositories(ctx context.Context) ([]string, error) {
 	if err := ctx.Err(); err != nil {
@@ -73,24 +88,6 @@ func (r *Registry) ListRepositories(ctx context.Context) ([]string, error) {
 	}
 	r.logger.Debug("Fetched repositories", "count", len(repositories))
 	return repositories, nil
-}
-
-// DeleteRepository deletes an entire repository and evicts its known manifests
-// from the cache. Pass the inspected manifests when they are available.
-func (r *Registry) DeleteRepository(ctx context.Context, repository string, known ...*Manifest) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !imageref.ValidRepository(repository) {
-		return fmt.Errorf("invalid repository name %q", repository)
-	}
-	if err := r.backend.DeleteRepository(ctx, repository); err != nil {
-		return fmt.Errorf("failed to delete repository %s: %w", repository, err)
-	}
-	for _, m := range known {
-		r.cache.Remove(m.Digest)
-	}
-	return nil
 }
 
 // ProtectsLastTag reports whether the registry refuses to delete the last

@@ -24,6 +24,19 @@ func TestSplit(t *testing.T) {
 	}
 }
 
+func TestValidOwner(t *testing.T) {
+	for _, owner := range []string{"acme", "a-b", "my.org_1", strings.Repeat("a", 255)} {
+		if !ValidOwner(owner) {
+			t.Errorf("rejected valid owner %q", owner)
+		}
+	}
+	for _, bad := range []string{"", "a/b", "..", "A", "-acme", "acme-", strings.Repeat("a", 256)} {
+		if ValidOwner(bad) {
+			t.Errorf("accepted invalid owner %q", bad)
+		}
+	}
+}
+
 func FuzzSplit(f *testing.F) {
 	for _, s := range []string{"app", "team/app:v1", "../x", "app@sha256:" + strings.Repeat("a", 64)} {
 		f.Add(s)

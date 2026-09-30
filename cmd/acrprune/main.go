@@ -14,15 +14,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/term"
 
 	"github.com/JohanLindvall/acrprune/internal/fileio"
 	"github.com/JohanLindvall/acrprune/internal/progress"
@@ -33,7 +32,9 @@ import (
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
 
-// version is set at build time via -ldflags "-X main.version=...".
+// version is set at build time via -ldflags "-X main.version=...". Other
+// builds report the module version Go recorded in the binary, if any: see
+// resolveVersion.
 var version = "dev"
 
 // errRegistryRequired is returned by commands that need the registry when the
@@ -41,14 +42,65 @@ var version = "dev"
 // local-only commands such as top can run without it.
 var errRegistryRequired = errors.New("required flag --registry not set")
 
+// snapshotInterval is the least time between two rewrites of a statistics
+// output file during a scan.
+const snapshotInterval = 5 * time.Second
+
+// Seams for tests: whether stdin is a terminal, the progress display, and the
+// GHCR backend.
+var (
+	stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
+	runProgress     = progress.Run
+	newGHCR         = ghcr.New
+)
+
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	cmd := newCommand()
-	err := cmd.Run(ctx, os.Args)
-	stop()
-	if err != nil {
-		os.Exit(1)
+	os.Exit(run(os.Args))
+}
+
+// run runs the command line args and returns the exit status, as exitCode
+// determines it. SIGINT and SIGTERM end the run as interrupts describes.
+func run(args []string) int {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	done := make(chan struct{})
+	defer close(done)
+	in := &interrupts{}
+	go in.handle(signals, done, cancel)
+	err := newCommand().Run(withInterrupts(ctx, in), args)
+	return exitCode(err, context.Cause(ctx))
+}
+
+// exitCode returns the exit status of a run that returned err, whose context
+// was canceled with cause, if at all: 0 on success, 1 on failure, and for a
+// run cut short 128 plus the number of the signal, as shells report a process
+// that signal killed.
+func exitCode(err, cause error) int {
+	if err == nil {
+		return 0
 	}
+	if c, ok := errors.AsType[signalCause](cause); ok {
+		return signalStatus(c.Signal)
+	}
+	// Ctrl-C in the terminal display is a key, not a signal, but interrupts
+	// the run all the same.
+	if errors.Is(err, context.Canceled) {
+		return signalStatus(syscall.SIGINT)
+	}
+	return 1
+}
+
+// resolveVersion returns the version to report: the one set at build time,
+// else the module version that go install recorded in the binary, as
+// debug.ReadBuildInfo returns it, else "dev".
+func resolveVersion(info *debug.BuildInfo, ok bool) string {
+	if version != "dev" || !ok || info.Main.Version == "" || info.Main.Version == "(devel)" {
+		return version
+	}
+	return info.Main.Version
 }
 
 // newCommand builds the acrprune CLI command tree. It is split out from main
@@ -71,15 +123,27 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 
 	cmd := &cli.Command{
 		Name:    "acrprune",
-		Version: version,
+		Version: resolveVersion(debug.ReadBuildInfo()),
 		Usage:   "prune Azure Container Registry and GitHub Container Registry manifests using declarative rules",
+		// Only an unknown command reaches the root action with arguments;
+		// urfave/cli would report it as a missing help topic.
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			if !cmd.Args().Present() {
+				return cli.ShowRootCommandHelp(cmd)
+			}
+			name := cmd.Args().First()
+			if suggestion := cli.SuggestCommand(cmd.Commands, name); suggestion != "" {
+				return fmt.Errorf("unknown command %q; did you mean %q? (see --help)", name, suggestion)
+			}
+			return fmt.Errorf("unknown command %q (see --help)", name)
+		},
 		Commands: []*cli.Command{
 			{
 				Name:    "statistics",
 				Aliases: []string{"stats"},
 				Usage:   "write per-repository size and manifest statistics as JSON",
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "output", Aliases: []string{"o", "out", "outfile"}},
+					&cli.StringFlag{Name: "output", Aliases: []string{"o", "out", "outfile"}, Usage: "statistics JSON file, rewritten during the scan (defaults to stdout)"},
 					&cli.StringFlag{Name: "running", Usage: "file of running images used to annotate stats"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
@@ -90,36 +154,53 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					if err != nil {
 						return err
 					}
-					runningRules, err := loadRunningRules(cmd.String("running"), addr)
+					runningRules, err := loadRunningRules(cmd.String("running"), addr, logger)
 					if err != nil {
 						return err
 					}
-					return progress.Run(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "statistics", Registry: addr.String()}, logger, func(ctx context.Context, logger *slog.Logger) error {
+					outPath := cmd.String("output")
+					toStdout := outPath == "" || outPath == "-"
+					// Statistics for stdout are written once the progress
+					// display has restored the terminal: written while it
+					// runs, they would land on its alternate screen, which is
+					// discarded when it closes.
+					var stdoutStats []pruner.RepositoryStats
+					err = display(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "statistics", Registry: addr.String()}, logger, func(ctx context.Context, logger *slog.Logger) error {
 						reg, err := connect(ctx, cmd, addr, logger)
 						if err != nil {
 							return err
 						}
 
-						outPath := cmd.String("output")
 						var onUpdate func([]pruner.RepositoryStats) error
-						if outPath != "" && outPath != "-" {
-							// Rewrite the file after each repository so partial
-							// results survive an interrupted run.
-							onUpdate = func(stats []pruner.RepositoryStats) error {
+						if !toStdout {
+							// Rewrite the file periodically so partial results
+							// survive an interrupted run. Rewriting it after
+							// every repository would take time quadratic in
+							// their number.
+							onUpdate = throttled(snapshotInterval, time.Now, func(stats []pruner.RepositoryStats) error {
 								return writeOutput(outPath, stats)
-							}
+							})
 						}
 
 						// Denied repositories yield partial stats and an error;
 						// write what was collected either way.
 						stats, err := pruner.CollectRegistryStats(ctx, reg, runningRules, onUpdate)
+						if toStdout {
+							stdoutStats = stats
+							return err
+						}
 						if stats == nil {
 							return err
 						}
-						// Write once more so an empty registry still leaves valid
-						// JSON behind rather than an empty file.
+						// Write once more so the file holds every repository,
+						// and an empty registry still leaves valid JSON behind
+						// rather than an empty file.
 						return errors.Join(writeOutput(outPath, stats), err)
 					})
+					if stdoutStats != nil {
+						err = errors.Join(writeOutput(outPath, stdoutStats), err)
+					}
+					return err
 				},
 			},
 			{
@@ -127,9 +208,10 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 				Usage: "delete manifests and empty repositories according to a rule file",
 				Flags: []cli.Flag{
 					&cli.StringFlag{Name: "input", Aliases: []string{"in", "infile"}, Usage: "rule file (defaults to stdin)"},
-					&cli.BoolFlag{Name: "dry-run", Aliases: []string{"dryrun"}, Value: true},
-					&cli.DurationFlag{Name: "keep-younger", Aliases: []string{"keepyounger"}, Value: 24 * time.Hour, Usage: "never delete manifests updated within this period"},
-					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "unlock delete/write-disabled manifests and tags before deleting them (ACR)"},
+					&cli.BoolFlag{Name: "dry-run", Aliases: []string{"dryrun"}, Value: true, Usage: "only log what would be deleted (default: true); pass --dry-run=false to delete"},
+					&ruleDurationFlag{Name: "keep-younger", Aliases: []string{"keepyounger"}, Value: 24 * time.Hour, Usage: "never delete manifests updated within this period (e.g. 36h, 7d, 2w)"},
+					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "delete locked manifests too, unlocking them and their tags just before (ACR); they are kept by default"},
+					&cli.StringFlag{Name: "running", Usage: "file of running images never to delete, whatever the rules say"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if err := noArguments(cmd); err != nil {
@@ -143,23 +225,30 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					if keepYounger < 0 {
 						return errors.New("--keep-younger must not be negative")
 					}
+					if in := interruptsOf(ctx); in != nil && addr.Kind == registry.ACR && cmd.Bool("include-locked") && !cmd.Bool("dry-run") {
+						in.unlocking.Store(true) // GHCR has no locks
+					}
 
-					in, closeIn, err := openInput(cmd.String("input"))
+					ruleSet, err := parseInput(cmd.String("input"), "rule file", func(r io.Reader) ([]*rules.RepoRule, error) {
+						specs, err := rules.ParseSpecs(r)
+						if err != nil {
+							return nil, err
+						}
+						return rules.Compile(specs)
+					})
 					if err != nil {
 						return err
 					}
-					defer closeIn()
-
-					specs, err := rules.ParseSpecs(in)
-					if err != nil {
-						return err
-					}
-					ruleSet, err := rules.Compile(specs)
+					warnings := rules.Warnings(ruleSet)
+					runningRules, err := loadRunningRules(cmd.String("running"), addr, logger)
 					if err != nil {
 						return err
 					}
 
-					return progress.Run(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "prune", Registry: addr.String(), DryRun: cmd.Bool("dry-run")}, logger, func(ctx context.Context, logger *slog.Logger) error {
+					return display(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "prune", Registry: addr.String(), DryRun: cmd.Bool("dry-run")}, logger, func(ctx context.Context, logger *slog.Logger) error {
+						for _, warning := range warnings {
+							logger.Warn("Rule never applies", "file", inputName(cmd.String("input")), "detail", warning)
+						}
 						reg, err := connect(ctx, cmd, addr, logger)
 						if err != nil {
 							return err
@@ -170,6 +259,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 							DryRun:        cmd.Bool("dry-run"),
 							KeepYounger:   keepYounger,
 							IncludeLocked: cmd.Bool("include-locked"),
+							Protect:       runningRules,
 						}
 						return p.Prune(ctx, ruleSet)
 					})
@@ -177,9 +267,10 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 			},
 			{
 				Name:  "generate",
-				Usage: "generate a rule file keeping only the images listed on stdin",
+				Usage: "generate a rule file keeping only the images listed in the input",
 				Flags: []cli.Flag{
-					&cli.StringFlag{Name: "output", Aliases: []string{"out", "outfile"}},
+					&cli.StringFlag{Name: "input", Aliases: []string{"in", "infile"}, Usage: "image list, one reference per line (defaults to stdin)"},
+					&cli.StringFlag{Name: "output", Aliases: []string{"o", "out", "outfile"}, Usage: "rule file to write (defaults to stdout)"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
 					if err := noArguments(cmd); err != nil {
@@ -189,11 +280,23 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					if err != nil {
 						return err
 					}
-					specs, err := rules.KeepRulesFromImageList(os.Stdin, addr.String())
+					var counts rules.ImageListCounts
+					specs, err := parseInput(cmd.String("input"), "image list", func(r io.Reader) ([]*rules.RepoRuleSpec, error) {
+						specs, c, err := rules.KeepRulesFromImageList(r, addr.String())
+						counts = c
+						return specs, err
+					})
 					if err != nil {
 						return err
 					}
-					logger.Debug("Built rules", "rules", len(specs))
+					if len(specs) == 0 {
+						// Safe, as an empty rule file prunes nothing, but most
+						// likely a failed inventory or the wrong --registry.
+						logger.Warn("No image in the input belongs to this registry; the rule file is empty",
+							"lines", counts.Lines, "expected_prefix", addr.String()+"/")
+					}
+					logger.Info("Built rules", "rules", len(specs), "lines", counts.Lines,
+						"matched", counts.Matched, "ignored", counts.Lines-counts.Matched)
 					return writeOutput(cmd.String("output"), specs)
 				},
 			},
@@ -224,13 +327,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					if inPath == "" {
 						inPath = cmd.Args().First()
 					}
-					in, closeIn, err := openInput(inPath)
-					if err != nil {
-						return err
-					}
-					defer closeIn()
-
-					stats, err := pruner.ReadStats(in)
+					stats, err := parseInput(inPath, "statistics file", pruner.ReadStats)
 					if err != nil {
 						return err
 					}
@@ -249,6 +346,9 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 			if cmd.Bool("verbose") {
 				logLevel.Set(slog.LevelDebug)
 			}
+			if in := interruptsOf(ctx); in != nil {
+				in.base.Store(logger)
+			}
 
 			pageSize := cmd.Int("page-size")
 			if pageSize < 1 || pageSize > math.MaxInt32 {
@@ -263,12 +363,12 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 		},
 
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "ACR registry name or login server, or ghcr.io/<owner> (required except for local-only commands)"},
-			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests"},
+			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "ACR registry name (myreg) or login server (myreg.azurecr.io), or ghcr.io/<owner> (required except for top)"},
+			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests, created if missing"},
 			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250, Usage: "items per listing request (GHCR caps it at 100)"},
-			&cli.IntFlag{Name: "parallelism", Value: 16},
+			&cli.IntFlag{Name: "parallelism", Value: 16, Usage: "number of concurrent registry requests"},
 			&cli.StringFlag{Name: "progress", Value: "auto", Usage: "batch progress display: auto, plain or tui"},
-			&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}},
+			&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "log debug messages"},
 		},
 		ExitErrHandler: func(ctx context.Context, cmd *cli.Command, err error) {
 			logger.Error("An error occurred", "err", err)
@@ -278,17 +378,87 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 	return cmd
 }
 
-// openInput opens path for reading, falling back to stdin when it is empty.
-// The returned function closes the file, and does nothing for stdin.
-func openInput(path string) (io.Reader, func(), error) {
-	if path == "" || path == "-" {
+// ruleDurationFlag is a duration flag accepting the syntax of rule file
+// durations, days and weeks included.
+type ruleDurationFlag = cli.FlagBase[time.Duration, cli.NoConfig, ruleDuration]
+
+// ruleDuration is the cli.Value of a ruleDurationFlag.
+type ruleDuration time.Duration
+
+// Create points the flag's value at p, initialized to val.
+func (ruleDuration) Create(val time.Duration, p *time.Duration, _ cli.NoConfig) cli.Value {
+	*p = val
+	return (*ruleDuration)(p)
+}
+
+// ToString formats val for the help text.
+func (ruleDuration) ToString(val time.Duration) string {
+	return val.String()
+}
+
+// Set parses s with rules.ParseDuration.
+func (d *ruleDuration) Set(s string) error {
+	v, err := rules.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = ruleDuration(v)
+	return nil
+}
+
+// Get returns the duration as a time.Duration, for cli.Command.Duration.
+func (d *ruleDuration) Get() any {
+	return time.Duration(*d)
+}
+
+// String formats the duration as time.Duration does.
+func (d *ruleDuration) String() string {
+	return time.Duration(*d).String()
+}
+
+// openInput opens path for reading, "-" meaning stdin. An empty path means
+// stdin too, unless stdin is a terminal: a forgotten --input would then wait
+// silently for the input, what, to be typed. The returned function closes the
+// file, and does nothing for stdin.
+func openInput(path, what string) (io.Reader, func(), error) {
+	switch path {
+	case "":
+		if stdinIsTerminal() {
+			return nil, nil, fmt.Errorf("no %s given and stdin is a terminal: pass --input FILE, pipe it to stdin, or use --input - to type it", what)
+		}
+		fallthrough
+	case "-":
 		return os.Stdin, func() {}, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%s: %w", what, err)
 	}
 	return f, func() { _ = f.Close() }, nil
+}
+
+// inputName names the input at path in messages.
+func inputName(path string) string {
+	if path == "" || path == "-" {
+		return "stdin"
+	}
+	return path
+}
+
+// parseInput parses the input, what, that openInput opens at path. Parse
+// errors are prefixed with what and the file name, or stdin.
+func parseInput[T any](path, what string, parse func(io.Reader) (T, error)) (T, error) {
+	var zero T
+	in, closeIn, err := openInput(path, what)
+	if err != nil {
+		return zero, err
+	}
+	defer closeIn()
+	v, err := parse(in)
+	if err != nil {
+		return zero, fmt.Errorf("%s %s: %w", what, inputName(path), err)
+	}
+	return v, nil
 }
 
 // noArguments prevents a mistyped input filename from silently falling back
@@ -316,52 +486,59 @@ func connect(ctx context.Context, cmd *cli.Command, addr registry.Address, logge
 	var err error
 	switch addr.Kind {
 	case registry.GHCR:
-		backend, err = connectGHCR(ctx, addr, cmd.Int("page-size"), logger)
+		// Only a run that deletes needs to delete; checking the token for
+		// that up front saves a scan that would end in denied deletions.
+		needDelete := cmd.Name == "prune" && !cmd.Bool("dry-run")
+		backend, err = connectGHCR(ctx, addr, cmd.Int("page-size"), needDelete, logger)
 	default:
-		backend, err = connectACR(addr, cmd.Int("page-size"))
+		backend, err = connectACR(addr, cmd.Int("page-size"), logger)
 	}
 	if err != nil {
 		return nil, err
 	}
 	var cache *registry.Cache
 	if dir := cmd.String("cache"); dir != "" {
-		cache = registry.NewCache(filepath.Join(dir, addr.String()))
+		cache, err = registry.NewCache(filepath.Join(dir, addr.String()))
+		if err != nil {
+			return nil, fmt.Errorf("--cache: %w", err)
+		}
 	}
 	return registry.New(backend, logger, cmd.Int("parallelism"), cache)
 }
 
 // connectACR builds the ACR backend, authenticating with
-// DefaultAzureCredential.
-func connectACR(addr registry.Address, pageSize int) (registry.Backend, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
+// DefaultAzureCredential in the login server's cloud.
+func connectACR(addr registry.Address, pageSize int, logger *slog.Logger) (registry.Backend, error) {
+	cred, err := azidentity.NewDefaultAzureCredential(acr.CredentialOptions(addr.Host))
 	if err != nil {
 		return nil, err
 	}
-	client, err := azcontainerregistry.NewClient("https://"+addr.Host, cred, &azcontainerregistry.ClientOptions{
-		ClientOptions: azcore.ClientOptions{Telemetry: policy.TelemetryOptions{ApplicationID: "acrprune"}},
+	backend, err := acr.New(acr.Options{
+		Endpoint:   "https://" + addr.Host,
+		Credential: cred,
+		PageSize:   pageSize,
+		Logger:     logger,
 	})
-	if err != nil {
-		return nil, err
-	}
-	backend, err := acr.New(client, pageSize)
 	if err != nil {
 		return nil, err
 	}
 	return backend, nil
 }
 
-// connectGHCR builds the GHCR backend for the address's owner.
-func connectGHCR(ctx context.Context, addr registry.Address, pageSize int, logger *slog.Logger) (registry.Backend, error) {
+// connectGHCR builds the GHCR backend for the address's owner. needDelete
+// makes it refuse a token that reports its scopes without delete:packages.
+func connectGHCR(ctx context.Context, addr registry.Address, pageSize int, needDelete bool, logger *slog.Logger) (registry.Backend, error) {
 	token, err := githubToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-	backend, err := ghcr.New(ctx, ghcr.Options{
-		Owner:    addr.Owner,
-		Token:    token,
-		Username: os.Getenv("GITHUB_ACTOR"),
-		PageSize: pageSize,
-		Logger:   logger,
+	backend, err := newGHCR(ctx, ghcr.Options{
+		Owner:      addr.Owner,
+		Token:      token,
+		NeedDelete: needDelete,
+		Username:   os.Getenv("GITHUB_ACTOR"),
+		PageSize:   pageSize,
+		Logger:     logger,
 	})
 	if err != nil {
 		return nil, err
@@ -391,42 +568,59 @@ var ghAuthToken = func(ctx context.Context) (string, error) {
 }
 
 // loadRunningRules compiles the keep-rules describing the images listed in
-// path, or returns nil when no file was given.
-func loadRunningRules(path string, addr registry.Address) ([]*rules.RepoRule, error) {
+// path, or returns nil when no file was given. An empty file is refused, and
+// a file naming none of the registry's images draws a warning: either would
+// treat every image as not running.
+func loadRunningRules(path string, addr registry.Address, logger *slog.Logger) ([]*rules.RepoRule, error) {
 	if path == "" {
 		return nil, nil
 	}
-	f, closeIn, err := openInput(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open running file: %w", err)
-	}
-	defer closeIn()
-
-	specs, err := rules.KeepRulesFromImageList(f, addr.String())
+	var counts rules.ImageListCounts
+	specs, err := parseInput(path, "running file", func(r io.Reader) ([]*rules.RepoRuleSpec, error) {
+		specs, c, err := rules.KeepRulesFromImageList(r, addr.String())
+		counts = c
+		return specs, err
+	})
 	if err != nil {
 		return nil, err
+	}
+	if counts.Lines == 0 {
+		// get_pod_images.sh prints nothing at all when a query fails.
+		return nil, fmt.Errorf("running file %s lists no images; no image would count as running", inputName(path))
+	}
+	if counts.Matched == 0 {
+		logger.Warn("No image in the running file belongs to this registry; no image counts as running",
+			"file", inputName(path), "lines", counts.Lines, "expected_prefix", addr.String()+"/")
 	}
 	return rules.Compile(specs)
 }
 
-func writeJSON(w io.Writer, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
+// throttled returns a function passing its argument to write at most once per
+// interval, as measured by now, and dropping the calls in between. The first
+// call always writes.
+func throttled[T any](interval time.Duration, now func() time.Time, write func(T) error) func(T) error {
+	var last time.Time
+	return func(v T) error {
+		if t := now(); last.IsZero() || t.Sub(last) >= interval {
+			last = t
+			return write(v)
+		}
+		return nil
 	}
-	_, err = w.Write(append(data, '\n'))
-	return err
 }
 
-// writeOutput publishes a complete JSON snapshot. Named files are replaced
-// atomically, so interruptions and failed writes preserve the last snapshot.
+// writeOutput publishes a complete JSON document to path, or to stdout for ""
+// and "-". Named files are replaced atomically, so interruptions and failed
+// writes preserve the last snapshot.
 func writeOutput(path string, v any) error {
-	if path == "" || path == "-" {
-		return writeJSON(os.Stdout, v)
-	}
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return fileio.WriteFile(path, append(data, '\n'), 0o600)
+	data = append(data, '\n')
+	if path == "" || path == "-" {
+		_, err = os.Stdout.Write(data)
+		return err
+	}
+	return fileio.WriteFile(path, data, 0o600)
 }

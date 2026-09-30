@@ -1,6 +1,6 @@
 [
   {
-    "description": "Deletes (tagged) feature branch and PR images older than 14 days",
+    "description": "Deletes feature branch and PR images older than 14 days, tagged YYYYMMDD-br or YYYYMMDD.N-<br|pr|ft|local|db>.<name>, and untagged manifests older than 24 hours",
     "repo": ".+",
     "ignore_missing_manifests": true,
     "delete_orphaned_manifests": false,
