@@ -1,5 +1,5 @@
-// Package pruner applies compiled rules to an Azure Container Registry,
-// deleting manifests and repositories that no rule keeps.
+// Package pruner applies compiled rules to a container registry, deleting
+// manifests and repositories that no rule keeps.
 package pruner
 
 import (
@@ -120,9 +120,9 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 		if !ok {
 			repositories, err := p.Registry.ListRepositories(ctx)
 			if registry.IsPermissionError(err) {
-				// On ABAC registries catalog listing needs the Catalog Lister
-				// role. Point the user at the literal-name path that avoids it.
-				return nil, fmt.Errorf("%w (listing the catalog requires the Container Registry Repository Catalog Lister role; on ABAC registries, use literal ^repo$ patterns to target specific repositories without listing)", err)
+				// Point the user at the literal-name path, which avoids
+				// listing altogether.
+				return nil, fmt.Errorf("repository pattern %q needs every repository listed; use literal ^repo$ patterns to target specific repositories without listing: %w", rule.Repo, err)
 			}
 			return repositories, err
 		}
@@ -135,13 +135,17 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 }
 
 func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *rules.RepoRule) (PruneStats, error) {
-	manifests, found, err := p.Registry.FetchRepositoryManifests(ctx, repository, rule.IgnoreMissingManifests)
+	contents, found, err := p.Registry.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{
+		IgnoreMissing: rule.IgnoreMissingManifests,
+		Platforms:     rule.UsesPlatform(),
+	})
 	if err != nil {
 		return PruneStats{}, err
 	}
 	if !found {
 		return PruneStats{}, nil // repository disappeared; nothing to do
 	}
+	manifests := contents.Manifests
 
 	markOrphans(manifests)
 
@@ -153,6 +157,21 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	kept, err := p.decide(all, manifests, rule)
 	if err != nil {
 		return PruneStats{}, err
+	}
+
+	// A repository keeping nothing is deleted outright rather than manifest
+	// by manifest; ACR keeps no repository without manifests anyway. Not so
+	// when the registry listed manifests it could not serve: never judged,
+	// they would go along with the repository.
+	deleteWholeRepository := len(kept) == 0 && len(contents.Missing) == 0
+	if len(kept) == 0 && !deleteWholeRepository {
+		p.Logger.Warn("Not deleting the repository outright: some listed manifests could not be downloaded",
+			"repository", repository, "missing", len(contents.Missing))
+	}
+	if !deleteWholeRepository && p.Registry.ProtectsLastTag() {
+		if err := p.keepLastTag(all, manifests, contents.Missing, kept, rule); err != nil {
+			return PruneStats{}, err
+		}
 	}
 
 	toKeep := make([]*registry.Manifest, 0, len(kept))
@@ -175,10 +194,6 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	p.Logger.Info("Processed manifests", "repository", repository,
 		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), "deleted", humanize.Bytes(seenBytes-keptBytes))
 
-	// An empty repository is deleted outright rather than manifest by
-	// manifest; ACR keeps no repository without manifests anyway.
-	deleteWholeRepository := len(kept) == 0
-
 	if p.DryRun {
 		if deleteWholeRepository {
 			p.Logger.Info("Dry-run: deleting repository", "repository", repository)
@@ -189,7 +204,7 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 		}
 	} else {
 		if p.IncludeLocked {
-			if err := p.unlock(ctx, repository, toDelete); err != nil {
+			if err := p.Registry.UnlockManifests(ctx, repository, toDelete); err != nil {
 				return PruneStats{}, err
 			}
 		}
@@ -217,20 +232,6 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 		stats.KeptRepositories = 1
 	}
 	return stats, nil
-}
-
-// unlock re-enables delete and write on the manifests about to be deleted, and
-// on any of their tags that are locked.
-func (p *Pruner) unlock(ctx context.Context, repository string, toDelete []*registry.Manifest) error {
-	if len(toDelete) == 0 {
-		return nil
-	}
-	lockedTags, err := p.Registry.ListTagLocks(ctx, repository)
-	if err != nil {
-		return err
-	}
-	p.Registry.UnlockManifests(ctx, toDelete, lockedTags)
-	return nil
 }
 
 // decide returns the digests of the manifests to keep, including the
@@ -269,6 +270,51 @@ func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry
 	return kept, nil
 }
 
+// keepLastTag keeps the newest tagged manifest of a repository that is not
+// deleted outright but would otherwise keep no tagged manifest, on registries
+// that refuse to delete a repository's last tagged manifest (GHCR). Deleting
+// it would fail, and deleting the whole repository instead would take the
+// untagged manifests the rules keep — digest-pinned running images, say —
+// along with it. missing are the manifests the registry listed but could not
+// serve, which stay.
+func (p *Pruner) keepLastTag(all []*registry.Manifest, manifests map[string]*registry.Manifest, missing []registry.Attributes, kept map[string]struct{}, rule *rules.RepoRule) error {
+	if slices.ContainsFunc(missing, func(a registry.Attributes) bool { return len(a.Tags) > 0 }) {
+		return nil // a tagged manifest survives anyway
+	}
+	// Prefer a healthy image: an orphaned manifest cannot be kept whole, and
+	// a tagged referrer such as a signature is no image at all.
+	rank := func(m *registry.Manifest) int {
+		r := 0
+		if m.Orphaned {
+			r += 2
+		}
+		if m.Subject != nil {
+			r++
+		}
+		return r
+	}
+	var last *registry.Manifest
+	for _, m := range all { // newest first
+		if len(m.Tags) == 0 {
+			continue
+		}
+		if _, ok := kept[m.Digest]; ok {
+			return nil // a tagged manifest survives anyway
+		}
+		if last == nil || rank(m) < rank(last) {
+			last = m
+		}
+	}
+	if last == nil {
+		return nil // nothing is tagged
+	}
+	p.Logger.Warn("Keeping the last tagged manifest, which the registry refuses to delete without deleting the repository", "manifest", last)
+	if err := p.keepWithDependencies(last.Digest, manifests, kept, rule); err != nil {
+		return err
+	}
+	return p.keepReferrers(all, manifests, kept, rule, time.Now())
+}
+
 // keepReferrers settles the fate of subject-bearing manifests (signatures,
 // attestations, SBOMs): a referrer is kept exactly when its subject is kept,
 // and deleted along with it — including referrers whose subject is already
@@ -291,7 +337,7 @@ func (p *Pruner) keepReferrers(all []*registry.Manifest, manifests map[string]*r
 			if !keep && p.KeepYounger != 0 {
 				// The grace period holds for referrers too; a dangling one
 				// outlives its subject by at most the grace period.
-				keep = m.LastUpdated().Add(p.KeepYounger).After(now)
+				keep = m.LastUpdated.Add(p.KeepYounger).After(now)
 			}
 			if !keep {
 				continue
@@ -324,7 +370,7 @@ func (p *Pruner) shouldKeep(m *registry.Manifest, evaluator *evaluator, rule *ru
 	}
 
 	if !keep && p.KeepYounger != 0 {
-		keep = m.LastUpdated().Add(p.KeepYounger).After(evaluator.now)
+		keep = m.LastUpdated.Add(p.KeepYounger).After(evaluator.now)
 	}
 
 	return keep

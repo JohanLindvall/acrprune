@@ -1,8 +1,11 @@
 package registry
 
 import (
+	"io"
 	"strings"
 	"testing"
+
+	godigest "github.com/opencontainers/go-digest"
 )
 
 const imageManifest = `{
@@ -78,5 +81,45 @@ func TestParseManifestIndex(t *testing.T) {
 	}
 	if got := strings.Join(m.Architectures(), ","); got != "amd64,arm64" {
 		t.Errorf("Architectures = %q", got)
+	}
+}
+
+func TestVerify(t *testing.T) {
+	content := []byte(imageManifest)
+	for _, digest := range []godigest.Digest{godigest.SHA256.FromBytes(content), godigest.SHA512.FromBytes(content)} {
+		if err := verify(digest.String(), content); err != nil {
+			t.Errorf("verify(%s): %v", digest.Algorithm(), err)
+		}
+	}
+
+	digest := godigest.FromBytes(content).String()
+	if err := verify(digest, []byte("tampered")); err == nil {
+		t.Error("content that does not hash to the digest must fail verification")
+	}
+	for _, bad := range []string{"", "sha256:short", "md5:d41d8cd98f00b204e9800998ecf8427e", "nocolon"} {
+		if err := verify(bad, content); err == nil {
+			t.Errorf("verify(%q) should reject the digest", bad)
+		}
+	}
+}
+
+// zeros reads as an endless stream of zero bytes.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func TestReadDocument(t *testing.T) {
+	data, err := ReadDocument(strings.NewReader(imageManifest))
+	if err != nil || string(data) != imageManifest {
+		t.Errorf("ReadDocument = %q, %v", data, err)
+	}
+	if _, err := ReadDocument(io.LimitReader(zeros{}, MaxDocumentSize)); err != nil {
+		t.Errorf("a document of exactly the limit should be read: %v", err)
+	}
+	if _, err := ReadDocument(zeros{}); err == nil {
+		t.Error("a runaway document should be refused")
 	}
 }

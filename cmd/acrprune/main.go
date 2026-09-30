@@ -1,5 +1,5 @@
-// Command acrprune prunes Azure Container Registry manifests and
-// repositories using declarative JSON rules.
+// Command acrprune prunes manifests and repositories of Azure Container
+// Registry and GitHub Container Registry using declarative JSON rules.
 package main
 
 import (
@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -23,14 +24,16 @@ import (
 
 	"github.com/JohanLindvall/acrprune/internal/pruner"
 	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/acrprune/internal/registry/acr"
+	"github.com/JohanLindvall/acrprune/internal/registry/ghcr"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-// errRegistryRequired is returned by commands that access the registry when
-// the --registry flag was not given. The flag is not marked required so that
+// errRegistryRequired is returned by commands that need the registry when the
+// --registry flag was not given. The flag is not marked required so that
 // local-only commands such as top can run without it.
 var errRegistryRequired = errors.New("required flag --registry not set")
 
@@ -51,8 +54,6 @@ func newCommand() *cli.Command {
 		Level: logLevel,
 	}))
 
-	var reg *registry.Registry
-
 	// Keep -v bound to the verbose flag below; expose the version only as
 	// --version so the auto-generated version flag does not claim -v.
 	cli.VersionFlag = &cli.BoolFlag{Name: "version", Usage: "print the version"}
@@ -60,7 +61,7 @@ func newCommand() *cli.Command {
 	cmd := &cli.Command{
 		Name:    "acrprune",
 		Version: version,
-		Usage:   "prune Azure Container Registry manifests using declarative rules",
+		Usage:   "prune Azure Container Registry and GitHub Container Registry manifests using declarative rules",
 		Commands: []*cli.Command{
 			{
 				Name:    "statistics",
@@ -71,10 +72,15 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "running", Usage: "file of running images used to annotate stats"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if reg == nil {
-						return errRegistryRequired
+					addr, err := address(cmd)
+					if err != nil {
+						return err
 					}
-					runningRules, err := loadRunningRules(cmd.String("running"), cmd.String("registry"))
+					runningRules, err := loadRunningRules(cmd.String("running"), addr)
+					if err != nil {
+						return err
+					}
+					reg, err := connect(ctx, cmd, addr, logger)
 					if err != nil {
 						return err
 					}
@@ -115,11 +121,12 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "input", Aliases: []string{"in", "infile"}, Usage: "rule file (defaults to stdin)"},
 					&cli.BoolFlag{Name: "dry-run", Aliases: []string{"dryrun"}, Value: true},
 					&cli.DurationFlag{Name: "keep-younger", Aliases: []string{"keepyounger"}, Value: 24 * time.Hour, Usage: "never delete manifests updated within this period"},
-					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "unlock delete/write-disabled manifests and tags before deleting them"},
+					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "unlock delete/write-disabled manifests and tags before deleting them (ACR)"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if reg == nil {
-						return errRegistryRequired
+					addr, err := address(cmd)
+					if err != nil {
+						return err
 					}
 					keepYounger := cmd.Duration("keep-younger")
 					if keepYounger < 0 {
@@ -141,6 +148,10 @@ func newCommand() *cli.Command {
 						return err
 					}
 
+					reg, err := connect(ctx, cmd, addr, logger)
+					if err != nil {
+						return err
+					}
 					p := &pruner.Pruner{
 						Registry:      reg,
 						Logger:        logger,
@@ -158,10 +169,11 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "output", Aliases: []string{"out", "outfile"}},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
-					if cmd.String("registry") == "" {
-						return errRegistryRequired
+					addr, err := address(cmd)
+					if err != nil {
+						return err
 					}
-					specs, err := rules.KeepRulesFromImageList(os.Stdin, cmd.String("registry"))
+					specs, err := rules.KeepRulesFromImageList(os.Stdin, addr.String())
 					if err != nil {
 						return err
 					}
@@ -227,39 +239,13 @@ func newCommand() *cli.Command {
 			if parallelism < 1 {
 				return ctx, fmt.Errorf("--parallelism must be at least 1, got %d", parallelism)
 			}
-
-			registryName := cmd.String("registry")
-			if registryName == "" {
-				// Local-only commands (top) run without Azure credentials;
-				// commands that access the registry fail with
-				// errRegistryRequired instead.
-				return ctx, nil
-			}
-			var cache *registry.Cache
-			if dir := cmd.String("cache"); dir != "" {
-				cache = registry.NewCache(filepath.Join(dir, registryName))
-			}
-
-			cred, err := azidentity.NewDefaultAzureCredential(nil)
-			if err != nil {
-				return ctx, err
-			}
-
-			client, err := azcontainerregistry.NewClient(loginServerURL(registryName), cred, &azcontainerregistry.ClientOptions{
-				ClientOptions: azcore.ClientOptions{Telemetry: policy.TelemetryOptions{ApplicationID: "acrprune"}},
-			})
-			if err != nil {
-				return ctx, err
-			}
-
-			reg, err = registry.New(client, logger, pageSize, parallelism, cache)
-			return ctx, err
+			return ctx, nil
 		},
 
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "registry name or full login server (required except for local-only commands)"},
+			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "ACR registry name or login server, or ghcr.io/<owner> (required except for local-only commands)"},
 			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests"},
-			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250},
+			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250, Usage: "items per listing request (GHCR caps it at 100)"},
 			&cli.IntFlag{Name: "parallelism", Value: 16},
 			&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}},
 		},
@@ -298,9 +284,99 @@ func openOutput(path string) (*os.File, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
+// address parses --registry for the commands that need it.
+func address(cmd *cli.Command) (registry.Address, error) {
+	name := cmd.String("registry")
+	if name == "" {
+		return registry.Address{}, errRegistryRequired
+	}
+	return registry.ParseAddress(name)
+}
+
+// connect opens the registry for the commands that access it, authenticating
+// with Azure credentials on ACR and a GitHub token on GHCR.
+func connect(ctx context.Context, cmd *cli.Command, addr registry.Address, logger *slog.Logger) (*registry.Registry, error) {
+	var backend registry.Backend
+	var err error
+	switch addr.Kind {
+	case registry.GHCR:
+		backend, err = connectGHCR(ctx, addr, cmd.Int("page-size"), logger)
+	default:
+		backend, err = connectACR(addr, cmd.Int("page-size"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cache *registry.Cache
+	if dir := cmd.String("cache"); dir != "" {
+		cache = registry.NewCache(filepath.Join(dir, cmd.String("registry")))
+	}
+	return registry.New(backend, logger, cmd.Int("parallelism"), cache)
+}
+
+// connectACR builds the ACR backend, authenticating with
+// DefaultAzureCredential.
+func connectACR(addr registry.Address, pageSize int) (registry.Backend, error) {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return nil, err
+	}
+	client, err := azcontainerregistry.NewClient("https://"+addr.Host, cred, &azcontainerregistry.ClientOptions{
+		ClientOptions: azcore.ClientOptions{Telemetry: policy.TelemetryOptions{ApplicationID: "acrprune"}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	backend, err := acr.New(client, pageSize)
+	if err != nil {
+		return nil, err
+	}
+	return backend, nil
+}
+
+// connectGHCR builds the GHCR backend for the address's owner.
+func connectGHCR(ctx context.Context, addr registry.Address, pageSize int, logger *slog.Logger) (registry.Backend, error) {
+	token, err := githubToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	backend, err := ghcr.New(ctx, ghcr.Options{
+		Owner:    addr.Owner,
+		Token:    token,
+		Username: os.Getenv("GITHUB_ACTOR"),
+		PageSize: pageSize,
+		Logger:   logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return backend, nil
+}
+
+// githubToken returns the GitHub token for GHCR: $GH_TOKEN or $GITHUB_TOKEN,
+// in the GitHub CLI's order of precedence, and otherwise the GitHub CLI's own
+// login.
+func githubToken(ctx context.Context) (string, error) {
+	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
+			return token, nil
+		}
+	}
+	if token, err := ghAuthToken(ctx); err == nil && token != "" {
+		return token, nil
+	}
+	return "", errors.New("no GitHub token: set GH_TOKEN or GITHUB_TOKEN to a token with the read:packages scope (and delete:packages to prune), or log in with the GitHub CLI: gh auth login --scopes read:packages,delete:packages")
+}
+
+// ghAuthToken asks the GitHub CLI for its token; tests replace it.
+var ghAuthToken = func(ctx context.Context) (string, error) {
+	out, err := exec.CommandContext(ctx, "gh", "auth", "token", "--hostname", "github.com").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
 // loadRunningRules compiles the keep-rules describing the images listed in
 // path, or returns nil when no file was given.
-func loadRunningRules(path, registryName string) ([]*rules.RepoRule, error) {
+func loadRunningRules(path string, addr registry.Address) ([]*rules.RepoRule, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -310,18 +386,11 @@ func loadRunningRules(path, registryName string) ([]*rules.RepoRule, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	specs, err := rules.KeepRulesFromImageList(f, registryName)
+	specs, err := rules.KeepRulesFromImageList(f, addr.String())
 	if err != nil {
 		return nil, err
 	}
 	return rules.Compile(specs)
-}
-
-// loginServerURL turns a registry name into its login server URL; names
-// containing a dot are treated as complete login servers, so sovereign-cloud
-// registries can be passed directly.
-func loginServerURL(registryName string) string {
-	return "https://" + registry.LoginServer(registryName)
 }
 
 func writeJSON(w io.Writer, v any) error {

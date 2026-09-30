@@ -104,7 +104,7 @@ func TestCalculateStatsSharesAcrossRepositories(t *testing.T) {
 func TestCalculateStatsIgnoresMissingTimestamps(t *testing.T) {
 	now := time.Now()
 	dated := testManifest("sha256:dated", now)
-	undated := &registry.Manifest{Repository: "r", Digest: "sha256:undated"}
+	undated := testManifest("sha256:undated", time.Time{})
 
 	stats := calculateStats("r", []*registry.Manifest{dated, undated})
 	if !stats.Oldest.Equal(now) || !stats.Newest.Equal(now) {
@@ -119,7 +119,7 @@ func TestCountRunning(t *testing.T) {
 	untagged := testManifest("3", now)
 	manifests := byDigest(running, stopped, untagged)
 
-	specs, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg")
+	specs, err := rules.KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestCountRunningDigestPinned(t *testing.T) {
 	manifests := byDigest(pinnedTagged, pinnedUntagged, otherTagged, otherUntagged)
 
 	input := "myreg.azurecr.io/app@sha256:aaa\nmyreg.azurecr.io/app@sha256:bbb\n"
-	specs, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	specs, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}

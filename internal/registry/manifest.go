@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/opencontainers/image-spec/specs-go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -23,17 +22,38 @@ type OCIManifest struct {
 	Annotations  map[string]string `json:"annotations,omitempty"`
 }
 
+// Attributes are what a registry's listing reports about a manifest besides
+// its content.
+type Attributes struct {
+	Digest string
+	Tags   []string
+	// LastUpdated is when the registry last updated the manifest, or the zero
+	// time when it reported none: callers deciding what to delete must treat
+	// that as "age unknown" rather than "infinitely old" — see
+	// Manifest.HasTimestamp.
+	LastUpdated time.Time
+	// Architecture and OS are the platform of an image manifest, or empty
+	// when unknown.
+	Architecture string
+	OS           string
+	// Locked is set when deleting or overwriting the manifest is disabled
+	// (ACR image locks; GHCR has none).
+	Locked bool
+	// ID is the backend's handle on the manifest where that is not the
+	// digest: the package version id on GHCR.
+	ID string
+}
+
 // Manifest pairs a downloaded OCI manifest with its registry attributes and
 // the pruner's bookkeeping. Repository and Digest address it in the registry;
 // the config and layer blobs it points at are not included in Size.
 type Manifest struct {
 	OCIManifest
+	Attributes
 	Repository string
-	Digest     string
 	Size       uint64 // size of the manifest document itself
-	Azure      *azcontainerregistry.ManifestAttributes
-	Orphaned   bool // manifest is missing or has a broken dependency chain
-	HasOwner   bool // referenced by an index manifest
+	Orphaned   bool   // manifest is missing or has a broken dependency chain
+	HasOwner   bool   // referenced by an index manifest
 }
 
 // Ref returns the repository@digest reference identifying the manifest. It is
@@ -42,50 +62,10 @@ func (m *Manifest) Ref() string {
 	return m.Repository + "@" + m.Digest
 }
 
-// Locked reports whether the manifest is protected from deletion, i.e. its
-// delete or write attribute has been disabled.
-func (m *Manifest) Locked() bool {
-	if m.Azure == nil || m.Azure.ChangeableAttributes == nil {
-		return false
-	}
-	return locked(m.Azure.ChangeableAttributes.CanDelete, m.Azure.ChangeableAttributes.CanWrite)
-}
-
-// locked reports whether a set of changeable attributes protects an artifact
-// from deletion. Manifests and tags carry the same flags in distinct types.
-func locked(canDelete, canWrite *bool) bool {
-	return canDelete != nil && !*canDelete || canWrite != nil && !*canWrite
-}
-
-// Tags returns the manifest's registry tags.
-func (m *Manifest) Tags() []string {
-	if m.Azure == nil {
-		return nil
-	}
-	result := make([]string, 0, len(m.Azure.Tags))
-	for _, tag := range m.Azure.Tags {
-		if tag != nil {
-			result = append(result, *tag)
-		}
-	}
-	return result
-}
-
-// LastUpdated returns when the registry last updated the manifest. The result
-// is the zero time when the registry reported no timestamp; callers deciding
-// what to delete must treat that as "age unknown" rather than "infinitely
-// old" — see Manifest.HasTimestamp.
-func (m *Manifest) LastUpdated() time.Time {
-	if m.Azure == nil || m.Azure.LastUpdatedOn == nil {
-		return time.Time{}
-	}
-	return *m.Azure.LastUpdatedOn
-}
-
 // HasTimestamp reports whether the registry told us when the manifest was last
 // updated. Every age-based rule is meaningless without it.
 func (m *Manifest) HasTimestamp() bool {
-	return m.Azure != nil && m.Azure.LastUpdatedOn != nil && !m.Azure.LastUpdatedOn.IsZero()
+	return !m.LastUpdated.IsZero()
 }
 
 // Architectures returns the distinct known architectures of the manifest and,
@@ -93,9 +73,7 @@ func (m *Manifest) HasTimestamp() bool {
 func (m *Manifest) Architectures() []string {
 	var result []string
 	add := addKnown(&result)
-	if m.Azure != nil && m.Azure.Architecture != nil {
-		add(string(*m.Azure.Architecture))
-	}
+	add(m.Architecture)
 	for _, child := range m.Manifests {
 		if child.Platform != nil {
 			add(child.Platform.Architecture)
@@ -109,9 +87,7 @@ func (m *Manifest) Architectures() []string {
 func (m *Manifest) OperatingSystems() []string {
 	var result []string
 	add := addKnown(&result)
-	if m.Azure != nil && m.Azure.OperatingSystem != nil {
-		add(string(*m.Azure.OperatingSystem))
-	}
+	add(m.OS)
 	for _, child := range m.Manifests {
 		if child.Platform != nil {
 			add(child.Platform.OS)
@@ -135,7 +111,7 @@ func addKnown(result *[]string) func(string) {
 func (m *Manifest) LogValue() slog.Value {
 	attrs := []slog.Attr{slog.String("ref", m.Ref())}
 	if m.HasTimestamp() {
-		attrs = append(attrs, slog.Time("updated", m.LastUpdated()))
+		attrs = append(attrs, slog.Time("updated", m.LastUpdated))
 	}
 	if archs := m.Architectures(); len(archs) > 0 {
 		attrs = append(attrs, slog.String("archs", strings.Join(archs, ",")))
@@ -143,11 +119,11 @@ func (m *Manifest) LogValue() slog.Value {
 	if m.Orphaned {
 		attrs = append(attrs, slog.Bool("orphaned", true))
 	}
-	if m.Locked() {
+	if m.Locked {
 		attrs = append(attrs, slog.Bool("locked", true))
 	}
-	if tags := m.Tags(); len(tags) > 0 {
-		attrs = append(attrs, slog.String("tags", strings.Join(tags, ",")))
+	if len(m.Tags) > 0 {
+		attrs = append(attrs, slog.String("tags", strings.Join(m.Tags, ",")))
 	}
 	return slog.GroupValue(attrs...)
 }

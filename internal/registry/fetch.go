@@ -2,83 +2,134 @@ package registry
 
 import (
 	"context"
+	_ "crypto/sha256" // digest algorithms go-digest verifies with
+	_ "crypto/sha512"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
+	godigest "github.com/opencontainers/go-digest"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// acceptedManifestTypes are the manifest media types we can decode.
-var acceptedManifestTypes = "application/vnd.oci.image.index.v1+json," +
-	string(azcontainerregistry.ContentTypeApplicationVndDockerDistributionManifestV2JSON) + "," +
-	string(azcontainerregistry.ContentTypeApplicationVndOciImageManifestV1JSON)
+// ManifestMediaTypes is the Accept header for manifest downloads, listing the
+// manifest and index formats parseManifest can decode.
+const ManifestMediaTypes = v1.MediaTypeImageIndex + "," +
+	v1.MediaTypeImageManifest + "," +
+	"application/vnd.docker.distribution.manifest.list.v2+json," +
+	"application/vnd.docker.distribution.manifest.v2+json"
 
-// FetchRepositoryManifests downloads every manifest in the repository, keyed
-// by digest. found is false when the repository itself does not exist and
-// ignoreMissing is set.
-func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository string, ignoreMissing bool) (manifests map[string]*Manifest, found bool, err error) {
+// imageConfigTypes are the config media types that record an image's
+// platform.
+var imageConfigTypes = []string{
+	v1.MediaTypeImageConfig,
+	"application/vnd.docker.container.image.v1+json",
+}
+
+// MaxDocumentSize bounds the manifests and image configs read into memory.
+// Far beyond anything a registry accepts, it only guards against a runaway
+// response.
+const MaxDocumentSize = 16 << 20
+
+// ReadDocument reads a manifest or config document to the end, failing when
+// it exceeds MaxDocumentSize.
+func ReadDocument(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, MaxDocumentSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxDocumentSize {
+		return nil, fmt.Errorf("document exceeds %d bytes", MaxDocumentSize)
+	}
+	return data, nil
+}
+
+// FetchOptions tunes FetchRepositoryManifests.
+type FetchOptions struct {
+	// IgnoreMissing tolerates a missing repository or manifest instead of
+	// failing on it.
+	IgnoreMissing bool
+	// Platforms asks for the platform of every image manifest. It is read
+	// from the image config when neither the registry's listing nor an index
+	// referencing the manifest reports it — which on GHCR, whose listings
+	// carry no platforms, costs a download per single-platform image.
+	Platforms bool
+}
+
+// Contents is what FetchRepositoryManifests found in a repository.
+type Contents struct {
+	// Manifests are the downloaded manifests, keyed by digest.
+	Manifests map[string]*Manifest
+	// Missing are the manifests the registry listed but could not serve,
+	// ignored as FetchOptions.IgnoreMissing asks, sorted by digest. Nothing
+	// is known about what they are, so they must be left alone — and with
+	// them the repository.
+	Missing []Attributes
+}
+
+// FetchRepositoryManifests downloads every manifest in the repository. found
+// is false when the repository itself does not exist and missing manifests
+// are ignored.
+func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository string, opts FetchOptions) (contents Contents, found bool, err error) {
 	group, groupCtx := r.group(ctx)
 
-	// Page through the manifest attributes on this goroutine, downloading each
-	// manifest document in the background as its digest becomes known. Paging
-	// uses groupCtx so a failed download stops the listing too.
-	pager := r.client.NewListManifestsPager(repository, &azcontainerregistry.ClientListManifestsOptions{
-		OrderBy: to.Ptr(azcontainerregistry.ArtifactManifestOrderByNone),
-		MaxNum:  to.Ptr(r.pageSize),
-	})
-
+	// List on this goroutine, downloading each manifest document in the
+	// background as its digest becomes known. Listing uses groupCtx so a
+	// failed download stops it too.
 	var mu sync.Mutex
-	manifests = map[string]*Manifest{}
-	attributes := map[string]*azcontainerregistry.ManifestAttributes{}
-
-	page := 0
-	pageErr := forEachPage(groupCtx, pager, func(attributePage azcontainerregistry.ClientListManifestsResponse) error {
-		r.logger.Debug("Fetching manifest attributes", "page", page, "repository", repository)
-		page++
-		for _, attrs := range attributePage.Attributes {
-			if attrs == nil || attrs.Digest == nil {
-				return fmt.Errorf("listing returned a manifest without a digest")
-			}
-			digest := *attrs.Digest
-			attributes[digest] = attrs
-			group.Go(func() error {
-				m, err := r.fetchManifest(groupCtx, repository, digest, ignoreMissing)
-				if err != nil || m == nil {
-					return err
-				}
-				mu.Lock()
-				defer mu.Unlock()
-				manifests[digest] = m
-				return nil
-			})
+	manifests := map[string]*Manifest{}
+	var missing []Attributes
+	listed := 0
+	listErr := r.backend.ListManifests(groupCtx, repository, func(attrs Attributes) error {
+		if listed%100 == 0 {
+			r.logger.Debug("Fetching manifest attributes", "repository", repository, "listed", listed)
 		}
+		listed++
+		if _, err := godigest.Parse(attrs.Digest); err != nil {
+			return fmt.Errorf("listing returned an invalid manifest digest %q: %w", attrs.Digest, err)
+		}
+		group.Go(func() error {
+			m, err := r.fetchManifest(groupCtx, repository, attrs.Digest, opts.IgnoreMissing)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if m == nil {
+				missing = append(missing, attrs)
+				return nil
+			}
+			m.Attributes = attrs
+			manifests[attrs.Digest] = m
+			return nil
+		})
 		return nil
 	})
-	if pageErr != nil {
-		// A download failure cancels groupCtx and so surfaces from paging as
+	if listErr != nil {
+		// A download failure cancels groupCtx and so surfaces from listing as
 		// well; report the original error from Wait in that case.
 		if waitErr := group.Wait(); waitErr != nil {
-			return nil, false, waitErr
+			return Contents{}, false, waitErr
 		}
-		if ignoreMissing && hasStatus(pageErr, http.StatusNotFound) {
+		if opts.IgnoreMissing && IsNotFound(listErr) {
 			r.logger.Warn("Repository missing", "repository", repository)
-			return nil, false, nil
+			return Contents{}, false, nil
 		}
-		return nil, false, fmt.Errorf("failed to list manifests for %s: %w", repository, pageErr)
+		return Contents{}, false, fmt.Errorf("failed to list manifests for %s: %w", repository, listErr)
 	}
 	if err := group.Wait(); err != nil {
-		return nil, false, err
+		return Contents{}, false, err
 	}
 
-	for digest, m := range manifests {
-		m.Azure = attributes[digest]
+	if err := r.resolvePlatforms(ctx, repository, manifests, opts.Platforms); err != nil {
+		return Contents{}, false, err
 	}
-
-	return manifests, true, nil
+	slices.SortFunc(missing, func(a, b Attributes) int { return strings.Compare(a.Digest, b.Digest) })
+	return Contents{Manifests: manifests, Missing: missing}, true, nil
 }
 
 // fetchManifest downloads (or loads from cache) a single manifest document.
@@ -86,37 +137,50 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 // is set.
 func (r *Registry) fetchManifest(ctx context.Context, repository, digest string, ignoreMissing bool) (*Manifest, error) {
 	ref := repository + "@" + digest
-	raw := r.cache.Get(digest)
-
-	if raw == nil {
+	raw, err := r.fetchDocument(ctx, digest, func() ([]byte, error) {
 		r.logger.Debug("Downloading manifest", "manifest", ref)
-		res, err := r.client.GetManifest(ctx, repository, digest, &azcontainerregistry.ClientGetManifestOptions{Accept: &acceptedManifestTypes})
-		if err != nil {
-			if ignoreMissing && hasStatus(err, http.StatusNotFound) {
-				r.logger.Warn("Manifest missing", "manifest", ref)
-				return nil, nil
-			}
-			return nil, fmt.Errorf("failed to get manifest %s: %w", ref, err)
+		return r.backend.GetManifest(ctx, repository, digest)
+	})
+	if err != nil {
+		if ignoreMissing && IsNotFound(err) {
+			r.logger.Warn("Manifest missing", "manifest", ref)
+			return nil, nil
 		}
-		if res.DockerContentDigest == nil {
-			return nil, fmt.Errorf("manifest %s: registry returned no content digest to validate against", ref)
-		}
-		// Validate against the digest we asked for, not the one the server
-		// claims: content is stored in the cache under the requested digest.
-		if *res.DockerContentDigest != digest {
-			return nil, fmt.Errorf("manifest %s: registry returned content digest %s", ref, *res.DockerContentDigest)
-		}
-		reader, err := azcontainerregistry.NewDigestValidationReader(digest, res.ManifestData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to validate manifest %s: %w", ref, err)
-		}
-		if raw, err = io.ReadAll(reader); err != nil {
-			return nil, fmt.Errorf("failed to read manifest %s: %w", ref, err)
-		}
-		r.cache.Put(digest, raw)
+		return nil, fmt.Errorf("failed to get manifest %s: %w", ref, err)
 	}
-
 	return parseManifest(repository, digest, raw)
+}
+
+// fetchDocument returns the cached document for digest, or downloads it,
+// verifies it and caches it. A cached document that fails verification is
+// downloaded afresh.
+func (r *Registry) fetchDocument(ctx context.Context, digest string, download func() ([]byte, error)) ([]byte, error) {
+	if raw := r.cache.Get(digest); raw != nil && verify(digest, raw) == nil {
+		return raw, nil
+	}
+	raw, err := download()
+	if err != nil {
+		return nil, err
+	}
+	// Verify against the digest that was asked for, whatever the server
+	// claims: the content is cached under that digest.
+	if err := verify(digest, raw); err != nil {
+		return nil, err
+	}
+	r.cache.Put(digest, raw)
+	return raw, nil
+}
+
+// verify checks that content hashes to digest.
+func verify(digest string, content []byte) error {
+	d, err := godigest.Parse(digest)
+	if err != nil {
+		return err
+	}
+	if actual := d.Algorithm().FromBytes(content); actual != d {
+		return fmt.Errorf("registry returned content with digest %s", actual)
+	}
+	return nil
 }
 
 // parseManifest decodes a downloaded manifest document.
@@ -126,7 +190,7 @@ func (r *Registry) fetchManifest(ctx context.Context, repository, digest string,
 // accounted for by whoever walks the descriptors. Folding the config size in
 // here made every consumer that adds it double-count.
 func parseManifest(repository, digest string, raw []byte) (*Manifest, error) {
-	result := &Manifest{Repository: repository, Digest: digest, Size: uint64(len(raw))}
+	result := &Manifest{Repository: repository, Attributes: Attributes{Digest: digest}, Size: uint64(len(raw))}
 	if err := json.Unmarshal(raw, &result.OCIManifest); err != nil {
 		return nil, fmt.Errorf("failed to decode manifest %s@%s: %w", repository, digest, err)
 	}
@@ -134,4 +198,73 @@ func parseManifest(repository, digest string, raw []byte) (*Manifest, error) {
 		return nil, fmt.Errorf("manifest %s@%s: unsupported schema version %d", repository, digest, result.SchemaVersion)
 	}
 	return result, nil
+}
+
+// resolvePlatforms fills in the platform of manifests the listing reported
+// none for: from the descriptor of an index referencing them, which is free,
+// and, when fromConfig is set and the backend can download blobs, from their
+// image config.
+func (r *Registry) resolvePlatforms(ctx context.Context, repository string, manifests map[string]*Manifest, fromConfig bool) error {
+	// Sorted, so a child two indexes disagree about resolves the same way on
+	// every run.
+	for _, digest := range slices.Sorted(maps.Keys(manifests)) {
+		for _, child := range manifests[digest].Manifests {
+			m := manifests[string(child.Digest)]
+			if m != nil && child.Platform != nil && m.Architecture == "" && m.OS == "" {
+				m.Architecture, m.OS = child.Platform.Architecture, child.Platform.OS
+			}
+		}
+	}
+
+	blobs, ok := r.backend.(BlobGetter)
+	if !fromConfig || !ok {
+		return nil
+	}
+	// Images built alike share a config; download each config once.
+	waiting := map[string][]*Manifest{}
+	for _, m := range manifests {
+		if m.Architecture == "" && m.OS == "" && m.Config != nil && slices.Contains(imageConfigTypes, m.Config.MediaType) {
+			config := string(m.Config.Digest)
+			waiting[config] = append(waiting[config], m)
+		}
+	}
+	group, groupCtx := r.group(ctx)
+	for config, images := range waiting {
+		group.Go(func() error {
+			platform, err := r.fetchPlatform(groupCtx, blobs, repository, config)
+			if err != nil {
+				return err
+			}
+			for _, m := range images {
+				m.Architecture, m.OS = platform.Architecture, platform.OS
+			}
+			return nil
+		})
+	}
+	return group.Wait()
+}
+
+// fetchPlatform reads an image's platform from its config blob. A missing
+// config leaves the platform unknown rather than failing: rules then treat the
+// image as matching no platform.
+func (r *Registry) fetchPlatform(ctx context.Context, blobs BlobGetter, repository, digest string) (v1.Platform, error) {
+	raw, err := r.fetchDocument(ctx, digest, func() ([]byte, error) {
+		r.logger.Debug("Downloading image config", "repository", repository, "digest", digest)
+		return blobs.GetBlob(ctx, repository, digest)
+	})
+	if err != nil {
+		if IsNotFound(err) {
+			r.logger.Warn("Image config missing; platform unknown", "repository", repository, "digest", digest)
+			return v1.Platform{}, nil
+		}
+		return v1.Platform{}, fmt.Errorf("failed to get image config %s@%s: %w", repository, digest, err)
+	}
+	var config struct {
+		Architecture string `json:"architecture"`
+		OS           string `json:"os"`
+	}
+	if err := json.Unmarshal(raw, &config); err != nil {
+		return v1.Platform{}, fmt.Errorf("failed to decode image config %s@%s: %w", repository, digest, err)
+	}
+	return v1.Platform{Architecture: config.Architecture, OS: config.OS}, nil
 }

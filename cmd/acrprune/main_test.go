@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/urfave/cli/v3"
+
+	"github.com/JohanLindvall/acrprune/internal/registry"
 )
 
 // flagByName returns the root-level flag exposing the given name, or nil.
@@ -126,5 +130,177 @@ func TestTopRejectsAmbiguousInputs(t *testing.T) {
 		if runErr == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+// withStdin feeds input to the command under test as its standard input.
+func withStdin(t *testing.T, input string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, _ = io.WriteString(w, input)
+		_ = w.Close()
+	}()
+	orig := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = orig
+		_ = r.Close()
+	})
+}
+
+// noGitHubCredentials removes every source of a GitHub token.
+func noGitHubCredentials(t *testing.T) {
+	t.Helper()
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	orig := ghAuthToken
+	ghAuthToken = func(context.Context) (string, error) { return "", errors.New("gh: not logged in") }
+	t.Cleanup(func() { ghAuthToken = orig })
+}
+
+// TestGenerateForGHCR: generate runs offline — no GitHub token needed — and
+// maps ghcr.io/<owner>/<package> references to package rules.
+func TestGenerateForGHCR(t *testing.T) {
+	noGitHubCredentials(t)
+	withStdin(t, "ghcr.io/acme/app:v1\nghcr.io/acme/team/api@sha256:abc\nghcr.io/other/app:v2\n")
+
+	got, runErr := captureStdout(t, func() error {
+		return newCommand().Run(context.Background(), []string{"acrprune", "-r", "ghcr.io/Acme", "generate"})
+	})
+	if runErr != nil {
+		t.Fatalf("generate returned error: %v", runErr)
+	}
+	var specs []struct {
+		Repo string `json:"repo"`
+	}
+	if err := json.Unmarshal([]byte(got), &specs); err != nil {
+		t.Fatalf("generate output is not a rule file: %v\n%s", err, got)
+	}
+	if len(specs) != 2 || specs[0].Repo != "^app$" || specs[1].Repo != "^team/api$" {
+		t.Errorf("rules = %+v, want app and team/api", specs)
+	}
+}
+
+// TestRegistryFlagValidation: a missing or malformed --registry fails before
+// any credential or network access.
+func TestRegistryFlagValidation(t *testing.T) {
+	noGitHubCredentials(t)
+	rules := filepath.Join(t.TempDir(), "rules.json")
+	if err := os.WriteFile(rules, []byte(`[{"repo": ".+"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"acrprune", "stats"}, "--registry"},
+		{[]string{"acrprune", "prune", "--in", rules}, "--registry"},
+		{[]string{"acrprune", "generate"}, "--registry"},
+		{[]string{"acrprune", "-r", "ghcr.io", "stats"}, "ghcr.io/<owner>"},
+		{[]string{"acrprune", "-r", "quay.io/acme", "prune", "--in", rules}, "unsupported registry"},
+		{[]string{"acrprune", "-r", "ghcr.io/acme", "stats"}, "no GitHub token"},
+		{[]string{"acrprune", "-r", "ghcr.io/acme", "prune", "--in", rules}, "no GitHub token"},
+	}
+	for _, tt := range tests {
+		_, runErr := captureStdout(t, func() error {
+			return newCommand().Run(context.Background(), tt.args)
+		})
+		if runErr == nil || !strings.Contains(runErr.Error(), tt.want) {
+			t.Errorf("%v: error = %v, want it to mention %q", tt.args, runErr, tt.want)
+		}
+	}
+}
+
+func TestGitHubToken(t *testing.T) {
+	noGitHubCredentials(t)
+	ctx := context.Background()
+
+	if _, err := githubToken(ctx); err == nil || !strings.Contains(err.Error(), "read:packages") {
+		t.Errorf("error = %v, want advice naming the scopes", err)
+	}
+
+	ghAuthToken = func(context.Context) (string, error) { return "from-gh", nil }
+	if token, err := githubToken(ctx); token != "from-gh" || err != nil {
+		t.Errorf("githubToken = %q, %v; want the GitHub CLI's token", token, err)
+	}
+
+	t.Setenv("GITHUB_TOKEN", " from-github-token\n")
+	if token, _ := githubToken(ctx); token != "from-github-token" {
+		t.Errorf("githubToken = %q, want $GITHUB_TOKEN over the GitHub CLI", token)
+	}
+
+	t.Setenv("GH_TOKEN", "from-gh-token")
+	if token, _ := githubToken(ctx); token != "from-gh-token" {
+		t.Errorf("githubToken = %q, want $GH_TOKEN first, as the GitHub CLI does", token)
+	}
+}
+
+func TestLoadRunningRules(t *testing.T) {
+	addr, err := registry.ParseAddress("ghcr.io/acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ruleSet, err := loadRunningRules("", addr); ruleSet != nil || err != nil {
+		t.Errorf("no file should yield no rules, got %v, %v", ruleSet, err)
+	}
+
+	path := filepath.Join(t.TempDir(), "running.txt")
+	if err := os.WriteFile(path, []byte("ghcr.io/acme/app:v1\nmyreg.azurecr.io/app:v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ruleSet, err := loadRunningRules(path, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ruleSet) != 1 || !ruleSet[0].Repo.MatchString("app") {
+		t.Errorf("running rules = %+v, want one for app", ruleSet)
+	}
+
+	if _, err := loadRunningRules(filepath.Join(t.TempDir(), "missing"), addr); err == nil {
+		t.Error("a missing running file should fail")
+	}
+}
+
+// TestConnectACR builds the ACR backend, which needs no network access until
+// it is used.
+func TestConnectACR(t *testing.T) {
+	addr, err := registry.ParseAddress("myreg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend, err := connectACR(addr, 250); err != nil || backend == nil {
+		t.Errorf("connectACR = %v, %v", backend, err)
+	}
+	if _, err := connectACR(addr, 0); err == nil {
+		t.Error("a zero page size should be refused")
+	}
+}
+
+// TestRewriteJSON: rewriting a shorter document must not leave the tail of
+// the previous one behind.
+func TestRewriteJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "stats.json")
+	f, closeFile, err := openOutput(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteJSON(f, []string{"a long first document", "with two entries"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteJSON(f, []string{"short"}); err != nil {
+		t.Fatal(err)
+	}
+	closeFile()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := json.Unmarshal(data, &got); err != nil || len(got) != 1 || got[0] != "short" {
+		t.Errorf("file = %q, %v; want only the last document", data, err)
 	}
 }

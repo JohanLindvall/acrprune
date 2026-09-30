@@ -1,0 +1,434 @@
+package ghcr
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/JohanLindvall/acrprune/internal/registry"
+)
+
+// failFirst makes the fake answer the first n REST requests with fail.
+func failFirst(f *fakeGitHub, n int, fail func(w http.ResponseWriter)) {
+	fails := make([]func(http.ResponseWriter), n)
+	for i := range fails {
+		fails[i] = fail
+	}
+	failSequence(f, fails...)
+}
+
+// failSequence makes the fake answer its next REST requests with fails, in
+// order.
+func failSequence(f *fakeGitHub, fails ...func(w http.ResponseWriter)) {
+	var count atomic.Int32
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.HasPrefix(r.URL.Path, "/v2/") || r.URL.Path == "/token" {
+			return false
+		}
+		i := int(count.Add(1)) - 1
+		if i >= len(fails) {
+			return false
+		}
+		fails[i](w)
+		return true
+	}
+}
+
+func rateLimit(retryAfter string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("Retry-After", retryAfter)
+		apiError(w, http.StatusForbidden, "You have exceeded a secondary rate limit.")
+	}
+}
+
+func serverError(w http.ResponseWriter) {
+	apiError(w, http.StatusBadGateway, "Server Error")
+}
+
+func TestRetriesServerErrors(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	sleeps := recordSleeps(b)
+	failFirst(f, 2, func(w http.ResponseWriter) { apiError(w, http.StatusBadGateway, "Server Error") })
+
+	names, err := b.ListRepositories(ctx)
+	if err != nil || !slices.Equal(names, []string{"app"}) {
+		t.Fatalf("ListRepositories = %v, %v", names, err)
+	}
+	if !slices.Equal(*sleeps, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Errorf("backoff = %v, want 1s then 2s", *sleeps)
+	}
+}
+
+func TestRetriesRateLimits(t *testing.T) {
+	reset := time.Now().Add(90 * time.Second).Unix()
+	tests := []struct {
+		name  string
+		fail  func(w http.ResponseWriter)
+		check func(time.Duration) bool
+	}{
+		{"secondary limit with Retry-After", func(w http.ResponseWriter) {
+			w.Header().Set("Retry-After", "7")
+			apiError(w, http.StatusForbidden, "You have exceeded a secondary rate limit.")
+		}, func(d time.Duration) bool { return d == 7*time.Second }},
+		{"secondary limit without headers", func(w http.ResponseWriter) {
+			apiError(w, http.StatusForbidden, "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.")
+		}, func(d time.Duration) bool { return d == time.Minute }},
+		{"primary limit used up", func(w http.ResponseWriter) {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(reset, 10))
+			apiError(w, http.StatusForbidden, "API rate limit exceeded for user ID 1.")
+		}, func(d time.Duration) bool { return d > 80*time.Second && d <= 92*time.Second }},
+		{"too many requests", func(w http.ResponseWriter) {
+			apiError(w, http.StatusTooManyRequests, "Too Many Requests")
+		}, func(d time.Duration) bool { return d == time.Minute }},
+	}
+	for _, tt := range tests {
+		f, b := newFakeGitHub(t, true)
+		f.push("app", manifestDoc("a"), time.Now(), "v1")
+		sleeps := recordSleeps(b)
+		failFirst(f, 1, tt.fail)
+
+		if _, err := b.ListRepositories(ctx); err != nil {
+			t.Errorf("%s: %v", tt.name, err)
+			continue
+		}
+		if len(*sleeps) != 1 || !tt.check((*sleeps)[0]) {
+			t.Errorf("%s: waited %v", tt.name, *sleeps)
+		}
+	}
+}
+
+// TestRateLimitExhaustion: a rate limit outlasting the time a request may
+// wait fails it, and is not mistaken for missing permission — which would
+// skip the repository as denied.
+func TestRateLimitExhaustion(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	sleeps := recordSleeps(b)
+	b.maxThrottle = 5 * time.Second
+	failFirst(f, 1000, rateLimit("1"))
+
+	_, err := b.ListRepositories(ctx)
+	if err == nil || registry.IsPermissionError(err) || !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Errorf("error = %v, want a rate limit error that is not a permission error", err)
+	}
+	if len(*sleeps) != 5 {
+		t.Errorf("waited %v, want five one-second waits within the five-second budget", *sleeps)
+	}
+}
+
+// TestRateLimitsOutlastAttempts: a long cleanup keeps hitting GitHub's hourly
+// limits; waiting them out is bounded by time, not by the attempts allowed
+// for transient failures, and does not use those attempts up.
+func TestRateLimitsOutlastAttempts(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	sleeps := recordSleeps(b)
+	var fails []func(http.ResponseWriter)
+	for range 2 * b.maxAttempts {
+		fails = append(fails, rateLimit("60"))
+	}
+	for range b.maxAttempts - 1 {
+		fails = append(fails, serverError)
+	}
+	failSequence(f, fails...)
+
+	if _, err := b.ListRepositories(ctx); err != nil {
+		t.Fatalf("rate limits and a few server errors should be waited out: %v", err)
+	}
+	if len(*sleeps) != len(fails) || (*sleeps)[0] != time.Minute || (*sleeps)[len(fails)-1] != 16*time.Second {
+		t.Errorf("waits = %v", *sleeps)
+	}
+}
+
+// TestPermissionErrorsAreFinal: a 403 that is not rate limiting is not
+// retried.
+func TestPermissionErrorsAreFinal(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	failFirst(f, 1, func(w http.ResponseWriter) {
+		apiError(w, http.StatusForbidden, "Must have admin rights to Repository.")
+	})
+	_, err := b.ListRepositories(ctx) // the fake's unexpected-retry guard fails the test on a retry
+	if !registry.IsPermissionError(err) || !strings.Contains(err.Error(), "admin rights") {
+		t.Errorf("error = %v, want the permission error", err)
+	}
+}
+
+func TestRetriesNetworkErrors(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	sleeps := recordSleeps(b)
+	// The transport itself retries a request that fails on a reused
+	// connection; on fresh connections the failure reaches the backend.
+	b.client = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	var dropped atomic.Bool
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if dropped.Swap(true) {
+			return false
+		}
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.Close() // drop the connection without a response
+		return true
+	}
+	if _, err := b.ListRepositories(ctx); err != nil {
+		t.Fatalf("a dropped connection should be retried: %v", err)
+	}
+	if len(*sleeps) != 1 {
+		t.Errorf("retries = %v, want one", *sleeps)
+	}
+}
+
+func TestRetryStopsWithContext(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	failFirst(f, 1000, func(w http.ResponseWriter) { apiError(w, http.StatusServiceUnavailable, "unavailable") })
+	cancelled, cancel := context.WithCancel(ctx)
+	b.sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return sleep(ctx, d)
+	}
+	if _, err := b.ListRepositories(cancelled); !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want the cancellation", err)
+	}
+}
+
+func TestSleep(t *testing.T) {
+	if err := sleep(ctx, time.Millisecond); err != nil {
+		t.Errorf("sleep = %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := sleep(cancelled, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Errorf("sleep with a cancelled context = %v", err)
+	}
+}
+
+// TestRateLimited: each of GitHub's signals marks a response as rate limited
+// on its own; a 403 carrying none of them is missing permission.
+func TestRateLimited(t *testing.T) {
+	tests := []struct {
+		status  int
+		headers []string
+		message string
+		want    bool
+	}{
+		{http.StatusTooManyRequests, nil, "", true},
+		{http.StatusForbidden, []string{"Retry-After", "5"}, "Forbidden", true},
+		{http.StatusForbidden, []string{"X-RateLimit-Remaining", "0"}, "Forbidden", true},
+		{http.StatusForbidden, nil, "You have exceeded a secondary rate limit.", true},
+		{http.StatusForbidden, nil, "API rate limit exceeded for user ID 1.", true},
+		{http.StatusForbidden, []string{"X-RateLimit-Remaining", "4999"}, "Must have admin rights to Repository.", false},
+		{http.StatusForbidden, nil, "Resource not accessible by integration", false},
+		{http.StatusUnauthorized, []string{"Retry-After", "5"}, "rate limit", false},
+		{http.StatusInternalServerError, nil, "rate limit", false},
+	}
+	for _, tt := range tests {
+		resp := &http.Response{StatusCode: tt.status, Header: http.Header{}}
+		for i := 0; i < len(tt.headers); i += 2 {
+			resp.Header.Set(tt.headers[i], tt.headers[i+1])
+		}
+		if got := rateLimited(resp, tt.message); got != tt.want {
+			t.Errorf("rateLimited(%d, %v, %q) = %v, want %v", tt.status, tt.headers, tt.message, got, tt.want)
+		}
+	}
+}
+
+func TestRateLimitDelay(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	response := func(status int, headers ...string) *http.Response {
+		resp := &http.Response{StatusCode: status, Header: http.Header{}}
+		for i := 0; i < len(headers); i += 2 {
+			resp.Header.Set(headers[i], headers[i+1])
+		}
+		return resp
+	}
+	tests := []struct {
+		name string
+		resp *http.Response
+		want time.Duration
+	}{
+		{"Retry-After seconds", response(http.StatusForbidden, "Retry-After", "30"), 30 * time.Second},
+		{"Retry-After zero waits a second", response(http.StatusTooManyRequests, "Retry-After", "0"), time.Second},
+		{"Retry-After date", response(http.StatusTooManyRequests, "Retry-After", now.Add(45*time.Second).Format(http.TimeFormat)), 45 * time.Second},
+		{"reset", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(time.Minute).Unix(), 10)), time.Minute + time.Second},
+		{"bogus reset is capped", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(24*time.Hour).Unix(), 10)), time.Hour},
+		{"past reset waits a second", response(http.StatusForbidden, "X-RateLimit-Remaining", "0", "X-RateLimit-Reset", strconv.FormatInt(now.Add(-time.Minute).Unix(), 10)), time.Second},
+		{"no guidance waits a minute", response(http.StatusForbidden), time.Minute},
+	}
+	for _, tt := range tests {
+		if got := rateLimitDelay(tt.resp, now); got != tt.want {
+			t.Errorf("%s: rateLimitDelay = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestBackoff(t *testing.T) {
+	var got []time.Duration
+	for attempt := 1; attempt <= 7; attempt++ {
+		got = append(got, backoff(attempt))
+	}
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	if !slices.Equal(got, want) {
+		t.Errorf("backoff = %v, want %v", got, want)
+	}
+}
+
+func TestErrorMessage(t *testing.T) {
+	tests := []struct{ body, want string }{
+		{`{"message": "Bad credentials", "documentation_url": "x"}`, "Bad credentials"},
+		{`{"errors": [{"code": "DENIED", "message": "denied"}, {"code": "UNAUTHORIZED", "message": "no"}]}`, "DENIED denied; UNAUTHORIZED no"},
+		{"plain text\n", "plain text"},
+		{"", ""},
+		{strings.Repeat("x", 300), strings.Repeat("x", 200) + "…"},
+	}
+	for _, tt := range tests {
+		if got := errorMessage([]byte(tt.body)); got != tt.want {
+			t.Errorf("errorMessage(%q) = %q, want %q", tt.body, got, tt.want)
+		}
+	}
+}
+
+// TestFailedRedirectRedactsSignature: a blob download failing at the storage
+// URLs ghcr.io redirects to must not log or return their signatures.
+func TestFailedRedirectRedactsSignature(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	digest := f.pushBlob([]byte("{}"))
+	sleeps := recordSleeps(b)
+	var logs bytes.Buffer
+	b.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	b.client = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/cdn/") {
+			return false
+		}
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err == nil {
+			_ = conn.Close() // drop the connection without a response
+		}
+		return true
+	}
+
+	_, err := b.GetBlob(ctx, "app", digest)
+	if err == nil || !strings.Contains(err.Error(), "/cdn/"+digest) {
+		t.Fatalf("error = %v, want the failed storage request", err)
+	}
+	if strings.Contains(err.Error(), "secret") || strings.Contains(logs.String(), "secret") {
+		t.Errorf("the signature leaked:\nerror: %v\nlogs: %s", err, logs.String())
+	}
+	if len(*sleeps) != b.maxAttempts-1 {
+		t.Errorf("retries = %v", *sleeps)
+	}
+}
+
+// TestBlobRedirectDropsAuthorization: blob storage lives on another host than
+// ghcr.io, which must not see the registry token.
+func TestBlobRedirectDropsAuthorization(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	f.push("app", manifestDoc("a"), time.Now(), "v1")
+	content := []byte(`{"architecture":"arm64","os":"linux"}`)
+	digest := f.pushBlob(content)
+
+	var authorization atomic.Pointer[string]
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		authorization.Store(&header)
+		_, _ = w.Write(content)
+	}))
+	defer storage.Close()
+	_, port, err := net.SplitHostPort(storage.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Redirect to a host name of its own, which the client resolves to the
+	// storage server.
+	f.blobStorage = "http://storage.test:" + port
+	var dialer net.Dialer
+	b.client = &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "storage.test:") {
+				addr = storage.Listener.Addr().String()
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+	}}
+
+	got, err := b.GetBlob(ctx, "app", digest)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("GetBlob = %q, %v", got, err)
+	}
+	seen := authorization.Load()
+	if seen == nil {
+		t.Fatal("the storage server was not reached")
+	}
+	if *seen != "" {
+		t.Errorf("the storage host received Authorization %q", *seen)
+	}
+}
+
+func TestRedact(t *testing.T) {
+	u, err := url.Parse("https://user:pass@storage.example/blob?signature=secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := redact(u); got != "https://storage.example/blob" {
+		t.Errorf("redact = %q", got)
+	}
+}
+
+// TestNextPage: next page links carry the token, so they must stay on the
+// API's origin.
+func TestNextPage(t *testing.T) {
+	apiURL, _ := url.Parse("https://api.github.com")
+	b := &Backend{apiURL: apiURL}
+	tests := []struct {
+		link, want string
+		ok         bool
+	}{
+		{`<https://api.github.com/orgs/o/packages?page=2>; rel="next", <https://api.github.com/orgs/o/packages?page=5>; rel="last"`, "https://api.github.com/orgs/o/packages?page=2", true},
+		{`<https://api.github.com/x?page=4>; rel="prev", <https://api.github.com/x?page=1>; rel="first"`, "", true},
+		{``, "", true},
+		{`<https://evil.example/steal>; rel="next"`, "", false},
+		{`<http://api.github.com/x?page=2>; rel="next"`, "", false},
+	}
+	for _, tt := range tests {
+		got, err := b.nextPage(tt.link)
+		if got != tt.want || (err == nil) != tt.ok {
+			t.Errorf("nextPage(%q) = %q, %v; want %q, ok=%v", tt.link, got, err, tt.want, tt.ok)
+		}
+	}
+}
+
+// TestCheckKeepsStatus exercises check on a live response, whose request it
+// names.
+func TestCheckKeepsStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiError(w, http.StatusConflict, "conflict")
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/thing?token=secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = check(resp)
+	var responseErr *registry.ResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusConflict {
+		t.Fatalf("check = %v, want a 409 response error", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "GET "+srv.URL+"/thing: 409 Conflict: conflict") || strings.Contains(msg, "secret") {
+		t.Errorf("message = %q", msg)
+	}
+}
