@@ -16,13 +16,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	godigest "github.com/opencontainers/go-digest"
 
+	"github.com/JohanLindvall/acrprune/internal/imageref"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 )
 
@@ -45,17 +45,6 @@ const (
 	defaultUsername = "acrprune"
 	userAgent       = "acrprune"
 	apiVersion      = "2022-11-28"
-)
-
-// component is a path component of an OCI repository name.
-const component = `[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*`
-
-var (
-	// ownerPattern matches the owner's namespace on ghcr.io.
-	ownerPattern = regexp.MustCompile(`^` + component + `$`)
-	// repositoryPattern matches a repository below the owner. Names go into
-	// registry URL paths verbatim, so anything else is refused.
-	repositoryPattern = regexp.MustCompile(`^` + component + `(?:/` + component + `)*$`)
 )
 
 // Options configures a Backend.
@@ -110,7 +99,7 @@ func New(ctx context.Context, opts Options) (*Backend, error) {
 	if opts.Token == "" {
 		return nil, errors.New("a GitHub token is required")
 	}
-	if !ownerPattern.MatchString(opts.Owner) {
+	if !imageref.ValidOwner(opts.Owner) {
 		return nil, fmt.Errorf("invalid GHCR owner %q", opts.Owner)
 	}
 	if opts.PageSize < 1 {
@@ -162,7 +151,7 @@ func baseURL(s, def string) (*url.URL, error) {
 		s = def
 	}
 	u, err := url.Parse(strings.TrimRight(s, "/"))
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("invalid service URL %q", s)
 	}
 	return u, nil
@@ -246,6 +235,9 @@ func (v packageVersion) attributes() registry.Attributes {
 // ListManifests calls fn with the attributes of every version of the
 // repository's package.
 func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(registry.Attributes) error) error {
+	if !imageref.ValidRepository(repository) {
+		return fmt.Errorf("invalid repository name %q", repository)
+	}
 	return b.paginate(ctx, b.packageURL(repository)+"/versions?per_page="+strconv.Itoa(b.pageSize), func(body io.Reader) error {
 		var page []packageVersion
 		if err := json.NewDecoder(body).Decode(&page); err != nil {
@@ -274,6 +266,9 @@ func (b *Backend) GetBlob(ctx context.Context, repository, digest string) ([]byt
 // DeleteManifest deletes the package version holding the manifest, and with
 // it the tags pointing at the manifest.
 func (b *Backend) DeleteManifest(ctx context.Context, m *registry.Manifest) error {
+	if !imageref.ValidRepository(m.Repository) {
+		return fmt.Errorf("invalid repository name %q", m.Repository)
+	}
 	// The id goes into the URL path; it must be the number the listing gave.
 	if _, err := strconv.ParseUint(m.ID, 10, 64); err != nil {
 		return fmt.Errorf("manifest %s has no package version id", m.Ref())
@@ -283,6 +278,9 @@ func (b *Backend) DeleteManifest(ctx context.Context, m *registry.Manifest) erro
 
 // DeleteRepository deletes the repository's package with all its versions.
 func (b *Backend) DeleteRepository(ctx context.Context, repository string) error {
+	if !imageref.ValidRepository(repository) {
+		return fmt.Errorf("invalid repository name %q", repository)
+	}
 	return b.delete(ctx, b.packageURL(repository))
 }
 
@@ -335,12 +333,17 @@ func (b *Backend) api(ctx context.Context, method, u string) (*http.Response, er
 // paginate GETs a listing and every further page its Link headers point to,
 // handing each page's body to fn.
 func (b *Backend) paginate(ctx context.Context, u string, fn func(io.Reader) error) error {
+	seen := map[string]struct{}{}
 	for u != "" {
+		if _, duplicate := seen[u]; duplicate {
+			return fmt.Errorf("pagination repeated a page: %s", redactURL(u))
+		}
+		seen[u] = struct{}{}
 		resp, err := b.api(ctx, http.MethodGet, u)
 		if err != nil {
 			return err
 		}
-		err = fn(resp.Body)
+		err = fn(io.LimitReader(resp.Body, registry.MaxDocumentSize))
 		_ = resp.Body.Close()
 		if err != nil {
 			return err
@@ -367,7 +370,7 @@ func (b *Backend) nextPage(link string) (string, error) {
 		}
 		target = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(target), "<"), ">")
 		u, err := url.Parse(target)
-		if err != nil || u.Scheme != b.apiURL.Scheme || u.Host != b.apiURL.Host {
+		if err != nil || u.User != nil || u.Fragment != "" || !sameOrigin(u, b.apiURL) {
 			return "", fmt.Errorf("refusing to follow the next page link %q away from %s", target, b.apiURL.Host)
 		}
 		return target, nil
@@ -378,7 +381,7 @@ func (b *Backend) nextPage(link string) (string, error) {
 // registryGet downloads a manifest or blob from the registry API,
 // authenticating with a bearer token for the repository's pull scope.
 func (b *Backend) registryGet(ctx context.Context, repository, kind, digest, accept string) ([]byte, error) {
-	if !repositoryPattern.MatchString(repository) {
+	if !imageref.ValidRepository(repository) {
 		return nil, fmt.Errorf("invalid repository name %q", repository)
 	}
 	if _, err := godigest.Parse(digest); err != nil {

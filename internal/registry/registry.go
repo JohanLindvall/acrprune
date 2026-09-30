@@ -8,6 +8,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+
+	"github.com/JohanLindvall/acrprune/internal/imageref"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -25,6 +28,9 @@ type Registry struct {
 func New(backend Backend, logger *slog.Logger, parallelism int, cache *Cache) (*Registry, error) {
 	if parallelism < 1 {
 		return nil, fmt.Errorf("parallelism must be at least 1, got %d", parallelism)
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Registry{
 		backend:     backend,
@@ -50,35 +56,39 @@ func (r *Registry) group(ctx context.Context) (*errgroup.Group, context.Context)
 
 // ListRepositories returns the names of all repositories in the registry.
 func (r *Registry) ListRepositories(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	repositories, err := r.backend.ListRepositories(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Stable ordering makes cross-repository byte attribution reproducible.
+	slices.Sort(repositories)
+	repositories = slices.Compact(repositories)
+	for _, repository := range repositories {
+		if !imageref.ValidRepository(repository) {
+			return nil, fmt.Errorf("listing returned an invalid repository name %q", repository)
+		}
 	}
 	r.logger.Debug("Fetched repositories", "count", len(repositories))
 	return repositories, nil
 }
 
-// DeleteManifests deletes the given manifests in parallel, evicting each from
-// the cache.
-func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest) error {
-	group, groupCtx := r.group(ctx)
-	for _, m := range manifests {
-		group.Go(func() error {
-			r.logger.Info("Deleting manifest", "manifest", m)
-			if err := r.backend.DeleteManifest(groupCtx, m); err != nil {
-				return fmt.Errorf("failed to delete manifest %s: %w", m.Ref(), err)
-			}
-			r.cache.Remove(m.Digest)
-			return nil
-		})
+// DeleteRepository deletes an entire repository and evicts its known manifests
+// from the cache. Pass the inspected manifests when they are available.
+func (r *Registry) DeleteRepository(ctx context.Context, repository string, known ...*Manifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return group.Wait()
-}
-
-// DeleteRepository deletes an entire repository.
-func (r *Registry) DeleteRepository(ctx context.Context, repository string) error {
+	if !imageref.ValidRepository(repository) {
+		return fmt.Errorf("invalid repository name %q", repository)
+	}
 	if err := r.backend.DeleteRepository(ctx, repository); err != nil {
 		return fmt.Errorf("failed to delete repository %s: %w", repository, err)
+	}
+	for _, m := range known {
+		r.cache.Remove(m.Digest)
 	}
 	return nil
 }

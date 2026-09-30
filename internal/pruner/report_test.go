@@ -75,8 +75,10 @@ func TestReadStats(t *testing.T) {
 }
 
 func TestReadStatsRejectsInvalidJSON(t *testing.T) {
-	if _, err := ReadStats(strings.NewReader("not json")); err == nil {
-		t.Fatal("expected an error for invalid JSON")
+	for _, input := range []string{"not json", "null", "[]]", "[]}", "[] []", "[] trailing"} {
+		if _, err := ReadStats(strings.NewReader(input)); err == nil {
+			t.Errorf("accepted invalid statistics %q", input)
+		}
 	}
 }
 

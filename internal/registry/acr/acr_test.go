@@ -286,6 +286,15 @@ func TestDelete(t *testing.T) {
 	if err := b.DeleteRepository(ctx, "other"); !registry.IsPermissionError(err) {
 		t.Errorf("error = %v, want a permission error", err)
 	}
+	for _, key := range want {
+		f.fail[key] = http.StatusNotFound
+	}
+	if err := b.DeleteManifest(ctx, m); err != nil {
+		t.Errorf("already deleted manifest: %v", err)
+	}
+	if err := b.DeleteRepository(ctx, "team/app"); err != nil {
+		t.Errorf("already deleted repository: %v", err)
+	}
 }
 
 func TestLocks(t *testing.T) {

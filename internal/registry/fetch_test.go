@@ -11,10 +11,10 @@ import (
 const imageManifest = `{
   "schemaVersion": 2,
   "mediaType": "application/vnd.oci.image.manifest.v1+json",
-  "config": {"digest": "sha256:cfg", "size": 4096},
+  "config": {"digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "size": 4096},
   "layers": [
-    {"digest": "sha256:l1", "size": 100000},
-    {"digest": "sha256:l2", "size": 200000}
+    {"digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "size": 100000},
+    {"digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "size": 200000}
   ]
 }`
 
@@ -48,6 +48,9 @@ func TestParseManifestRejectsBadDocuments(t *testing.T) {
 		{"malformed JSON", `{"schemaVersion": 2`, "failed to decode"},
 		{"schema version 1", `{"schemaVersion": 1}`, "unsupported schema version"},
 		{"no schema version", `{}`, "unsupported schema version"},
+		{"unknown format", `{"schemaVersion":2,"mediaType":"unknown"}`, "unsupported media type"},
+		{"bad dependency", `{"schemaVersion":2,"manifests":[{"digest":"../escape"}]}`, "invalid descriptor digest"},
+		{"negative size", `{"schemaVersion":2,"layers":[{"digest":"sha256:` + strings.Repeat("a", 64) + `","size":-1}]}`, "negative descriptor size"},
 	}
 	for _, tt := range tests {
 		_, err := parseManifest("myrepo", "sha256:abc", []byte(tt.raw))
@@ -68,8 +71,8 @@ func TestParseManifestIndex(t *testing.T) {
 	  "schemaVersion": 2,
 	  "mediaType": "application/vnd.oci.image.index.v1+json",
 	  "manifests": [
-	    {"digest": "sha256:amd", "platform": {"architecture": "amd64", "os": "linux"}},
-	    {"digest": "sha256:arm", "platform": {"architecture": "arm64", "os": "linux"}}
+	    {"digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333", "platform": {"architecture": "amd64", "os": "linux"}},
+	    {"digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444", "platform": {"architecture": "arm64", "os": "linux"}}
 	  ]
 	}`
 	m, err := parseManifest("myrepo", "sha256:idx", []byte(index))

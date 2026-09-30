@@ -154,9 +154,10 @@ func TestPruneGHCRLeavesUnservedVersions(t *testing.T) {
 	f, b := newFakeGitHub(t, true)
 	old := time.Now().Add(-10 * 24 * time.Hour)
 	config := f.pushBlob([]byte(`{"architecture":"amd64","os":"linux"}`))
-	unserved := f.pushUnserved("app", old, "latest")
+	f.pushUnserved("app", old, "latest")
 	f.push("app", imageDoc("a", config), old)
 	f.push("app", imageDoc("b", config), old)
+	want := f.remaining("app")
 
 	ruleSet := compile(t, `[{"repo": "^app$", "untagged": [{"keep": false}]}]`)
 	if err := stackPruner(t, b, false).Prune(ctx, ruleSet); err != nil {
@@ -165,8 +166,8 @@ func TestPruneGHCRLeavesUnservedVersions(t *testing.T) {
 	if !f.hasPackage("app") {
 		t.Fatal("the package was deleted with a version nobody judged")
 	}
-	if got := f.remaining("app"); !slices.Equal(got, []string{unserved}) {
-		t.Errorf("remaining = %v, want only the unserved version", got)
+	if got := f.remaining("app"); !slices.Equal(got, want) {
+		t.Errorf("remaining = %v, want the unserved version and its possible dependencies", got)
 	}
 }
 

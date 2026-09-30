@@ -141,13 +141,13 @@ func TestCountRunning(t *testing.T) {
 // keep rules constrain no tag — other manifests must not ride along.
 func TestCountRunningDigestPinned(t *testing.T) {
 	now := time.Now()
-	pinnedTagged := testManifest("sha256:aaa", now, "v1")
-	pinnedUntagged := testManifest("sha256:bbb", now)
-	otherTagged := testManifest("sha256:ccc", now, "v9")
+	pinnedTagged := testManifest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now, "v1")
+	pinnedUntagged := testManifest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now)
+	otherTagged := testManifest("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", now, "v9")
 	otherUntagged := testManifest("sha256:ddd", now)
 	manifests := byDigest(pinnedTagged, pinnedUntagged, otherTagged, otherUntagged)
 
-	input := "myreg.azurecr.io/app@sha256:aaa\nmyreg.azurecr.io/app@sha256:bbb\n"
+	input := "myreg.azurecr.io/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nmyreg.azurecr.io/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
 	specs, err := rules.KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)

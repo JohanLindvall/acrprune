@@ -5,6 +5,7 @@ import (
 	_ "crypto/sha256" // digest algorithms go-digest verifies with
 	_ "crypto/sha512"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -14,6 +15,9 @@ import (
 
 	godigest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/JohanLindvall/acrprune/internal/imageref"
+	"github.com/JohanLindvall/acrprune/internal/progress"
 )
 
 // ManifestMediaTypes is the Accept header for manifest downloads, listing the
@@ -75,7 +79,15 @@ type Contents struct {
 // is false when the repository itself does not exist and missing manifests
 // are ignored.
 func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository string, opts FetchOptions) (contents Contents, found bool, err error) {
-	group, groupCtx := r.group(ctx)
+	if err := ctx.Err(); err != nil {
+		return Contents{}, false, err
+	}
+	if !imageref.ValidRepository(repository) {
+		return Contents{}, false, fmt.Errorf("invalid repository name %q", repository)
+	}
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	group, groupCtx := r.group(fetchCtx)
 
 	// List on this goroutine, downloading each manifest document in the
 	// background as its digest becomes known. Listing uses groupCtx so a
@@ -84,19 +96,30 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	manifests := map[string]*Manifest{}
 	var missing []Attributes
 	listed := 0
+	seen := map[string]struct{}{}
 	listErr := r.backend.ListManifests(groupCtx, repository, func(attrs Attributes) error {
+		if err := groupCtx.Err(); err != nil {
+			return err
+		}
 		if listed%100 == 0 {
 			r.logger.Debug("Fetching manifest attributes", "repository", repository, "listed", listed)
 		}
 		listed++
+		progress.Report(ctx, progress.Event{Kind: progress.Listed, Count: 1})
 		if _, err := godigest.Parse(attrs.Digest); err != nil {
 			return fmt.Errorf("listing returned an invalid manifest digest %q: %w", attrs.Digest, err)
 		}
+		if _, duplicate := seen[attrs.Digest]; duplicate {
+			return fmt.Errorf("manifest %s@%s was listed more than once; the repository may have changed during pagination, rerun the command", repository, attrs.Digest)
+		}
+		seen[attrs.Digest] = struct{}{}
+		attrs.Tags = slices.Clone(attrs.Tags)
 		group.Go(func() error {
 			m, err := r.fetchManifest(groupCtx, repository, attrs.Digest, opts.IgnoreMissing)
 			if err != nil {
 				return err
 			}
+			progress.Report(ctx, progress.Event{Kind: progress.Fetched, Count: 1})
 			mu.Lock()
 			defer mu.Unlock()
 			if m == nil {
@@ -112,7 +135,8 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	if listErr != nil {
 		// A download failure cancels groupCtx and so surfaces from listing as
 		// well; report the original error from Wait in that case.
-		if waitErr := group.Wait(); waitErr != nil {
+		cancel()
+		if waitErr := group.Wait(); waitErr != nil && errors.Is(listErr, context.Canceled) {
 			return Contents{}, false, waitErr
 		}
 		if opts.IgnoreMissing && IsNotFound(listErr) {
@@ -125,6 +149,9 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 		return Contents{}, false, err
 	}
 
+	if opts.Platforms {
+		progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Resolving image platforms"})
+	}
 	if err := r.resolvePlatforms(ctx, repository, manifests, opts.Platforms); err != nil {
 		return Contents{}, false, err
 	}
@@ -155,12 +182,19 @@ func (r *Registry) fetchManifest(ctx context.Context, repository, digest string,
 // verifies it and caches it. A cached document that fails verification is
 // downloaded afresh.
 func (r *Registry) fetchDocument(ctx context.Context, digest string, download func() ([]byte, error)) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if raw := r.cache.Get(digest); raw != nil && verify(digest, raw) == nil {
+		progress.Report(ctx, progress.Event{Kind: progress.Cached, Count: 1})
 		return raw, nil
 	}
 	raw, err := download()
 	if err != nil {
 		return nil, err
+	}
+	if len(raw) > MaxDocumentSize {
+		return nil, fmt.Errorf("document exceeds %d bytes", MaxDocumentSize)
 	}
 	// Verify against the digest that was asked for, whatever the server
 	// claims: the content is cached under that digest.
@@ -197,6 +231,32 @@ func parseManifest(repository, digest string, raw []byte) (*Manifest, error) {
 	if result.SchemaVersion != 2 {
 		return nil, fmt.Errorf("manifest %s@%s: unsupported schema version %d", repository, digest, result.SchemaVersion)
 	}
+	if result.MediaType != "" && !slices.Contains(strings.Split(ManifestMediaTypes, ","), result.MediaType) {
+		return nil, fmt.Errorf("manifest %s@%s: unsupported media type %q", repository, digest, result.MediaType)
+	}
+	check := func(desc v1.Descriptor) error {
+		if err := desc.Digest.Validate(); err != nil {
+			return fmt.Errorf("invalid descriptor digest %q: %w", desc.Digest, err)
+		}
+		if desc.Size < 0 {
+			return fmt.Errorf("negative descriptor size for %s", desc.Digest)
+		}
+		return nil
+	}
+	for _, descriptors := range [][]v1.Descriptor{result.Manifests, result.Layers} {
+		for _, desc := range descriptors {
+			if err := check(desc); err != nil {
+				return nil, fmt.Errorf("manifest %s@%s: %w", repository, digest, err)
+			}
+		}
+	}
+	for _, desc := range []*v1.Descriptor{result.Config, result.Subject} {
+		if desc != nil {
+			if err := check(*desc); err != nil {
+				return nil, fmt.Errorf("manifest %s@%s: %w", repository, digest, err)
+			}
+		}
+	}
 	return result, nil
 }
 
@@ -210,8 +270,8 @@ func (r *Registry) resolvePlatforms(ctx context.Context, repository string, mani
 	for _, digest := range slices.Sorted(maps.Keys(manifests)) {
 		for _, child := range manifests[digest].Manifests {
 			m := manifests[string(child.Digest)]
-			if m != nil && child.Platform != nil && m.Architecture == "" && m.OS == "" {
-				m.Architecture, m.OS = child.Platform.Architecture, child.Platform.OS
+			if m != nil && child.Platform != nil {
+				fillPlatform(m, *child.Platform)
 			}
 		}
 	}
@@ -223,7 +283,7 @@ func (r *Registry) resolvePlatforms(ctx context.Context, repository string, mani
 	// Images built alike share a config; download each config once.
 	waiting := map[string][]*Manifest{}
 	for _, m := range manifests {
-		if m.Architecture == "" && m.OS == "" && m.Config != nil && slices.Contains(imageConfigTypes, m.Config.MediaType) {
+		if (m.Architecture == "" || m.OS == "") && m.Config != nil && slices.Contains(imageConfigTypes, m.Config.MediaType) {
 			config := string(m.Config.Digest)
 			waiting[config] = append(waiting[config], m)
 		}
@@ -236,12 +296,27 @@ func (r *Registry) resolvePlatforms(ctx context.Context, repository string, mani
 				return err
 			}
 			for _, m := range images {
-				m.Architecture, m.OS = platform.Architecture, platform.OS
+				fillPlatform(m, platform)
 			}
 			return nil
 		})
 	}
 	return group.Wait()
+}
+
+// Fill only absent platform fields, and only from a compatible descriptor.
+// Mixing conflicting reports can invent an OS/architecture combination.
+func fillPlatform(m *Manifest, platform v1.Platform) {
+	if m.Architecture != "" && platform.Architecture != "" && m.Architecture != platform.Architecture ||
+		m.OS != "" && platform.OS != "" && m.OS != platform.OS {
+		return
+	}
+	if m.Architecture == "" {
+		m.Architecture = platform.Architecture
+	}
+	if m.OS == "" {
+		m.OS = platform.OS
+	}
 }
 
 // fetchPlatform reads an image's platform from its config blob. A missing

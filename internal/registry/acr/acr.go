@@ -127,13 +127,22 @@ func (b *Backend) GetManifest(ctx context.Context, repository, digest string) ([
 // DeleteManifest deletes a manifest and its tags.
 func (b *Backend) DeleteManifest(ctx context.Context, m *registry.Manifest) error {
 	_, err := b.client.DeleteManifest(ctx, m.Repository, m.Digest, nil)
-	return wrap(err)
+	return deleted(err)
 }
 
 // DeleteRepository deletes a repository.
 func (b *Backend) DeleteRepository(ctx context.Context, repository string) error {
 	_, err := b.client.DeleteRepository(ctx, repository, nil)
-	return wrap(err)
+	return deleted(err)
+}
+
+// A concurrently removed resource already satisfies the delete request.
+func deleted(err error) error {
+	err = wrap(err)
+	if registry.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // LockedTags returns the names of the repository's tags whose delete or write

@@ -166,7 +166,7 @@ func noGitHubCredentials(t *testing.T) {
 // maps ghcr.io/<owner>/<package> references to package rules.
 func TestGenerateForGHCR(t *testing.T) {
 	noGitHubCredentials(t)
-	withStdin(t, "ghcr.io/acme/app:v1\nghcr.io/acme/team/api@sha256:abc\nghcr.io/other/app:v2\n")
+	withStdin(t, "ghcr.io/acme/app:v1\nghcr.io/acme/team/api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nghcr.io/other/app:v2\n")
 
 	got, runErr := captureStdout(t, func() error {
 		return newCommand().Run(context.Background(), []string{"acrprune", "-r", "ghcr.io/Acme", "generate"})
@@ -280,21 +280,19 @@ func TestConnectACR(t *testing.T) {
 	}
 }
 
-// TestRewriteJSON: rewriting a shorter document must not leave the tail of
+// TestWriteOutput: rewriting a shorter document must not leave the tail of
 // the previous one behind.
-func TestRewriteJSON(t *testing.T) {
+func TestWriteOutput(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "stats.json")
-	f, closeFile, err := openOutput(path)
-	if err != nil {
+	if err := writeOutput(path, []string{"a long first document", "with two entries"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := rewriteJSON(f, []string{"a long first document", "with two entries"}); err != nil {
+	if err := writeOutput(path, []string{"short"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := rewriteJSON(f, []string{"short"}); err != nil {
-		t.Fatal(err)
+	if err := writeOutput(path, make(chan int)); err == nil {
+		t.Fatal("encoding failure should leave the last snapshot untouched")
 	}
-	closeFile()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JohanLindvall/acrprune/internal/progress"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 	"github.com/dustin/go-humanize"
@@ -30,12 +31,14 @@ type Pruner struct {
 
 // PruneStats accumulates counts over one or more repository prunes.
 type PruneStats struct {
+	SkippedRepositories                            int
 	Repositories, KeptRepositories                 int
 	SeenManifests, KeptManifests, DeletedManifests int
 	SeenBytes, KeptBytes, DeletedBytes             uint64
 }
 
 func (s *PruneStats) Add(o PruneStats) {
+	s.SkippedRepositories += o.SkippedRepositories
 	s.Repositories += o.Repositories
 	s.KeptRepositories += o.KeptRepositories
 	s.SeenManifests += o.SeenManifests
@@ -50,6 +53,7 @@ func (s PruneStats) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("repositories", s.Repositories),
 		slog.Int("kept_repos", s.KeptRepositories),
+		slog.Int("skipped_repos", s.SkippedRepositories),
 		slog.Int("deleted_repos", s.Repositories-s.KeptRepositories),
 		slog.Int("seen_manifests", s.SeenManifests),
 		slog.Int("kept_manifests", s.KeptManifests),
@@ -64,18 +68,24 @@ func (s PruneStats) LogValue() slog.Value {
 func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 	p.Logger.Debug("Starting prune", "dryRun", p.DryRun, "keepYounger", p.KeepYounger, "rules", len(ruleSet))
 
+	progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Listing repositories"})
 	repositories, err := p.candidateRepositories(ctx, ruleSet)
 	if err != nil {
 		return err
 	}
+	progress.Report(ctx, progress.Event{Kind: progress.Candidates, Total: len(repositories)})
 
 	var total PruneStats
 	var pruned, denied []string
 	for i, repository := range repositories {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		for _, rule := range ruleSet {
 			if !rule.Repo.MatchString(repository) {
 				continue
 			}
+			progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: repository})
 			stats, err := p.pruneRepository(ctx, repository, rule)
 			if err != nil {
 				// On an ABAC registry a broad rule can match repositories the
@@ -83,6 +93,7 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 				// the whole run) but report them and fail at the end.
 				if registry.IsPermissionError(err) {
 					denied = append(denied, repository)
+					progress.Report(ctx, progress.Event{Kind: progress.Finished, Name: "denied"})
 					p.Logger.Warn("Insufficient permission to prune repository; skipping",
 						"repository", repository, "pruned", len(pruned), "denied", len(denied),
 						"remaining", len(repositories)-i-1, "err", err)
@@ -92,6 +103,11 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 			}
 			pruned = append(pruned, repository)
 			total.Add(stats)
+			status := ""
+			if stats.SkippedRepositories > 0 || stats.Repositories == 0 {
+				status = "skipped"
+			}
+			progress.Report(ctx, progress.Event{Kind: progress.Finished, Name: status})
 			p.Logger.Info("Processed", "totals", total)
 			break
 		}
@@ -115,6 +131,7 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 // registry listing as soon as one rule needs it to resolve what it matches.
 func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.RepoRule) ([]string, error) {
 	var literals []string
+	seen := map[string]struct{}{}
 	for _, rule := range ruleSet {
 		name, ok := rule.LiteralRepoName()
 		if !ok {
@@ -124,10 +141,16 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 				// listing altogether.
 				return nil, fmt.Errorf("repository pattern %q needs every repository listed; use literal ^repo$ patterns to target specific repositories without listing: %w", rule.Repo, err)
 			}
-			return repositories, err
+			if err != nil {
+				return nil, err
+			}
+			return slices.DeleteFunc(repositories, func(repository string) bool {
+				return !slices.ContainsFunc(ruleSet, func(rule *rules.RepoRule) bool { return rule.Repo.MatchString(repository) })
+			}), nil
 		}
-		if !slices.Contains(literals, name) {
+		if _, ok := seen[name]; !ok {
 			literals = append(literals, name)
+			seen[name] = struct{}{}
 		}
 	}
 	p.Logger.Debug("All rules target literal repositories; skipping catalog listing", "repositories", literals)
@@ -146,7 +169,18 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 		return PruneStats{}, nil // repository disappeared; nothing to do
 	}
 	manifests := contents.Manifests
+	if len(contents.Missing) > 0 {
+		// An unavailable index can reference any of the downloaded manifests.
+		// Without its document there is no safe way to prune its dependencies.
+		p.Logger.Warn("Skipping repository with unavailable manifest documents; dependencies cannot be determined",
+			"repository", repository, "missing", len(contents.Missing))
+		known := calculateStats(repository, slices.Collect(maps.Values(manifests)))
+		count := len(manifests) + len(contents.Missing)
+		return PruneStats{Repositories: 1, KeptRepositories: 1, SkippedRepositories: 1, SeenManifests: count,
+			KeptManifests: count, SeenBytes: known.Unique, KeptBytes: known.Unique}, nil
+	}
 
+	progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Evaluating rules and dependencies"})
 	markOrphans(manifests)
 
 	if err := p.reportOrphans(manifests, rule); err != nil {
@@ -159,15 +193,8 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 		return PruneStats{}, err
 	}
 
-	// A repository keeping nothing is deleted outright rather than manifest
-	// by manifest; ACR keeps no repository without manifests anyway. Not so
-	// when the registry listed manifests it could not serve: never judged,
-	// they would go along with the repository.
-	deleteWholeRepository := len(kept) == 0 && len(contents.Missing) == 0
-	if len(kept) == 0 && !deleteWholeRepository {
-		p.Logger.Warn("Not deleting the repository outright: some listed manifests could not be downloaded",
-			"repository", repository, "missing", len(contents.Missing))
-	}
+	// A repository keeping nothing can be deleted outright.
+	deleteWholeRepository := len(kept) == 0
 	if !deleteWholeRepository && p.Registry.ProtectsLastTag() {
 		if err := p.keepLastTag(all, manifests, contents.Missing, kept, rule); err != nil {
 			return PruneStats{}, err
@@ -190,11 +217,13 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 
 	seenBytes := calculateStats("", all).Unique
 	keptBytes := calculateStats("", toKeep).Unique
+	progress.Report(ctx, progress.Event{Kind: progress.Plan, Kept: len(toKeep), Count: len(toDelete), Bytes: seenBytes - keptBytes})
 
 	p.Logger.Info("Processed manifests", "repository", repository,
 		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), "deleted", humanize.Bytes(seenBytes-keptBytes))
 
 	if p.DryRun {
+		progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Previewing deletions"})
 		if deleteWholeRepository {
 			p.Logger.Info("Dry-run: deleting repository", "repository", repository)
 		} else {
@@ -203,14 +232,24 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 			}
 		}
 	} else {
+		if deleteWholeRepository {
+			progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Rechecking repository before deletion"})
+			if err := p.Registry.VerifyRepositorySnapshot(ctx, repository, all); err != nil {
+				return PruneStats{}, err
+			}
+		}
 		if p.IncludeLocked {
 			if err := p.Registry.UnlockManifests(ctx, repository, toDelete); err != nil {
 				return PruneStats{}, err
 			}
 		}
 		if deleteWholeRepository {
+			progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Deleting repository"})
 			p.Logger.Info("Deleting repository", "repository", repository)
-			err = p.Registry.DeleteRepository(ctx, repository)
+			err = p.Registry.DeleteRepository(ctx, repository, toDelete...)
+			if err == nil {
+				progress.Report(ctx, progress.Event{Kind: progress.Deleted, Count: len(toDelete)})
+			}
 		} else {
 			err = p.Registry.DeleteManifests(ctx, toDelete)
 		}
@@ -248,7 +287,7 @@ func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry
 		if !p.shouldKeep(m, evaluator, rule) {
 			continue
 		}
-		if err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
+		if _, err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
 			return nil, err
 		}
 	}
@@ -309,7 +348,7 @@ func (p *Pruner) keepLastTag(all []*registry.Manifest, manifests map[string]*reg
 		return nil // nothing is tagged
 	}
 	p.Logger.Warn("Keeping the last tagged manifest, which the registry refuses to delete without deleting the repository", "manifest", last)
-	if err := p.keepWithDependencies(last.Digest, manifests, kept, rule); err != nil {
+	if _, err := p.keepWithDependencies(last.Digest, manifests, kept, rule); err != nil {
 		return err
 	}
 	return p.keepReferrers(all, manifests, kept, rule, time.Now())
@@ -318,35 +357,40 @@ func (p *Pruner) keepLastTag(all []*registry.Manifest, manifests map[string]*reg
 // keepReferrers settles the fate of subject-bearing manifests (signatures,
 // attestations, SBOMs): a referrer is kept exactly when its subject is kept,
 // and deleted along with it — including referrers whose subject is already
-// gone, which are otherwise unreachable garbage. Iterates to a fixpoint so
-// chains (a signature on an attestation on an image) follow the image.
+// gone, which are otherwise unreachable garbage. A queue follows subject
+// chains (a signature on an attestation on an image) in linear time.
 func (p *Pruner) keepReferrers(all []*registry.Manifest, manifests map[string]*registry.Manifest, kept map[string]struct{}, rule *rules.RepoRule, now time.Time) error {
-	for changed := true; changed; {
-		changed = false
-		for _, m := range all {
-			if m.Subject == nil {
-				continue
+	referrers := map[string][]*registry.Manifest{}
+	var queue []*registry.Manifest
+	for _, m := range all {
+		if m.Subject == nil {
+			continue
+		}
+		referrers[string(m.Subject.Digest)] = append(referrers[string(m.Subject.Digest)], m)
+		if _, ok := kept[m.Digest]; !ok && p.protectedByAge(m, now) {
+			added, err := p.keepWithDependencies(m.Digest, manifests, kept, rule)
+			if err != nil {
+				return err
 			}
-			if _, ok := kept[m.Digest]; ok {
-				continue
-			}
-			_, keep := kept[string(m.Subject.Digest)]
-			if rule.DeleteOrphanedManifests && m.Orphaned {
-				keep = false
-			}
-			if !keep && p.KeepYounger != 0 {
-				// The grace period holds for referrers too; a dangling one
-				// outlives its subject by at most the grace period.
-				keep = m.LastUpdated.Add(p.KeepYounger).After(now)
-			}
-			if !keep {
+			queue = append(queue, added...)
+		}
+	}
+	for _, m := range all {
+		if _, ok := kept[m.Digest]; ok {
+			queue = append(queue, m)
+		}
+	}
+	for i := 0; i < len(queue); i++ {
+		for _, m := range referrers[queue[i].Digest] {
+			if _, ok := kept[m.Digest]; ok || rule.DeleteOrphanedManifests && m.Orphaned {
 				continue
 			}
 			p.Logger.Debug("Keeping referrer", "manifest", m, "subject", string(m.Subject.Digest))
-			if err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
+			added, err := p.keepWithDependencies(m.Digest, manifests, kept, rule)
+			if err != nil {
 				return err
 			}
-			changed = true
+			queue = append(queue, added...)
 		}
 	}
 	return nil
@@ -362,43 +406,45 @@ func (p *Pruner) shouldKeep(m *registry.Manifest, evaluator *evaluator, rule *ru
 		keep = false
 	}
 
-	if !keep && !m.HasTimestamp() {
+	return keep || p.protectedByAge(m, evaluator.now)
+}
+
+// protectedByAge applies the same timestamp protection to images and referrers.
+func (p *Pruner) protectedByAge(m *registry.Manifest, now time.Time) bool {
+	if !m.HasTimestamp() {
 		// Every age-based rule silently treats an unknown timestamp as the
 		// zero time, i.e. as infinitely old. Refuse to delete on that basis.
-		keep = true
 		p.Logger.Warn("Keeping manifest with no last-updated timestamp", "manifest", m)
+		return true
 	}
-
-	if !keep && p.KeepYounger != 0 {
-		keep = m.LastUpdated.Add(p.KeepYounger).After(evaluator.now)
-	}
-
-	return keep
+	return p.KeepYounger > 0 && m.LastUpdated.Add(p.KeepYounger).After(now)
 }
 
 // keepWithDependencies marks the manifest and every manifest it transitively
 // references as kept.
-func (p *Pruner) keepWithDependencies(digest string, manifests map[string]*registry.Manifest, kept map[string]struct{}, rule *rules.RepoRule) error {
-	if _, ok := kept[digest]; ok {
-		return nil
-	}
-
-	m := manifests[digest]
-	if m == nil {
-		// Do not record a missing dependency as kept: len(kept) decides
-		// whether anything of the repository survives.
-		if rule.IgnoreMissingManifests {
+func (p *Pruner) keepWithDependencies(digest string, manifests map[string]*registry.Manifest, kept map[string]struct{}, rule *rules.RepoRule) ([]*registry.Manifest, error) {
+	pending := []string{digest}
+	var added []*registry.Manifest
+	for len(pending) > 0 {
+		digest := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if _, ok := kept[digest]; ok {
+			continue
+		}
+		m := manifests[digest]
+		if m == nil {
+			// Missing dependencies must not count as surviving manifests.
+			if !rule.IgnoreMissingManifests {
+				return nil, fmt.Errorf("manifest missing %s", digest)
+			}
 			p.Logger.Warn("Kept manifest depends on a missing manifest", "digest", digest)
-			return nil
+			continue
 		}
-		return fmt.Errorf("manifest missing %s", digest)
-	}
-	kept[digest] = struct{}{}
-
-	for _, child := range m.Manifests {
-		if err := p.keepWithDependencies(string(child.Digest), manifests, kept, rule); err != nil {
-			return err
+		kept[digest] = struct{}{}
+		added = append(added, m)
+		for _, child := range m.Manifests {
+			pending = append(pending, string(child.Digest))
 		}
 	}
-	return nil
+	return added, nil
 }

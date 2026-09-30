@@ -6,6 +6,8 @@ The registry is chosen with `--registry`: an ACR registry name (`myreg`) or logi
 
 ## Install
 
+Requires Go 1.26 or later.
+
 ```sh
 go install github.com/JohanLindvall/acrprune/cmd/acrprune@latest
 ```
@@ -48,9 +50,33 @@ acrprune -r ghcr.io/myorg -v prune --in rules/delete_untagged_images.json
 | `--cache` | `-c` | | Local directory for caching downloaded manifests |
 | `--page-size` | `--pagesize` | `250` | Number of items per API page request (at least 1; GHCR caps it at 100) |
 | `--parallelism` | | `16` | Number of concurrent API operations (at least 1) |
+| `--progress` | | `auto` | Batch display: `auto` (TUI on a terminal), `plain` (logs), or `tui` (require a terminal) |
 | `--verbose` | `-v` | `false` | Enable debug logging |
 
 ¹ Required by every command except `top`, which runs locally.
+
+### Interactive batch progress
+
+`prune` and `statistics` automatically show a live terminal dashboard when stderr is a terminal. It uses [tcell](https://github.com/gdamore/tcell) directly, without a widget framework. The display shows the registry, a prominent **DRY RUN / LIVE DELETE** indicator, repository progress, current inspection phase, manifest and cache counts, keep/delete decisions, estimated bytes, warnings, and API retry countdowns. Statistics scans show manifest counts and deduplicated bytes instead of deletion decisions.
+
+```sh
+acrprune -r myregistry --progress=tui prune --in rules/delete_untagged_images.json
+acrprune -r ghcr.io/myorg stats --out stats.json
+acrprune -r myregistry --progress=plain stats > stats.json
+```
+
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl-C` | Cancel; wait for active requests to stop before restoring the terminal |
+| `l` | Toggle the activity panel |
+| `w` | Toggle warnings-only activity |
+| `↑` / `↓`, `k` / `j` | Scroll activity |
+| `PgUp` / `PgDn`, `Home` / `End` | Scroll by page, jump to oldest, or follow latest activity |
+| `?` / `Esc` | Show / close help |
+
+The layout adapts to terminal resizing and honors `NO_COLOR`. The last 200 log entries are retained in the display; use `--progress=plain` for a complete log. The dashboard closes automatically and leaves a summary and recent warnings in scrollback. A dry run counts selected manifests while the actual deletion counter stays zero. Byte estimates describe the evaluated plan, not confirmed registry garbage collection.
+
+The UI uses the controlling terminal, leaving stdout available for JSON and allowing rules to arrive over stdin. Redirected stderr and `TERM=dumb` automatically use plain logs. `--progress=tui` reports an error if no usable terminal is available. File flags accept `-` for stdin or stdout. `Ctrl-C` and `SIGTERM` also cancel plain-mode operations.
 
 ## Commands
 
@@ -92,7 +118,7 @@ GHCR has no image locks; there the flag has no effect.
 
 ### `statistics` (alias: `stats`)
 
-Generates per-repository size and manifest statistics as JSON. When writing to a file, the output is rewritten after each repository so partial results survive an interrupted run.
+Generates per-repository size and manifest statistics as JSON. Named files are replaced atomically after each repository, preserving the last complete snapshot if a write fails or the process is interrupted. A failure before the first result leaves an existing output file untouched. Errors after completed repositories return those partial results with a non-zero exit code, including when writing to stdout. New output files are private (`0600`); existing file permissions are preserved. Output symlinks and non-regular files are refused; use `-` for stdout.
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
@@ -125,16 +151,24 @@ The output is a JSON array with one object per repository:
 
 ### `generate`
 
-Reads a list of image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos). Tag references (`myreg.azurecr.io/repo:tag`, `ghcr.io/myorg/repo:tag`) are kept by tag; digest-pinned references (`myreg.azurecr.io/repo@sha256:…`) are kept by digest, whether or not the manifest is tagged in the registry; a reference carrying both keeps both, since the digest pins what is actually running even if the tag has been moved. References for other registries — and, on GHCR, other owners — are ignored. The input need not be sorted or deduplicated: each repository yields exactly one rule. `generate` works offline: it needs `--registry` to know which references are its images, but no credentials.
+Reads a list of image references from stdin and produces a JSON rule file that keeps only those images (deleting everything else in matching repos). Tag references (`myreg.azurecr.io/repo:tag`, `ghcr.io/myorg/repo:tag`) are kept by tag; digest-pinned references (`myreg.azurecr.io/repo@sha256:…`) are kept by digest, whether or not the manifest is tagged in the registry; a reference carrying both keeps both, since the digest pins what is actually running even if the tag has been moved. References for other registries — and, on GHCR, other owners — are ignored. A reference without a tag or digest means `:latest`. Malformed references for the selected registry abort generation with a line number, so they cannot silently omit a running image. Digests must be complete, valid OCI digests. The input need not be sorted or deduplicated: each repository yields exactly one rule. `generate` works offline: it needs `--registry` to know which references are its images, but no credentials.
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
 | `--output` | `--out`, `--outfile` | stdout | Output file path |
 
 ```sh
-scripts/get_pod_images.sh | acrprune -r myregistry generate | acrprune -r myregistry -v prune --dry-run=false
-scripts/get_pod_images.sh | acrprune -r ghcr.io/myorg generate | acrprune -r ghcr.io/myorg -v prune --dry-run=false
+scripts/get_pod_images.sh > images.txt &&
+  acrprune -r myregistry generate < images.txt > keep-rules.json &&
+  acrprune -r myregistry prune --in keep-rules.json
+# Review the dry run, then use --dry-run=false to apply it.
 ```
+
+#### Kubernetes image inventory
+
+`scripts/get_pod_images.sh [--scaledjobs] [context ...]` requires `kubectl` and `jq`. With no contexts supplied, it scans every kubeconfig context. It includes normal, init, and ephemeral containers, plus fully qualified runtime image digests, and deduplicates the result. `--scaledjobs` also includes KEDA ScaledJobs and fails if they cannot be queried. `KUBECTL_REQUEST_TIMEOUT` overrides the default `60s` request timeout.
+
+The script buffers all results and emits nothing if any query fails. Use the staged example above or enable your shell's `pipefail` when chaining commands. It no longer assumes particular cluster names or launches temporary pods. To include historical Mimir/Loki images, explicitly set `MIMIR_URL` and/or `LOKI_URL` to full label-values API URLs reachable from the local machine (for example, through port forwarding); those optional sources require `curl` and must also succeed.
 
 ### `top`
 
@@ -167,7 +201,7 @@ gp-profile  11 GB   29 GB   63.5%   75      150       225    0        2026-06-23
 
 ## Rule File Format
 
-Rules are a JSON array of repository rules. Each rule matches repositories by regex and defines how to handle tagged and untagged manifests. Regexes are validated when the rule file is loaded.
+Rules are a JSON array of repository rules. Each rule matches repositories by regex and defines how to handle tagged and untagged manifests. Regexes are validated when the rule file is loaded. Unknown fields, null rule entries, trailing JSON content, and negative age constraints are rejected. An empty array is valid and performs no pruning.
 
 ```json
 [
@@ -189,7 +223,7 @@ Rules are a JSON array of repository rules. Each rule matches repositories by re
 |-------|------|---------|-------------|
 | `description` | string | | Optional description |
 | `repo` | string | | Regex to match repository names (on GHCR, package names: `team/app` for `ghcr.io/myorg/team/app`) |
-| `ignore_missing_manifests` | bool | `true` | Ignore (rather than fail on) manifests that are listed but can't be downloaded; ignored manifests are left in place |
+| `ignore_missing_manifests` | bool | `true` | Ignore missing resources (404) rather than fail. If a listed manifest cannot be downloaded, its entire repository is left untouched because its dependencies are unknown |
 | `delete_orphaned_manifests` | bool | `false` | Delete manifests whose dependencies are missing |
 | `must_delete_everything` | bool | `false` | If any manifest must be kept, keep all (used for "delete entire repo" rules) |
 
@@ -212,7 +246,7 @@ Same as tagged rules but without the `tag` field.
 
 ### Rule Evaluation
 
-Rules are evaluated in order. The first matching rule determines whether a manifest is kept or deleted. If no rule matches, the manifest is kept. Duration values support Go duration syntax (`24h`, `168h`) and extended syntax with days and weeks (`14d`, `2w`).
+Rules are evaluated in order. The first matching rule determines whether a manifest is kept or deleted. If no rule matches, the manifest is kept. Duration values support Go duration syntax (`24h`, `168h`) and extended syntax with days and weeks (`14d`, `2w`), or an exact integer number of nanoseconds. Values must be non-negative and fit a Go duration. If both `arch` and `os` are present, they must match the same platform; separate index entries cannot satisfy one criterion each.
 
 `newest` ranks a manifest against the other manifests **the same rule matches**, not against the whole repository. So the pair of rules below keeps the three most recent release images however many newer feature-branch images sit alongside them:
 
@@ -237,15 +271,16 @@ Manifests of equal age are ranked by digest, so repeated runs over an unchanged 
 
 ## Behaviour Notes
 
-- A repository the rules leave no manifest in is deleted entirely (respecting `--dry-run`) — unless it lists a manifest that could not be downloaded. The rules never judged that manifest, so it is left in place, and the rest of the repository is deleted manifest by manifest.
+- A repository the rules leave no manifest in is deleted entirely (respecting `--dry-run`). If any listed manifest cannot be downloaded, the entire repository is skipped: an unavailable index could reference any of its other manifests. Other repositories continue to be processed.
+- Individual deletions remove indexes/referrers before their dependencies. If a parent deletion fails, its children are left intact. This also protects children of a locked index.
 - Manifests with a `subject` field (signatures, attestations, SBOMs) follow their subject instead of matching rules: they are kept exactly as long as the subject is kept, deleted along with it, and deleted when the subject is already gone. They do not occupy `newest` ranking slots, and they do not count as "kept" for `must_delete_everything`, so signed repositories can still be bulk-deleted.
 - The `--keep-younger` grace period overrides rule decisions — recently updated manifests are never deleted. This holds for subject-bearing manifests too, so a dangling signature outlives its subject by at most the grace period.
-- Listings are a point-in-time snapshot: tags moved or manifests pushed while a prune is running are not observed. New pushes are protected by `--keep-younger`, except in a repository the run deletes entirely; avoid retagging old manifests during a run.
+- Listings are a point-in-time snapshot. Before a whole-repository delete, attributes are listed again; new or missing manifests, changed tags, timestamps, or locks abort deletion. This narrows the race with concurrent writers, but registries offer no atomic compare-and-delete. Avoid pushes and retagging during a prune, especially while unlocking protected images. A repeated manifest during pagination also aborts inspection instead of making a decision from conflicting attributes.
 - The per-repository byte counts logged by `prune` deduplicate blobs within the repository only; layers shared with other repositories may not actually be freed by the registry's garbage collector.
 - A manifest the registry reports no last-updated time for is never deleted, since every age-based rule would otherwise read it as infinitely old.
-- A manifest is orphaned when something it references is missing — an index child or a `subject` alike — and the flag propagates both up to the indexes referencing it and down to its children. A child still reachable through a healthy index is not orphaned by a broken sibling.
+- A manifest is orphaned when something it references is missing — an index child or a `subject` alike — and the flag propagates both up to the indexes referencing it and down to its children. A child still reachable through a healthy index or its own tag is not orphaned by a broken sibling.
 - When every rule targets a literal repository name (`^name$`), only those repositories are fetched instead of listing the whole registry. A pattern containing an active metacharacter is not a literal name: `^my.repo$` matches `myXrepo` too, so it is resolved by listing the catalog. Write `^my\.repo$` (what `generate` emits) to address a repository with a dot in its name directly.
-- Cached manifests are stored under `<cache>/<registry>/` and are removed from cache when deleted from the registry. Image configs read for `arch`/`os` rules on GHCR are cached alongside them. Cached content is verified against its digest on every read.
+- Cached manifests are stored under `<cache>/<canonical-registry>/` (for example `myreg.azurecr.io` or `ghcr.io/myorg`) and are removed from cache when deleted from the registry. Image configs read for `arch`/`os` rules on GHCR are cached alongside them. Cached content is verified against its digest on every read, reads are bounded to 16 MiB, and writes replace files atomically. New cache directories and files are private. Unsupported manifest formats, invalid descriptor digests, and negative blob sizes abort inspection.
 
 ### GitHub Container Registry
 
@@ -268,12 +303,35 @@ Manifests of equal age are ranked by digest, so repeated runs over an unchanged 
 | `internal/registry/ghcr` | `Backend` for GitHub Container Registry: GitHub REST packages API, ghcr.io registry token exchange, rate-limit-aware retries |
 | `internal/registry/registrytest` | In-memory `Backend` for tests |
 | `internal/pruner` | Rule evaluation, orphan detection, keep/delete decisions, statistics |
+| `internal/progress` | Concurrent progress tracking, bounded logs, and the lightweight terminal dashboard |
+| `internal/imageref` | Shared repository and image-reference validation |
+| `internal/fileio` | Atomic file snapshots |
+
+## Development and validation
+
+```sh
+make build       # local binary, version from git
+make test        # Go tests and mocked Kubernetes inventory tests (requires jq)
+make test-race   # Go race detector plus inventory tests
+make coverage    # race-enabled coverage.out and function coverage
+make vet
+make lint        # pinned golangci-lint
+make dist-all    # Linux amd64/arm64 archives and checksums
+```
+
+The tests use in-memory registries and HTTP test servers; they do not require cloud credentials or delete real packages. Coverage includes rule validation, dependency/referrer lifecycles, pagination, throttling, credential redirects, cancellation, atomic output, CLI workflows, and terminal simulation at multiple sizes. Fuzz targets exercise rule parsing and image-reference validation. For an extended local run:
+
+```sh
+go test ./internal/rules -fuzz=FuzzParseAndCompile -fuzztime=30s
+go test ./internal/imageref -fuzz=FuzzSplit -fuzztime=30s
+govulncheck ./...
+```
 
 ## Similar Work
 
 - https://github.com/Azure/acr-cli
 
-This however lacks the rules and robustness, making it unusable for larger registries.
+acrprune adds declarative retention rules, dependency-aware cleanup, and support for both ACR and GHCR.
 
 ## License
 

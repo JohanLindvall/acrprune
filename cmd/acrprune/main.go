@@ -12,8 +12,10 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -22,6 +24,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	"github.com/urfave/cli/v3"
 
+	"github.com/JohanLindvall/acrprune/internal/fileio"
+	"github.com/JohanLindvall/acrprune/internal/progress"
 	"github.com/JohanLindvall/acrprune/internal/pruner"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/registry/acr"
@@ -38,8 +42,11 @@ var version = "dev"
 var errRegistryRequired = errors.New("required flag --registry not set")
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	cmd := newCommand()
-	if err := cmd.Run(context.Background(), os.Args); err != nil {
+	err := cmd.Run(ctx, os.Args)
+	stop()
+	if err != nil {
 		os.Exit(1)
 	}
 }
@@ -47,6 +54,10 @@ func main() {
 // newCommand builds the acrprune CLI command tree. It is split out from main
 // so tests can inspect the flag wiring.
 func newCommand() *cli.Command {
+	return newCommandWithConnector(connect)
+}
+
+func newCommandWithConnector(connect func(context.Context, *cli.Command, registry.Address, *slog.Logger) (*registry.Registry, error)) *cli.Command {
 	logLevel := new(slog.LevelVar)
 	logLevel.Set(slog.LevelInfo)
 
@@ -72,6 +83,9 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "running", Usage: "file of running images used to annotate stats"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := noArguments(cmd); err != nil {
+						return err
+					}
 					addr, err := address(cmd)
 					if err != nil {
 						return err
@@ -80,38 +94,32 @@ func newCommand() *cli.Command {
 					if err != nil {
 						return err
 					}
-					reg, err := connect(ctx, cmd, addr, logger)
-					if err != nil {
-						return err
-					}
-
-					outPath := cmd.String("output")
-					out, closeOut, err := openOutput(outPath)
-					if err != nil {
-						return err
-					}
-					defer closeOut()
-					var onUpdate func([]pruner.RepositoryStats) error
-					if outPath != "" {
-						// Rewrite the file after each repository so partial
-						// results survive an interrupted run.
-						onUpdate = func(stats []pruner.RepositoryStats) error {
-							return rewriteJSON(out, stats)
+					return progress.Run(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "statistics", Registry: addr.String()}, logger, func(ctx context.Context, logger *slog.Logger) error {
+						reg, err := connect(ctx, cmd, addr, logger)
+						if err != nil {
+							return err
 						}
-					}
 
-					// Denied repositories yield partial stats and an error;
-					// write what was collected either way.
-					stats, err := pruner.CollectRegistryStats(ctx, reg, runningRules, onUpdate)
-					if stats == nil {
-						return err
-					}
-					if outPath == "" {
-						return errors.Join(writeJSON(out, stats), err)
-					}
-					// Write once more so an empty registry still leaves valid
-					// JSON behind rather than an empty file.
-					return errors.Join(rewriteJSON(out, stats), err)
+						outPath := cmd.String("output")
+						var onUpdate func([]pruner.RepositoryStats) error
+						if outPath != "" && outPath != "-" {
+							// Rewrite the file after each repository so partial
+							// results survive an interrupted run.
+							onUpdate = func(stats []pruner.RepositoryStats) error {
+								return writeOutput(outPath, stats)
+							}
+						}
+
+						// Denied repositories yield partial stats and an error;
+						// write what was collected either way.
+						stats, err := pruner.CollectRegistryStats(ctx, reg, runningRules, onUpdate)
+						if stats == nil {
+							return err
+						}
+						// Write once more so an empty registry still leaves valid
+						// JSON behind rather than an empty file.
+						return errors.Join(writeOutput(outPath, stats), err)
+					})
 				},
 			},
 			{
@@ -124,6 +132,9 @@ func newCommand() *cli.Command {
 					&cli.BoolFlag{Name: "include-locked", Aliases: []string{"includelocked"}, Usage: "unlock delete/write-disabled manifests and tags before deleting them (ACR)"},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := noArguments(cmd); err != nil {
+						return err
+					}
 					addr, err := address(cmd)
 					if err != nil {
 						return err
@@ -148,18 +159,20 @@ func newCommand() *cli.Command {
 						return err
 					}
 
-					reg, err := connect(ctx, cmd, addr, logger)
-					if err != nil {
-						return err
-					}
-					p := &pruner.Pruner{
-						Registry:      reg,
-						Logger:        logger,
-						DryRun:        cmd.Bool("dry-run"),
-						KeepYounger:   keepYounger,
-						IncludeLocked: cmd.Bool("include-locked"),
-					}
-					return p.Prune(ctx, ruleSet)
+					return progress.Run(ctx, progress.Options{Mode: cmd.String("progress"), Operation: "prune", Registry: addr.String(), DryRun: cmd.Bool("dry-run")}, logger, func(ctx context.Context, logger *slog.Logger) error {
+						reg, err := connect(ctx, cmd, addr, logger)
+						if err != nil {
+							return err
+						}
+						p := &pruner.Pruner{
+							Registry:      reg,
+							Logger:        logger,
+							DryRun:        cmd.Bool("dry-run"),
+							KeepYounger:   keepYounger,
+							IncludeLocked: cmd.Bool("include-locked"),
+						}
+						return p.Prune(ctx, ruleSet)
+					})
 				},
 			},
 			{
@@ -169,6 +182,9 @@ func newCommand() *cli.Command {
 					&cli.StringFlag{Name: "output", Aliases: []string{"out", "outfile"}},
 				},
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if err := noArguments(cmd); err != nil {
+						return err
+					}
 					addr, err := address(cmd)
 					if err != nil {
 						return err
@@ -178,12 +194,7 @@ func newCommand() *cli.Command {
 						return err
 					}
 					logger.Debug("Built rules", "rules", len(specs))
-					out, closeOut, err := openOutput(cmd.String("output"))
-					if err != nil {
-						return err
-					}
-					defer closeOut()
-					return writeJSON(out, specs)
+					return writeOutput(cmd.String("output"), specs)
 				},
 			},
 			{
@@ -196,6 +207,12 @@ func newCommand() *cli.Command {
 				},
 				ArgsUsage: "[stats.json]",
 				Action: func(ctx context.Context, cmd *cli.Command) error {
+					if cmd.Int("top") < 0 {
+						return errors.New("--top must not be negative (use 0 for all rows)")
+					}
+					if err := pruner.SortStatsBy(nil, cmd.String("sort")); err != nil {
+						return err
+					}
 					// Refuse ambiguity instead of silently ignoring an input.
 					if cmd.Args().Len() > 1 {
 						return fmt.Errorf("expected at most one stats file argument, got %d", cmd.Args().Len())
@@ -226,6 +243,9 @@ func newCommand() *cli.Command {
 		},
 
 		Before: func(ctx context.Context, cmd *cli.Command) (context.Context, error) {
+			if err := progress.ValidateMode(cmd.String("progress")); err != nil {
+				return ctx, err
+			}
 			if cmd.Bool("verbose") {
 				logLevel.Set(slog.LevelDebug)
 			}
@@ -247,6 +267,7 @@ func newCommand() *cli.Command {
 			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests"},
 			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250, Usage: "items per listing request (GHCR caps it at 100)"},
 			&cli.IntFlag{Name: "parallelism", Value: 16},
+			&cli.StringFlag{Name: "progress", Value: "auto", Usage: "batch progress display: auto, plain or tui"},
 			&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}},
 		},
 		ExitErrHandler: func(ctx context.Context, cmd *cli.Command, err error) {
@@ -260,7 +281,7 @@ func newCommand() *cli.Command {
 // openInput opens path for reading, falling back to stdin when it is empty.
 // The returned function closes the file, and does nothing for stdin.
 func openInput(path string) (io.Reader, func(), error) {
-	if path == "" {
+	if path == "" || path == "-" {
 		return os.Stdin, func() {}, nil
 	}
 	f, err := os.Open(path)
@@ -270,18 +291,13 @@ func openInput(path string) (io.Reader, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
-// openOutput opens path for writing, creating or truncating it, and falls
-// back to stdout when path is empty. The returned function closes the file,
-// and does nothing for stdout.
-func openOutput(path string) (*os.File, func(), error) {
-	if path == "" {
-		return os.Stdout, func() {}, nil
+// noArguments prevents a mistyped input filename from silently falling back
+// to stdin, or an extra argument from being ignored before deleting data.
+func noArguments(cmd *cli.Command) error {
+	if cmd.Args().Len() != 0 {
+		return fmt.Errorf("%s does not accept positional arguments: %q", cmd.Name, cmd.Args().Slice())
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, nil, err
-	}
-	return f, func() { _ = f.Close() }, nil
+	return nil
 }
 
 // address parses --registry for the commands that need it.
@@ -309,7 +325,7 @@ func connect(ctx context.Context, cmd *cli.Command, addr registry.Address, logge
 	}
 	var cache *registry.Cache
 	if dir := cmd.String("cache"); dir != "" {
-		cache = registry.NewCache(filepath.Join(dir, cmd.String("registry")))
+		cache = registry.NewCache(filepath.Join(dir, addr.String()))
 	}
 	return registry.New(backend, logger, cmd.Int("parallelism"), cache)
 }
@@ -380,11 +396,11 @@ func loadRunningRules(path string, addr registry.Address) ([]*rules.RepoRule, er
 	if path == "" {
 		return nil, nil
 	}
-	f, err := os.Open(path)
+	f, closeIn, err := openInput(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open running file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	defer closeIn()
 
 	specs, err := rules.KeepRulesFromImageList(f, addr.String())
 	if err != nil {
@@ -402,14 +418,15 @@ func writeJSON(w io.Writer, v any) error {
 	return err
 }
 
-// rewriteJSON replaces the whole file with v, truncating whatever was there
-// before so a shorter document cannot leave a tail of the previous one behind.
-func rewriteJSON(f *os.File, v any) error {
-	if err := f.Truncate(0); err != nil {
+// writeOutput publishes a complete JSON snapshot. Named files are replaced
+// atomically, so interruptions and failed writes preserve the last snapshot.
+func writeOutput(path string, v any) error {
+	if path == "" || path == "-" {
+		return writeJSON(os.Stdout, v)
+	}
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
 		return err
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return writeJSON(f, v)
+	return fileio.WriteFile(path, append(data, '\n'), 0o600)
 }

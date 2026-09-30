@@ -11,6 +11,9 @@ import (
 // failures are logged and tolerated: the delete that follows surfaces anything
 // that genuinely could not be unlocked.
 func (r *Registry) UnlockManifests(ctx context.Context, repository string, manifests []*Manifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	unlocker, ok := r.backend.(Unlocker)
 	if !ok || len(manifests) == 0 {
 		return nil
@@ -46,5 +49,5 @@ func (r *Registry) UnlockManifests(ctx context.Context, repository string, manif
 		}
 	}
 	_ = group.Wait()
-	return nil
+	return ctx.Err()
 }

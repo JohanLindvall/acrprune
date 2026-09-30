@@ -168,6 +168,18 @@ func TestReferrerGracePeriod(t *testing.T) {
 	}
 }
 
+func TestReferrerWithoutTimestampIsProtected(t *testing.T) {
+	p := testPruner()
+	sig := testManifest("sig", time.Time{})
+	sig.Subject = &v1.Descriptor{Digest: "gone"}
+	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", DeleteOrphanedManifests: to.Ptr(true)})
+	manifests := byDigest(sig)
+	markOrphans(manifests)
+	if got := decideDigests(t, p, manifests, rule); strings.Join(got, ",") != "sig" {
+		t.Errorf("kept = %v, want unknown-age referrer protected", got)
+	}
+}
+
 // TestOrphanedReferrerDeletedDespiteKeptSubject: delete_orphaned_manifests
 // still wins over the subject linkage for a structurally broken referrer.
 func TestOrphanedReferrerDeletedDespiteKeptSubject(t *testing.T) {

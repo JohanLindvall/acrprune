@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"github.com/JohanLindvall/acrprune/internal/fileio"
 )
 
 // digestPattern matches an `algorithm:hex` OCI digest. Digests become file
@@ -40,7 +42,12 @@ func (c *Cache) Get(digest string) []byte {
 	if path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+	data, err := ReadDocument(f)
 	if err != nil {
 		return nil
 	}
@@ -50,11 +57,11 @@ func (c *Cache) Get(digest string) []byte {
 // Put stores a document; cache write failures are ignored.
 func (c *Cache) Put(digest string, data []byte) {
 	path := c.path(digest)
-	if path == "" {
+	if path == "" || len(data) > MaxDocumentSize {
 		return
 	}
-	if err := os.MkdirAll(c.dir, 0o755); err == nil {
-		_ = os.WriteFile(path, data, 0o644)
+	if err := os.MkdirAll(c.dir, 0o700); err == nil {
+		_ = fileio.WriteFile(path, data, 0o600)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/JohanLindvall/acrprune/internal/imageref"
 )
 
 // repoKeeps accumulates what one repository's rule must keep.
@@ -41,10 +42,17 @@ func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, erro
 	keeps := map[string]*repoKeeps{}
 
 	scanner := bufio.NewScanner(r)
+	lineNumber := 0
 	for scanner.Scan() {
-		repository, tag, digest, ok := splitImageRef(strings.TrimSpace(scanner.Text()), prefix)
-		if !ok {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		name, matches := strings.CutPrefix(line, prefix)
+		if !matches {
 			continue
+		}
+		repository, tag, digest, err := imageref.Split(name)
+		if err != nil {
+			return nil, fmt.Errorf("image list line %d: %w", lineNumber, err)
 		}
 		k := keeps[repository]
 		if k == nil {
@@ -97,25 +105,6 @@ func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, erro
 		specs = append(specs, spec)
 	}
 	return specs, nil
-}
-
-// splitImageRef extracts the repository, tag and pinned digest from an image
-// reference such as `myreg.azurecr.io/team/app:1.2.3` or
-// `ghcr.io/owner/app@sha256:…`, given the prefix to strip. ok is false when
-// the line is not an image below the prefix or names neither a tag nor a
-// digest.
-func splitImageRef(line, prefix string) (repository, tag, digest string, ok bool) {
-	name, ok := strings.CutPrefix(line, prefix)
-	if !ok {
-		return "", "", "", false
-	}
-	name, digest, _ = strings.Cut(name, "@")
-	// Repository names cannot contain a colon, so the first one starts the tag.
-	repository, tag, _ = strings.Cut(name, ":")
-	if repository == "" || (tag == "" && digest == "") {
-		return "", "", "", false
-	}
-	return repository, tag, digest, true
 }
 
 // anchored turns a literal name into a regex matching exactly that name.

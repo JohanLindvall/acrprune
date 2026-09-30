@@ -172,7 +172,7 @@ func TestKeepWithDependencies(t *testing.T) {
 
 	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
 	kept := map[string]struct{}{}
-	if err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
+	if _, err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
 		t.Fatal(err)
 	}
 	if len(kept) != 3 {
@@ -182,12 +182,12 @@ func TestKeepWithDependencies(t *testing.T) {
 	// A missing dependency fails unless ignore_missing_manifests is set.
 	index.Manifests = append(index.Manifests, v1.Descriptor{Digest: "gone"})
 	strict := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", IgnoreMissingManifests: to.Ptr(false)})
-	if err := p.keepWithDependencies(index.Digest, manifests, map[string]struct{}{}, strict); err == nil {
+	if _, err := p.keepWithDependencies(index.Digest, manifests, map[string]struct{}{}, strict); err == nil {
 		t.Error("missing dependency should fail in strict mode")
 	}
 
 	kept = map[string]struct{}{}
-	if err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
+	if _, err := p.keepWithDependencies(index.Digest, manifests, kept, rule); err != nil {
 		t.Errorf("missing dependency should be tolerated by default: %v", err)
 	}
 	// The missing digest must not be recorded as kept: an empty repository is
@@ -210,7 +210,7 @@ func TestKeepWithDependenciesCycle(t *testing.T) {
 
 	kept := map[string]struct{}{}
 	rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+"})
-	if err := p.keepWithDependencies("a", byDigest(a, b), kept, rule); err != nil {
+	if _, err := p.keepWithDependencies("a", byDigest(a, b), kept, rule); err != nil {
 		t.Fatal(err)
 	}
 	if len(kept) != 2 {

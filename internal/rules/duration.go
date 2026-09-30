@@ -2,7 +2,7 @@ package rules
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 	"time"
 
 	str2duration "github.com/xhit/go-str2duration/v2"
@@ -19,15 +19,11 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 }
 
 func (d *Duration) UnmarshalJSON(b []byte) error {
-	var v any
-	if err := json.Unmarshal(b, &v); err != nil {
-		return err
-	}
-	switch value := v.(type) {
-	case float64:
-		d.Duration = time.Duration(value)
-		return nil
-	case string:
+	if len(b) > 0 && b[0] == '"' {
+		var value string
+		if err := json.Unmarshal(b, &value); err != nil {
+			return err
+		}
 		// str2duration accepts everything time.ParseDuration does plus the
 		// day and week units.
 		parsed, err := str2duration.ParseDuration(value)
@@ -36,7 +32,16 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 		}
 		d.Duration = parsed
 		return nil
-	default:
-		return errors.New("invalid duration")
 	}
+	// Decode integers directly: converting through float64 loses precision
+	// and can turn a large positive duration into a negative one.
+	var nanos int64
+	if string(b) == "null" {
+		return fmt.Errorf("duration must be a string or an integer number of nanoseconds")
+	}
+	if err := json.Unmarshal(b, &nanos); err != nil {
+		return fmt.Errorf("duration must be a string or an integer number of nanoseconds: %w", err)
+	}
+	d.Duration = time.Duration(nanos)
+	return nil
 }

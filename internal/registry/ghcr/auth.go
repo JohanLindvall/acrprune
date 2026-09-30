@@ -40,7 +40,7 @@ func (b *Backend) registryToken(ctx context.Context, scope string) (string, erro
 	if token != "" || realm == "" {
 		return token, nil
 	}
-	return b.fetchRegistryToken(ctx, scope)
+	return b.fetchRegistryToken(ctx, scope, "")
 }
 
 // renewRegistryToken replaces a token the registry rejected with the given
@@ -58,22 +58,34 @@ func (b *Backend) renewRegistryToken(ctx context.Context, scope, rejected, chall
 	if current != "" && current != rejected {
 		return current, nil
 	}
-	return b.fetchRegistryToken(ctx, scope)
+	return b.fetchRegistryToken(ctx, scope, rejected)
 }
 
 // fetchRegistryToken exchanges the GitHub token for a registry token for
 // scope. Concurrent requests for one scope share a single exchange.
-func (b *Backend) fetchRegistryToken(ctx context.Context, scope string) (string, error) {
-	token, err, _ := b.tokens.flight.Do(scope, func() (any, error) {
+func (b *Backend) fetchRegistryToken(ctx context.Context, scope, rejected string) (string, error) {
+	result := b.tokens.flight.DoChan(scope, func() (any, error) {
 		b.tokens.mu.Lock()
 		realm, service := b.tokens.realm, b.tokens.service
+		current := b.tokens.byScope[scope]
 		b.tokens.mu.Unlock()
+		// A request may have renewed the token between the caller's lookup
+		// and entering this flight. Do not exchange it again in that gap.
+		if current != "" && current != rejected {
+			return current, nil
+		}
 
-		query := url.Values{"scope": {scope}}
+		u, err := url.Parse(realm)
+		if err != nil {
+			return "", err
+		}
+		query := u.Query()
+		query.Set("scope", scope)
 		if service != "" {
 			query.Set("service", service)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, realm+"?"+query.Encode(), nil)
+		u.RawQuery = query.Encode()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 		if err != nil {
 			return "", err
 		}
@@ -102,10 +114,15 @@ func (b *Backend) fetchRegistryToken(ctx context.Context, scope string) (string,
 		b.tokens.mu.Unlock()
 		return token, nil
 	})
-	if err != nil {
-		return "", err
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case token := <-result:
+		if token.Err != nil {
+			return "", token.Err
+		}
+		return token.Val.(string), nil
 	}
-	return token.(string), nil
 }
 
 // parseChallenge extracts the token endpoint from a WWW-Authenticate header
@@ -120,7 +137,7 @@ func (b *Backend) parseChallenge(header string) (realm, service string, err erro
 	values := parseParams(params)
 	realm = values["realm"]
 	u, err := url.Parse(realm)
-	if err != nil || u.Scheme != b.registryURL.Scheme || u.Host != b.registryURL.Host {
+	if err != nil || u.User != nil || u.Fragment != "" || !sameOrigin(u, b.registryURL) {
 		return "", "", fmt.Errorf("refusing to authenticate at %q, away from %s", realm, b.registryURL.Host)
 	}
 	return realm, values["service"], nil

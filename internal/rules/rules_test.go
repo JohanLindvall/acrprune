@@ -2,6 +2,7 @@ package rules
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,9 @@ func TestDurationUnmarshalJSON(t *testing.T) {
 		{`"2w"`, 14 * 24 * time.Hour, false},
 		{`"1h30m"`, 90 * time.Minute, false},
 		{`3600000000000`, time.Hour, false},
+		{`9223372036854775807`, time.Duration(math.MaxInt64), false},
+		{`9223372036854775808`, 0, true},
+		{`1.5`, 0, true},
 		{`"bogus"`, 0, true},
 		{`true`, 0, true},
 	}
@@ -178,8 +182,36 @@ func TestParseSpecsRejectsUnknownFields(t *testing.T) {
 // TestParseSpecsRejectsTrailingContent stops a rule file from being silently
 // read as only its first array.
 func TestParseSpecsRejectsTrailingContent(t *testing.T) {
-	if _, err := ParseSpecs(strings.NewReader(`[{"repo": ".+"}] [{"repo": "other"}]`)); err == nil {
-		t.Error("trailing content should be rejected")
+	for _, input := range []string{`[{"repo": ".+"}] [{"repo": "other"}]`, `[]]`, `[]} `, `[] garbage`, `null`} {
+		if _, err := ParseSpecs(strings.NewReader(input)); err == nil {
+			t.Errorf("invalid rule file should be rejected: %s", input)
+		}
+	}
+}
+
+func TestCompileRejectsNullRules(t *testing.T) {
+	for _, input := range []string{`[null]`, `[{"repo":".+","tagged":[null]}]`, `[{"repo":".+","untagged":[null]}]`} {
+		t.Run(input, func(t *testing.T) {
+			specs, err := ParseSpecs(strings.NewReader(input))
+			if err == nil {
+				_, err = Compile(specs)
+			}
+			if err == nil {
+				t.Fatal("null rule must fail without panicking")
+			}
+		})
+	}
+}
+
+func TestCompileRejectsNegativeAges(t *testing.T) {
+	for _, field := range []string{"match_older", "match_newer"} {
+		specs, err := ParseSpecs(strings.NewReader(`[{"repo":".+","tagged":[{"` + field + `":"-1h"}]}]`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Compile(specs); err == nil {
+			t.Errorf("negative %s must fail", field)
+		}
 	}
 }
 
@@ -190,7 +222,7 @@ func TestKeepRulesFromImageList(t *testing.T) {
 		"otherreg.azurecr.io/app:v9", // wrong registry, skipped
 		"myreg.azurecr.io/tools/db:latest",
 		"not-an-image-line",
-		"myreg.azurecr.io/no-tag",
+		"myreg.azurecr.io/app",
 	}, "\n")
 
 	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
@@ -205,15 +237,15 @@ func TestKeepRulesFromImageList(t *testing.T) {
 	if app.RepoRegex != "^app$" {
 		t.Errorf("rule 0 repo = %q", app.RepoRegex)
 	}
-	// v1 keep, v2 keep, catch-all delete
-	if len(app.Tagged) != 3 {
-		t.Fatalf("rule 0 tagged rules = %d, want 3", len(app.Tagged))
+	// v1 keep, v2 keep, latest keep, catch-all delete
+	if len(app.Tagged) != 4 {
+		t.Fatalf("rule 0 tagged rules = %d, want 4", len(app.Tagged))
 	}
 	if *app.Tagged[0].TagRegex != "^v1$" || !*app.Tagged[0].Keep {
 		t.Errorf("rule 0 tag 0 = %+v", app.Tagged[0])
 	}
-	if *app.Tagged[2].TagRegex != ".+" || *app.Tagged[2].Keep {
-		t.Errorf("rule 0 catch-all = %+v", app.Tagged[2])
+	if *app.Tagged[3].TagRegex != ".+" || *app.Tagged[3].Keep {
+		t.Errorf("rule 0 catch-all = %+v", app.Tagged[3])
 	}
 	if len(app.Untagged) != 1 || *app.Untagged[0].Keep {
 		t.Errorf("rule 0 untagged = %+v", app.Untagged)
@@ -274,7 +306,7 @@ func TestKeepRulesFromImageListSovereignCloud(t *testing.T) {
 func TestKeepRulesFromImageListGHCR(t *testing.T) {
 	input := strings.Join([]string{
 		"ghcr.io/acme/app:v1",
-		"ghcr.io/acme/team/api@sha256:pinned",
+		"ghcr.io/acme/team/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"ghcr.io/acmecorp/app:v9", // another owner sharing the prefix
 		"ghcr.io/other/app:v9",
 		"myreg.azurecr.io/app:v9",
@@ -290,7 +322,7 @@ func TestKeepRulesFromImageListGHCR(t *testing.T) {
 		if len(specs[0].Tagged) != 2 || *specs[0].Tagged[0].TagRegex != "^v1$" {
 			t.Errorf("app keeps = %+v", specs[0].Tagged)
 		}
-		if *specs[1].Untagged[0].DigestRegex != "^sha256:pinned$" {
+		if *specs[1].Untagged[0].DigestRegex != "^sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$" {
 			t.Errorf("team/api keeps = %+v", specs[1].Untagged)
 		}
 	}
@@ -300,6 +332,26 @@ func TestKeepRulesFromImageListNeedsLocation(t *testing.T) {
 	if _, err := KeepRulesFromImageList(strings.NewReader("/app:v1\n"), ""); err == nil {
 		t.Error("an empty location should be refused rather than match every reference")
 	}
+}
+
+func TestMalformedTargetImageAbortsGeneration(t *testing.T) {
+	for _, bad := range []string{"app:", "app@sha256:short", "../app:v1", "app:bad tag"} {
+		input := "myreg.azurecr.io/app:v1\nmyreg.azurecr.io/" + bad
+		if specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io"); err == nil || specs != nil || !strings.Contains(err.Error(), "line 2") {
+			t.Errorf("input %q produced partial rules: %v, %v", bad, specs, err)
+		}
+	}
+}
+
+func FuzzParseAndCompile(f *testing.F) {
+	for _, seed := range []string{`[]`, `[null]`, `[{"repo":".+","tagged":[null]}]`, `[{"repo":".+","untagged":[{"keep":false}]}]`} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		if specs, err := ParseSpecs(strings.NewReader(input)); err == nil {
+			_, _ = Compile(specs)
+		}
+	})
 }
 
 func TestUsesPlatform(t *testing.T) {
@@ -330,34 +382,6 @@ func TestUsesPlatform(t *testing.T) {
 	}
 }
 
-func TestSplitImageRef(t *testing.T) {
-	const prefix = "myreg.azurecr.io/"
-	tests := []struct {
-		line, repository, tag, digest string
-		ok                            bool
-	}{
-		{"myreg.azurecr.io/app:v1", "app", "v1", "", true},
-		{"myreg.azurecr.io/team/app:1.2.3", "team/app", "1.2.3", "", true},
-		// A pinned digest must not be read as part of the tag; a reference
-		// carrying both yields both.
-		{"myreg.azurecr.io/app:v1@sha256:abc", "app", "v1", "sha256:abc", true},
-		{"myreg.azurecr.io/app@sha256:abc", "app", "", "sha256:abc", true},
-		{"myreg.azurecr.io/app", "", "", "", false},
-		{"myreg.azurecr.io/app:", "", "", "", false},
-		{"myreg.azurecr.io/app@", "", "", "", false},
-		{"myreg.azurecr.io/:v1", "", "", "", false},
-		{"otherreg.azurecr.io/app:v1", "", "", "", false},
-		{"", "", "", "", false},
-	}
-	for _, tt := range tests {
-		repository, tag, digest, ok := splitImageRef(tt.line, prefix)
-		if repository != tt.repository || tag != tt.tag || digest != tt.digest || ok != tt.ok {
-			t.Errorf("splitImageRef(%q) = %q, %q, %q, %v; want %q, %q, %q, %v",
-				tt.line, repository, tag, digest, ok, tt.repository, tt.tag, tt.digest, tt.ok)
-		}
-	}
-}
-
 // TestKeepRulesFromImageListDigestPinned covers pods that run digest-pinned
 // images: the pin must be kept whether or not the manifest is tagged in the
 // registry, so digest keep rules go in both the tagged and untagged lists.
@@ -365,10 +389,10 @@ func TestSplitImageRef(t *testing.T) {
 // deleted running images.
 func TestKeepRulesFromImageListDigestPinned(t *testing.T) {
 	input := strings.Join([]string{
-		"myreg.azurecr.io/app@sha256:pinned",
+		"myreg.azurecr.io/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"myreg.azurecr.io/app:v1",
-		"myreg.azurecr.io/app@sha256:pinned", // duplicate
-		"myreg.azurecr.io/app:v2@sha256:other",
+		"myreg.azurecr.io/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", // duplicate
+		"myreg.azurecr.io/app:v2@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	}, "\n")
 
 	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
@@ -397,7 +421,7 @@ func TestKeepRulesFromImageListDigestPinned(t *testing.T) {
 		}
 	}
 
-	wantDigests := `^sha256:pinned$,^sha256:other$`
+	wantDigests := `^sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$,^sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb$`
 	if strings.Join(taggedDigests, ",") != wantDigests {
 		t.Errorf("tagged digest keeps = %v, want %s (deduplicated, in order)", taggedDigests, wantDigests)
 	}

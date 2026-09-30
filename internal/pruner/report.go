@@ -3,12 +3,14 @@ package pruner
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"slices"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/dustin/go-humanize"
 )
@@ -37,8 +39,18 @@ func StatSortKeys() []string {
 // ReadStats parses statistics JSON as written by the statistics command.
 func ReadStats(r io.Reader) ([]RepositoryStats, error) {
 	var stats []RepositoryStats
-	if err := json.NewDecoder(r).Decode(&stats); err != nil {
+	dec := json.NewDecoder(r)
+	if err := dec.Decode(&stats); err != nil {
 		return nil, fmt.Errorf("failed to parse statistics JSON: %w", err)
+	}
+	if stats == nil {
+		return nil, errors.New("statistics must be a JSON array, not null")
+	}
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("unexpected trailing content after statistics JSON")
+		}
+		return nil, fmt.Errorf("after statistics JSON: %w", err)
 	}
 	return stats, nil
 }
@@ -73,11 +85,18 @@ func WriteStatsTable(w io.Writer, stats []RepositoryStats, top int) error {
 			s.Untagged,
 			s.Count,
 			s.Running,
-			s.Newest.Format("2006-01-02"),
-			s.Oldest.Format("2006-01-02"),
+			statDate(s.Newest),
+			statDate(s.Oldest),
 		); err != nil {
 			return err
 		}
 	}
 	return tw.Flush()
+}
+
+func statDate(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Format("2006-01-02")
 }

@@ -17,65 +17,54 @@ import (
 // is orphaned: a child shared with a healthy index is still reachable through
 // it and must survive.
 func markOrphans(manifests map[string]*registry.Manifest) {
-	owners := map[string][]*registry.Manifest{} // digest -> indexes referencing it
+	owners := map[string]int{}
+	brokenOwners := map[string]int{}
+	parents := map[string][]*registry.Manifest{}
+	var queue []*registry.Manifest
+	mark := func(m *registry.Manifest) {
+		if !m.Orphaned {
+			m.Orphaned = true
+			queue = append(queue, m)
+		}
+	}
+	for _, m := range manifests {
+		m.Orphaned, m.HasOwner = false, false
+	}
 	for _, m := range manifests {
 		for _, child := range m.Manifests {
 			digest := string(child.Digest)
 			if dep, ok := manifests[digest]; ok {
 				dep.HasOwner = true
-				owners[digest] = append(owners[digest], m)
+				owners[digest]++
+				parents[digest] = append(parents[digest], m)
+			} else {
+				mark(m)
+			}
+		}
+		if m.Subject != nil {
+			digest := string(m.Subject.Digest)
+			if manifests[digest] != nil {
+				parents[digest] = append(parents[digest], m)
+			} else {
+				mark(m)
 			}
 		}
 	}
-
-	// Both rules only ever turn the flag on, so this reaches a fixpoint.
-	for changed := true; changed; {
-		changed = false
-		for digest, m := range manifests {
-			if m.Orphaned {
-				continue
+	// Each manifest is queued once and each edge visited a bounded number of
+	// times, including deeply nested indexes and subject chains.
+	for i := 0; i < len(queue); i++ {
+		m := queue[i]
+		for _, parent := range parents[m.Digest] {
+			mark(parent)
+		}
+		for _, child := range m.Manifests {
+			digest := string(child.Digest)
+			brokenOwners[digest]++
+			if dep := manifests[digest]; dep != nil && len(dep.Tags) == 0 && brokenOwners[digest] == owners[digest] {
+				mark(dep)
 			}
-			if hasBrokenChild(m, manifests) || onlyOrphanedOwners(owners[digest]) {
-				m.Orphaned = true
-				changed = true
-			}
 		}
 	}
-}
-
-// hasBrokenChild reports whether the manifest references one that is missing
-// from the repository or already known to be orphaned. A referrer's subject
-// counts as a reference: a signature whose subject is gone is as broken as an
-// index with a missing child.
-func hasBrokenChild(m *registry.Manifest, manifests map[string]*registry.Manifest) bool {
-	for _, child := range m.Manifests {
-		dep, ok := manifests[string(child.Digest)]
-		if !ok || dep.Orphaned {
-			return true
-		}
-	}
-	if m.Subject != nil {
-		dep, ok := manifests[string(m.Subject.Digest)]
-		if !ok || dep.Orphaned {
-			return true
-		}
-	}
-	return false
-}
-
-// onlyOrphanedOwners reports whether a manifest is reachable solely through
-// orphaned indexes. An unreferenced manifest is a root in its own right and is
-// never orphaned by this rule.
-func onlyOrphanedOwners(owners []*registry.Manifest) bool {
-	if len(owners) == 0 {
-		return false
-	}
-	for _, owner := range owners {
-		if !owner.Orphaned {
-			return false
-		}
-	}
-	return true
 }
 
 // reportOrphans fails on orphaned manifests unless the rule either ignores

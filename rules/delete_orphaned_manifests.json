@@ -1,6 +1,6 @@
 [
   {
-    "description": "Deletes orphaned manifests from all repositories. A manifest is orphaned if it or its dependencies cannot be downloaded",
+    "description": "Deletes orphaned manifests from all repositories. An inspected manifest is orphaned when a referenced manifest is absent; incomplete repository downloads are skipped",
     "repo": ".+",
     "ignore_missing_manifests": true,
     "delete_orphaned_manifests": true

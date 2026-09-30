@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/JohanLindvall/acrprune/internal/imageref"
 )
 
 // Kind identifies the registry service an Address points at.
@@ -32,7 +34,7 @@ const GHCRHost = "ghcr.io"
 
 // hostPattern matches a DNS host name, loosely: it keeps a registry name from
 // being something like ".." that would escape the cache directory.
-var hostPattern = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$`)
+var hostPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
 // Address locates the repositories a run operates on.
 type Address struct {
@@ -50,16 +52,17 @@ type Address struct {
 func ParseAddress(s string) (Address, error) {
 	s = strings.TrimRight(s, "/")
 	host, owner, hasPath := strings.Cut(s, "/")
+	host = strings.ToLower(host)
 	if strings.EqualFold(host, GHCRHost) {
 		// Image references spell the owner in lowercase, whatever the case
 		// of the GitHub account name.
 		owner = strings.ToLower(owner)
-		if owner == "" || strings.Contains(owner, "/") {
+		if !imageref.ValidOwner(owner) {
 			return Address{}, fmt.Errorf("invalid registry %q: expected ghcr.io/<owner>, naming the user or organization that owns the packages", s)
 		}
 		return Address{Kind: GHCR, Host: GHCRHost, Owner: owner}, nil
 	}
-	if hasPath || !hostPattern.MatchString(host) {
+	if hasPath || len(host) > 253 || !hostPattern.MatchString(host) {
 		return Address{}, fmt.Errorf("unsupported registry %q: expected an ACR registry name (myreg), an ACR login server (myreg.azurecr.io) or ghcr.io/<owner>", s)
 	}
 	if !strings.Contains(host, ".") {

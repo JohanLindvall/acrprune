@@ -65,6 +65,16 @@ func TestMarkOrphansKeepsSharedChildren(t *testing.T) {
 	}
 }
 
+func TestMarkOrphansKeepsIndependentlyTaggedChildren(t *testing.T) {
+	index := testManifest("index", time.Now(), "broken")
+	index.Manifests = []v1.Descriptor{{Digest: "child"}, {Digest: "missing"}}
+	child := testManifest("child", time.Now(), "standalone")
+	markOrphans(byDigest(index, child))
+	if !index.Orphaned || child.Orphaned {
+		t.Fatalf("orphaned index=%v, child=%v: a tag keeps the child independently reachable", index.Orphaned, child.Orphaned)
+	}
+}
+
 // TestMarkOrphansFlagsDanglingSubject: a referrer whose subject is missing or
 // orphaned is as broken as an index with a missing child.
 func TestMarkOrphansFlagsDanglingSubject(t *testing.T) {

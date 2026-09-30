@@ -5,6 +5,7 @@ package rules
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -48,8 +49,14 @@ func ParseSpecs(r io.Reader) ([]*RepoRuleSpec, error) {
 	if err := dec.Decode(&specs); err != nil {
 		return nil, err
 	}
-	if dec.More() {
-		return nil, errors.New("unexpected trailing content after the rule array")
+	if specs == nil {
+		return nil, errors.New("rules must be a JSON array, not null")
+	}
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("unexpected trailing content after the rule array")
+		}
+		return nil, fmt.Errorf("after the rule array: %w", err)
 	}
 	return specs, nil
 }

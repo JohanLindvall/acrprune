@@ -14,7 +14,7 @@ PLATFORMS := linux/amd64 linux/arm64
 GOLANGCI_LINT_VERSION := v2.12.2
 GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 
-.PHONY: all build test vet lint clean dist-all
+.PHONY: all build test test-race test-scripts coverage vet lint clean dist-all
 
 all: build
 
@@ -23,6 +23,18 @@ build:
 
 test:
 	go test ./...
+	$(MAKE) test-scripts
+
+test-race:
+	go test -race ./...
+	$(MAKE) test-scripts
+
+test-scripts:
+	sh scripts/get_pod_images_test.sh
+
+coverage:
+	go test -race -coverpkg=./... -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
 
 vet:
 	go vet ./...
@@ -39,7 +51,7 @@ $(GOLANGCI_LINT):
 dist-all:
 	@rm -rf $(DISTDIR)
 	@mkdir -p $(DISTDIR)
-	@for p in $(PLATFORMS); do \
+	@set -eu; for p in $(PLATFORMS); do \
 	  os=$${p%/*}; arch=$${p#*/}; \
 	  echo "building $$os/$$arch"; \
 	  GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \

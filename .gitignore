@@ -2,3 +2,5 @@
 /acrprune
 /images
 /stats.json
+/dist/
+/coverage.out

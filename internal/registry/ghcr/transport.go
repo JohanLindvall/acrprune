@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -30,10 +31,37 @@ const maxErrorBody = 64 << 10
 func (b *Backend) send(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	req.Header.Set("User-Agent", userAgent)
+	// Copy the client so a caller's redirect policy is preserved without
+	// mutating a shared client. Go otherwise forwards credentials to
+	// subdomains and across scheme/port changes on the same hostname.
+	client := *b.client
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if next.URL.User != nil || (next.URL.Scheme != "https" && next.URL.Scheme != "http") ||
+			(via[0].URL.Scheme == "https" && next.URL.Scheme != "https") {
+			return errors.New("refusing an unsafe redirect")
+		}
+		if b.client.CheckRedirect != nil {
+			if err := b.client.CheckRedirect(next, via); err != nil {
+				return err
+			}
+		}
+		if !sameOrigin(next.URL, via[0].URL) {
+			if via[0].Method != http.MethodGet && via[0].Method != http.MethodHead {
+				return errors.New("refusing to redirect a mutation to another origin")
+			}
+			next.Header.Del("Authorization")
+			next.Header.Del("Proxy-Authorization")
+			next.Header.Del("Cookie")
+		}
+		return nil
+	}
 	failures := 0
 	var throttled time.Duration
 	for {
-		resp, err := b.client.Do(req.Clone(ctx))
+		resp, err := client.Do(req.Clone(ctx))
 		var delay time.Duration
 		var reason string
 		switch {
@@ -49,7 +77,7 @@ func (b *Backend) send(req *http.Request) (*http.Response, error) {
 		case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests:
 			// retryable only passes a 403 or 429 when it is rate limiting.
 			delay = rateLimitDelay(resp, time.Now())
-			if throttled+delay > b.maxThrottle {
+			if delay > b.maxThrottle-throttled {
 				return resp, nil
 			}
 			throttled += delay
@@ -104,7 +132,10 @@ func rateLimited(resp *http.Response, message string) bool {
 // rateLimitDelay returns how long a rate-limited response asks to wait.
 func rateLimitDelay(resp *http.Response, now time.Time) time.Duration {
 	if s := resp.Header.Get("Retry-After"); s != "" {
-		if seconds, err := strconv.Atoi(s); err == nil {
+		if seconds, err := strconv.ParseInt(s, 10, 64); err == nil {
+			if seconds > math.MaxInt64/int64(time.Second) {
+				return time.Duration(math.MaxInt64)
+			}
 			return time.Duration(max(seconds, 1)) * time.Second
 		}
 		if t, err := http.ParseTime(s); err == nil {
@@ -114,7 +145,7 @@ func rateLimitDelay(resp *http.Response, now time.Time) time.Duration {
 	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
 		if reset, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
 			// The primary limit resets hourly; a later reset is bogus.
-			return min(max(time.Unix(reset, 0).Sub(now)+time.Second, time.Second), time.Hour)
+			return min(max(time.Unix(reset, 0).Sub(now), 0), time.Hour-time.Second) + time.Second
 		}
 	}
 	return time.Minute
@@ -123,7 +154,7 @@ func rateLimitDelay(resp *http.Response, now time.Time) time.Duration {
 // backoff returns an exponentially growing delay for retrying after the
 // given number of transient failures.
 func backoff(failures int) time.Duration {
-	return min(time.Second<<(failures-1), 30*time.Second)
+	return min(time.Second<<min(max(failures-1, 0), 5), 30*time.Second)
 }
 
 // sleep waits for d or until ctx is done.
@@ -202,7 +233,21 @@ func redact(u *url.URL) string {
 	clean := *u
 	clean.User = nil
 	clean.RawQuery = ""
+	clean.ForceQuery = false
+	clean.Fragment, clean.RawFragment = "", ""
 	return clean.String()
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return a.Scheme == b.Scheme && strings.EqualFold(a.Host, b.Host)
+}
+
+func redactURL(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "(unparsable URL)"
+	}
+	return redact(u)
 }
 
 // redactError redacts the URL a failed request names. After a redirect it is
@@ -213,10 +258,6 @@ func redactError(err error) error {
 		return err
 	}
 	clean := *urlErr
-	if u, parseErr := url.Parse(urlErr.URL); parseErr == nil {
-		clean.URL = redact(u)
-	} else {
-		clean.URL = "(unparsable URL)"
-	}
+	clean.URL = redactURL(urlErr.URL)
 	return &clean
 }

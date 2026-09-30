@@ -384,7 +384,7 @@ func TestKeepLastTagCountsMissingManifests(t *testing.T) {
 // TestPruneLeavesRepositoryWithMissingManifests: a manifest the registry
 // lists but cannot serve was never judged by the rules, so the repository is
 // not deleted outright even when the rules keep nothing else — deleting it
-// would take that manifest along. The rest is deleted manifest by manifest.
+// would take that manifest along. Its unknown dependencies must survive too.
 func TestPruneLeavesRepositoryWithMissingManifests(t *testing.T) {
 	for _, protect := range []bool{false, true} {
 		fake := registrytest.New()
@@ -402,11 +402,11 @@ func TestPruneLeavesRepositoryWithMissingManifests(t *testing.T) {
 		if got := fake.DeletedRepositories(); len(got) != 0 {
 			t.Errorf("protect=%v: deleted repositories %v; the missing manifest would have gone with them", protect, got)
 		}
-		if got := fake.Deleted(); !slices.Equal(got, refs("app", a, b)) {
-			t.Errorf("protect=%v: deleted = %v, want both untagged images", protect, got)
+		if got := fake.Deleted(); len(got) != 0 {
+			t.Errorf("protect=%v: deleted possible dependencies: %v", protect, got)
 		}
-		if got := fake.Digests("app"); !slices.Equal(got, []string{missing}) {
-			t.Errorf("protect=%v: remaining = %v, want the missing manifest left alone", protect, got)
+		if got := fake.Digests("app"); !slices.Equal(got, slices.Sorted(slices.Values([]string{missing, a, b}))) {
+			t.Errorf("protect=%v: remaining = %v, want the whole repository left alone", protect, got)
 		}
 	}
 }

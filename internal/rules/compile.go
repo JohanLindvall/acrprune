@@ -72,6 +72,9 @@ func Compile(specs []*RepoRuleSpec) ([]*RepoRule, error) {
 
 // Compile validates the spec's regexes and applies defaults.
 func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
+	if s == nil {
+		return nil, errors.New("repository rule must not be null")
+	}
 	// An empty pattern is a valid regex that matches every repository, which
 	// is never what someone means to write in a file that deletes things.
 	if s.RepoRegex == "" {
@@ -95,6 +98,9 @@ func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
 		result.MustDeleteEverything = *s.MustDeleteEverything
 	}
 	for i, u := range s.Untagged {
+		if u == nil {
+			return nil, fmt.Errorf("untagged rule %d must not be null", i)
+		}
 		common, err := u.compile()
 		if err != nil {
 			return nil, fmt.Errorf("untagged rule %d: %w", i, err)
@@ -102,6 +108,9 @@ func (s *RepoRuleSpec) Compile() (*RepoRule, error) {
 		result.Untagged = append(result.Untagged, UntaggedRule{CommonRule: common})
 	}
 	for i, t := range s.Tagged {
+		if t == nil {
+			return nil, fmt.Errorf("tagged rule %d must not be null", i)
+		}
 		common, err := t.compile()
 		if err != nil {
 			return nil, fmt.Errorf("tagged rule %d: %w", i, err)
@@ -133,9 +142,15 @@ func (s *CommonRuleSpec) compile() (CommonRule, error) {
 		rule.MatchNewest = *s.MatchNewest
 	}
 	if s.MatchNewerThan != nil {
+		if s.MatchNewerThan.Duration < 0 {
+			return rule, errors.New("match_newer must not be negative")
+		}
 		rule.MatchNewerThan = s.MatchNewerThan.Duration
 	}
 	if s.MatchOlderThan != nil {
+		if s.MatchOlderThan.Duration < 0 {
+			return rule, errors.New("match_older must not be negative")
+		}
 		rule.MatchOlderThan = s.MatchOlderThan.Duration
 	}
 	if s.Keep != nil {

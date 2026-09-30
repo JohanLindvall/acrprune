@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JohanLindvall/acrprune/internal/progress"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
@@ -36,16 +37,28 @@ type RepositoryStats struct {
 // when any were, the collected stats are returned together with a non-nil
 // error naming them, so partial results remain usable.
 func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRules []*rules.RepoRule, onUpdate func([]RepositoryStats) error) ([]RepositoryStats, error) {
+	progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Listing repositories"})
 	repositories, err := reg.ListRepositories(ctx)
 	if err != nil {
 		return nil, err
 	}
+	progress.Report(ctx, progress.Event{Kind: progress.Candidates, Total: len(repositories)})
 
 	logger := reg.Logger()
 	stats := []RepositoryStats{}
 	seen := map[string]struct{}{}
 	var denied []string
+	partial := func(err error) ([]RepositoryStats, error) {
+		if len(stats) == 0 {
+			return nil, err
+		}
+		return stats, err
+	}
 	for i, repository := range repositories {
+		if err := ctx.Err(); err != nil {
+			return partial(err)
+		}
+		progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: repository})
 		contents, found, err := reg.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{IgnoreMissing: true})
 		if err != nil {
 			// Same tolerance as pruning: on an ABAC registry the catalog can
@@ -53,29 +66,34 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 			// partial statistics useful, and report at the end.
 			if registry.IsPermissionError(err) {
 				denied = append(denied, repository)
+				progress.Report(ctx, progress.Event{Kind: progress.Finished, Name: "denied"})
 				logger.Warn("Insufficient permission to scan repository; skipping",
 					"repository", repository, "scanned", len(stats), "denied", len(denied),
 					"remaining", len(repositories)-i-1, "err", err)
 				continue
 			}
-			return nil, err
+			return partial(fmt.Errorf("failed to scan repository %s: %w", repository, err))
 		}
 		if !found {
+			progress.Report(ctx, progress.Event{Kind: progress.Finished, Name: "skipped"})
 			continue
 		}
 		repoStats := calculateStatsSeen(repository, slices.Collect(maps.Values(contents.Manifests)), seen)
 		repoStats.Running = countRunning(contents.Manifests, repository, runningRules)
 		stats = append(stats, repoStats)
+		progress.Report(ctx, progress.Event{Kind: progress.Plan, Kept: repoStats.Count, Bytes: repoStats.Unique})
 		if onUpdate != nil {
+			progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Writing statistics snapshot"})
 			if err := onUpdate(stats); err != nil {
 				return nil, err
 			}
 		}
+		progress.Report(ctx, progress.Event{Kind: progress.Finished})
 	}
 
 	if len(denied) > 0 {
-		return stats, fmt.Errorf("insufficient permission to scan %d of %d repositories: %s",
-			len(denied), len(repositories), strings.Join(denied, ", "))
+		return partial(fmt.Errorf("insufficient permission to scan %d of %d repositories: %s",
+			len(denied), len(repositories), strings.Join(denied, ", ")))
 	}
 	return stats, nil
 }

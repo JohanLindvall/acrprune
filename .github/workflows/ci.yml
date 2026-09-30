@@ -14,11 +14,14 @@ concurrency:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.26.x', '1.27.x']
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          go-version: ${{ matrix.go-version }}
           cache: true
       - run: make vet
       - name: Lint
@@ -26,7 +29,12 @@ jobs:
         with:
           version: v2.12.2
       - run: make build
-      - run: make test
+      - run: make test-scripts
+      - run: make coverage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-go-${{ matrix.go-version }}
+          path: coverage.out
 
   release:
     needs: build-test
@@ -59,14 +67,14 @@ jobs:
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "Next version: $next"
 
+      - name: Build release artifacts
+        run: make dist-all VERSION="${{ steps.version.outputs.version }}"
+
       - name: Create and push tag
         run: |
           set -euo pipefail
           git tag "${{ steps.version.outputs.version }}"
           git push origin "${{ steps.version.outputs.version }}"
-
-      - name: Build release artifacts
-        run: make dist-all VERSION="${{ steps.version.outputs.version }}"
 
       - name: Create GitHub release
         env:

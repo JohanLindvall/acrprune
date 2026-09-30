@@ -2,6 +2,7 @@ package pruner
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -50,12 +51,30 @@ func TestMatchNewest(t *testing.T) {
 		{"newest larger than the set deletes everything", 5, ""},
 		{"delete all but the newest", -1, "a"},
 		{"excluding more than the set deletes nothing", -5, "a,b,c"},
+		{"minimum int excludes everything", math.MinInt, "a,b,c"},
 		{"zero imposes no constraint", 0, ""},
 	}
 	for _, tt := range tests {
 		got := keepsWithNewest(t, all, tt.newest, now)
 		if fmt.Sprint(got) != fmt.Sprint(splitList(tt.wantKeptIs)) {
 			t.Errorf("%s: kept %v, want %v", tt.name, got, splitList(tt.wantKeptIs))
+		}
+	}
+}
+
+func TestPlatformCriteriaMatchOnePlatform(t *testing.T) {
+	m := testManifest("index", time.Now(), "v1")
+	m.Manifests = []v1.Descriptor{
+		{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}},
+		{Platform: &v1.Platform{OS: "windows", Architecture: "amd64"}},
+	}
+	for _, arch := range []string{"amd64", "arm64"} {
+		rule := compileRule(t, &rules.RepoRuleSpec{RepoRegex: ".+", Tagged: []*rules.TaggedRuleSpec{{
+			CommonRuleSpec: rules.CommonRuleSpec{OSRegex: to.Ptr("^linux$"), ArchitectureRegex: to.Ptr("^" + arch + "$"), Keep: to.Ptr(false)},
+		}}})
+		got := newEvaluator(rule, []*registry.Manifest{m}, time.Now()).keep(m)
+		if want := arch == "amd64"; got != want {
+			t.Errorf("linux/%s rule keeps index = %v, want %v", arch, got, want)
 		}
 	}
 }
