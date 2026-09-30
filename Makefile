@@ -11,7 +11,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64
 
 # Pinned golangci-lint; bootstrapped into GOPATH/bin if not already present.
-GOLANGCI_LINT_VERSION := v2.12.2
+GOLANGCI_LINT_VERSION := v2.14.0
 GOLANGCI_LINT         := $(shell go env GOPATH)/bin/golangci-lint
 
 .PHONY: all build test test-race test-scripts coverage vet lint clean dist-all
