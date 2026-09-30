@@ -37,7 +37,7 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 			// ranking slots meant for images.
 			continue
 		}
-		if len(m.Tags()) > 0 {
+		if len(m.Tags) > 0 {
 			tagged = append(tagged, m)
 		} else {
 			untagged = append(untagged, m)
@@ -49,7 +49,7 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 	e.tagged = make([]map[*registry.Manifest]int, len(rule.Tagged))
 	for i, r := range rule.Tagged {
 		e.tagged[i] = e.rank(tagged, func(m *registry.Manifest) bool {
-			return matchAny(r.Tag, m.Tags()) && e.matchesCriteria(r.CommonRule, m)
+			return matchAny(r.Tag, m.Tags) && e.matchesCriteria(r.CommonRule, m)
 		})
 	}
 	e.untagged = make([]map[*registry.Manifest]int, len(rule.Untagged))
@@ -64,7 +64,7 @@ func newEvaluator(rule *rules.RepoRule, manifests []*registry.Manifest, now time
 // keep reports whether the first rule matching the manifest keeps it. A
 // manifest no rule matches is kept.
 func (e *evaluator) keep(m *registry.Manifest) bool {
-	if len(m.Tags()) == 0 {
+	if len(m.Tags) == 0 {
 		for i, r := range e.rule.Untagged {
 			if e.matches(e.untagged[i], r.CommonRule, m) {
 				return r.Keep
@@ -122,10 +122,10 @@ func (e *evaluator) matchesCriteria(rule rules.CommonRule, m *registry.Manifest)
 	if !matchAny(rule.Digest, []string{m.Digest}) {
 		return false
 	}
-	if rule.MatchNewerThan != 0 && !m.LastUpdated().Add(rule.MatchNewerThan).After(e.now) {
+	if rule.MatchNewerThan != 0 && !m.LastUpdated.Add(rule.MatchNewerThan).After(e.now) {
 		return false
 	}
-	if rule.MatchOlderThan != 0 && !m.LastUpdated().Add(rule.MatchOlderThan).Before(e.now) {
+	if rule.MatchOlderThan != 0 && !m.LastUpdated.Add(rule.MatchOlderThan).Before(e.now) {
 		return false
 	}
 	return true
@@ -143,7 +143,7 @@ func matchAny(re *regexp.Regexp, values []string) bool {
 // byNewest orders manifests newest first, breaking ties on the reference so
 // that repeated runs over an unchanged repository decide identically.
 func byNewest(a, b *registry.Manifest) int {
-	if c := b.LastUpdated().Compare(a.LastUpdated()); c != 0 {
+	if c := b.LastUpdated.Compare(a.LastUpdated); c != 0 {
 		return c
 	}
 	return strings.Compare(a.Ref(), b.Ref())

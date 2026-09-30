@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
@@ -141,7 +140,7 @@ func TestCommonRuleMatches(t *testing.T) {
 	}
 
 	arm := testManifest("arm", now)
-	arm.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureArm64)
+	arm.Architecture = "arm64"
 	if !matches(rules.CommonRuleSpec{ArchitectureRegex: to.Ptr("arm64")}, arm) {
 		t.Error("arm64 manifest should match arch regex arm64")
 	}
@@ -150,7 +149,7 @@ func TestCommonRuleMatches(t *testing.T) {
 	}
 
 	windows := testManifest("win", now)
-	windows.Azure.OperatingSystem = to.Ptr(azcontainerregistry.ArtifactOperatingSystemWindows)
+	windows.OS = "windows"
 	if !matches(rules.CommonRuleSpec{OSRegex: to.Ptr("windows")}, windows) {
 		t.Error("windows manifest should match os regex windows")
 	}

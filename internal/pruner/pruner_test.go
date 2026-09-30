@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
@@ -18,19 +17,12 @@ import (
 )
 
 // testManifest builds a manifest in repository "r" with the given digest,
-// last-updated time and tags.
+// last-updated time (the zero time for none) and tags.
 func testManifest(digest string, updated time.Time, tags ...string) *registry.Manifest {
-	m := &registry.Manifest{
+	return &registry.Manifest{
 		Repository: "r",
-		Digest:     digest,
-		Azure: &azcontainerregistry.ManifestAttributes{
-			LastUpdatedOn: &updated,
-		},
+		Attributes: registry.Attributes{Digest: digest, LastUpdated: updated, Tags: tags},
 	}
-	for _, tag := range tags {
-		m.Azure.Tags = append(m.Azure.Tags, to.Ptr(tag))
-	}
-	return m
 }
 
 // byDigest keys manifests the way a repository fetch does.
@@ -157,7 +149,7 @@ func TestShouldKeepWithoutTimestamp(t *testing.T) {
 		},
 	})
 
-	undated := &registry.Manifest{Repository: "r", Digest: "undated"}
+	undated := testManifest("undated", time.Time{})
 	dated := testManifest("dated", now.Add(-48*time.Hour))
 	all := []*registry.Manifest{undated, dated}
 	e := newEvaluator(rule, all, now)
@@ -249,9 +241,9 @@ func TestDecideMustDeleteEverything(t *testing.T) {
 	p := testPruner()
 	now := time.Now()
 	keep := testManifest("keep", now, "arm64-app")
-	keep.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureArm64)
+	keep.Architecture = "arm64"
 	deletable := testManifest("del", now.Add(-time.Hour), "amd64-app")
-	deletable.Azure.Architecture = to.Ptr(azcontainerregistry.ArtifactArchitectureAmd64)
+	deletable.Architecture = "amd64"
 
 	rule := compileRule(t, &rules.RepoRuleSpec{
 		RepoRegex:            ".+",

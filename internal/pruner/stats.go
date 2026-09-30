@@ -38,9 +38,6 @@ type RepositoryStats struct {
 func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRules []*rules.RepoRule, onUpdate func([]RepositoryStats) error) ([]RepositoryStats, error) {
 	repositories, err := reg.ListRepositories(ctx)
 	if err != nil {
-		if registry.IsPermissionError(err) {
-			return nil, fmt.Errorf("%w (listing the catalog requires the Container Registry Repository Catalog Lister role)", err)
-		}
 		return nil, err
 	}
 
@@ -49,7 +46,7 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 	seen := map[string]struct{}{}
 	var denied []string
 	for i, repository := range repositories {
-		manifests, found, err := reg.FetchRepositoryManifests(ctx, repository, true)
+		contents, found, err := reg.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{IgnoreMissing: true})
 		if err != nil {
 			// Same tolerance as pruning: on an ABAC registry the catalog can
 			// list repositories the caller cannot read. Skip them, keep the
@@ -66,8 +63,8 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 		if !found {
 			continue
 		}
-		repoStats := calculateStatsSeen(repository, slices.Collect(maps.Values(manifests)), seen)
-		repoStats.Running = countRunning(manifests, repository, runningRules)
+		repoStats := calculateStatsSeen(repository, slices.Collect(maps.Values(contents.Manifests)), seen)
+		repoStats.Running = countRunning(contents.Manifests, repository, runningRules)
 		stats = append(stats, repoStats)
 		if onUpdate != nil {
 			if err := onUpdate(stats); err != nil {
@@ -98,7 +95,7 @@ func countRunning(manifests map[string]*registry.Manifest, repository string, ru
 
 // runningMatch reports whether the manifest's first matching rule keeps it.
 func runningMatch(m *registry.Manifest, repository string, ruleSet []*rules.RepoRule) bool {
-	tags := m.Tags()
+	tags := m.Tags
 	digest := []string{m.Digest}
 	for _, rule := range ruleSet {
 		if !rule.Repo.MatchString(repository) {
@@ -151,12 +148,12 @@ func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen 
 	}
 
 	for _, m := range manifests {
-		if len(m.Tags()) > 0 {
+		if len(m.Tags) > 0 {
 			tagged++
 		} else {
 			untagged++
 		}
-		if updated := m.LastUpdated(); m.HasTimestamp() {
+		if updated := m.LastUpdated; m.HasTimestamp() {
 			if newest.IsZero() || updated.After(newest) {
 				newest = updated
 			}

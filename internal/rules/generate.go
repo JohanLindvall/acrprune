@@ -2,14 +2,13 @@ package rules
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
-
-	"github.com/JohanLindvall/acrprune/internal/registry"
 )
 
 // repoKeeps accumulates what one repository's rule must keep.
@@ -21,17 +20,22 @@ type repoKeeps struct {
 // KeepRulesFromImageList reads image references (one per line, e.g. from a pod
 // image dump) and produces rules that keep exactly those images, deleting
 // everything else in the referenced repositories. Both tag references
-// (`registry.azurecr.io/repo:tag`) and digest-pinned references
-// (`registry.azurecr.io/repo@sha256:…`, with or without a tag) are kept; lines
-// not naming an image in the given registry are ignored.
+// (`myreg.azurecr.io/repo:tag`) and digest-pinned references
+// (`myreg.azurecr.io/repo@sha256:…`, with or without a tag) are kept; lines
+// not naming an image below location are ignored. location is what the
+// registry's image references start with: a login server such as
+// myreg.azurecr.io, or ghcr.io/<owner> on GHCR.
 //
 // A repository yields exactly one rule however often it appears in the input.
 // Pruning applies only the first rule matching a repository, so a second rule
 // for the same repository would be unreachable and its images would instead be
 // deleted by the first rule's catch-all — that is, an unsorted image list would
 // delete running images.
-func KeepRulesFromImageList(r io.Reader, registryName string) ([]*RepoRuleSpec, error) {
-	prefix := registry.LoginServer(registryName) + "/"
+func KeepRulesFromImageList(r io.Reader, location string) ([]*RepoRuleSpec, error) {
+	if location == "" {
+		return nil, errors.New("no registry location to match image references against")
+	}
+	prefix := strings.TrimSuffix(location, "/") + "/"
 
 	var order []string // repositories in first-seen order
 	keeps := map[string]*repoKeeps{}
@@ -97,9 +101,9 @@ func KeepRulesFromImageList(r io.Reader, registryName string) ([]*RepoRuleSpec, 
 
 // splitImageRef extracts the repository, tag and pinned digest from an image
 // reference such as `myreg.azurecr.io/team/app:1.2.3` or
-// `myreg.azurecr.io/app@sha256:…`, given the registry prefix to strip. ok is
-// false when the line is not an image in this registry or names neither a tag
-// nor a digest.
+// `ghcr.io/owner/app@sha256:…`, given the prefix to strip. ok is false when
+// the line is not an image below the prefix or names neither a tag nor a
+// digest.
 func splitImageRef(line, prefix string) (repository, tag, digest string, ok bool) {
 	name, ok := strings.CutPrefix(line, prefix)
 	if !ok {

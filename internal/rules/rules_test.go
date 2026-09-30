@@ -193,7 +193,7 @@ func TestKeepRulesFromImageList(t *testing.T) {
 		"myreg.azurecr.io/no-tag",
 	}, "\n")
 
-	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestKeepRulesFromImageListGroupsRepositories(t *testing.T) {
 		"myreg.azurecr.io/app:v1", // duplicate, e.g. the same image on two pods
 	}, "\n")
 
-	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,13 +259,74 @@ func TestKeepRulesFromImageListGroupsRepositories(t *testing.T) {
 	}
 }
 
-func TestKeepRulesFromImageListFullLoginServer(t *testing.T) {
-	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.cn/app:v1\n"), "myreg.azurecr.cn")
+func TestKeepRulesFromImageListSovereignCloud(t *testing.T) {
+	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.cn/app:v1\nmyreg.azurecr.io/app:v2\n"), "myreg.azurecr.cn")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(specs) != 1 || specs[0].RepoRegex != "^app$" {
-		t.Errorf("full login server input not handled: %+v", specs)
+	if len(specs) != 1 || specs[0].RepoRegex != "^app$" || len(specs[0].Tagged) != 2 {
+		t.Errorf("sovereign cloud login server not handled: %+v", specs)
+	}
+}
+
+// TestKeepRulesFromImageListGHCR: on GHCR the owner is part of the location,
+// and repositories are the package names below it.
+func TestKeepRulesFromImageListGHCR(t *testing.T) {
+	input := strings.Join([]string{
+		"ghcr.io/acme/app:v1",
+		"ghcr.io/acme/team/api@sha256:pinned",
+		"ghcr.io/acmecorp/app:v9", // another owner sharing the prefix
+		"ghcr.io/other/app:v9",
+		"myreg.azurecr.io/app:v9",
+	}, "\n")
+	for _, location := range []string{"ghcr.io/acme", "ghcr.io/acme/"} {
+		specs, err := KeepRulesFromImageList(strings.NewReader(input), location)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(specs) != 2 || specs[0].RepoRegex != "^app$" || specs[1].RepoRegex != "^team/api$" {
+			t.Fatalf("location %q: rules = %+v, want app and team/api", location, specs)
+		}
+		if len(specs[0].Tagged) != 2 || *specs[0].Tagged[0].TagRegex != "^v1$" {
+			t.Errorf("app keeps = %+v", specs[0].Tagged)
+		}
+		if *specs[1].Untagged[0].DigestRegex != "^sha256:pinned$" {
+			t.Errorf("team/api keeps = %+v", specs[1].Untagged)
+		}
+	}
+}
+
+func TestKeepRulesFromImageListNeedsLocation(t *testing.T) {
+	if _, err := KeepRulesFromImageList(strings.NewReader("/app:v1\n"), ""); err == nil {
+		t.Error("an empty location should be refused rather than match every reference")
+	}
+}
+
+func TestUsesPlatform(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *RepoRuleSpec
+		want bool
+	}{
+		{"no rules", &RepoRuleSpec{RepoRegex: ".+"}, false},
+		{"tag and age only", &RepoRuleSpec{RepoRegex: ".+",
+			Tagged:   []*TaggedRuleSpec{{TagRegex: to.Ptr("^v"), CommonRuleSpec: CommonRuleSpec{MatchOlderThan: &Duration{Duration: time.Hour}}}},
+			Untagged: []*UntaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{DigestRegex: to.Ptr("^sha256:")}}}}, false},
+		{"empty arch matches everything", &RepoRuleSpec{RepoRegex: ".+",
+			Tagged: []*TaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{ArchitectureRegex: to.Ptr("")}}}}, false},
+		{"tagged arch", &RepoRuleSpec{RepoRegex: ".+",
+			Tagged: []*TaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{ArchitectureRegex: to.Ptr("arm64")}}}}, true},
+		{"untagged os", &RepoRuleSpec{RepoRegex: ".+",
+			Untagged: []*UntaggedRuleSpec{{CommonRuleSpec: CommonRuleSpec{OSRegex: to.Ptr("windows")}}}}, true},
+	}
+	for _, tt := range tests {
+		rule, err := tt.spec.Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := rule.UsesPlatform(); got != tt.want {
+			t.Errorf("%s: UsesPlatform = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 
@@ -310,7 +371,7 @@ func TestKeepRulesFromImageListDigestPinned(t *testing.T) {
 		"myreg.azurecr.io/app:v2@sha256:other",
 	}, "\n")
 
-	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg")
+	specs, err := KeepRulesFromImageList(strings.NewReader(input), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +427,7 @@ func TestKeepRulesFromImageListDigestPinned(t *testing.T) {
 // TestKeepRulesCompile makes sure generated rules survive compilation, which
 // now rejects an empty repo pattern.
 func TestKeepRulesCompile(t *testing.T) {
-	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg")
+	specs, err := KeepRulesFromImageList(strings.NewReader("myreg.azurecr.io/app:v1\n"), "myreg.azurecr.io")
 	if err != nil {
 		t.Fatal(err)
 	}

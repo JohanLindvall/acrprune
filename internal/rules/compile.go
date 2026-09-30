@@ -40,6 +40,23 @@ type RepoRule struct {
 	Tagged                  []TaggedRule
 }
 
+// UsesPlatform reports whether any tagged or untagged rule matches on
+// architecture or operating system, which needs the platform of every image
+// known.
+func (r *RepoRule) UsesPlatform() bool {
+	for _, t := range r.Tagged {
+		if t.Architecture != nil || t.OS != nil {
+			return true
+		}
+	}
+	for _, u := range r.Untagged {
+		if u.Architecture != nil || u.OS != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // Compile validates and compiles a slice of rule specs.
 func Compile(specs []*RepoRuleSpec) ([]*RepoRule, error) {
 	result := make([]*RepoRule, len(specs))
