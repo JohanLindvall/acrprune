@@ -2,15 +2,35 @@ package ghcr
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestPermanentNetworkErrorsAreNotRetried(t *testing.T) {
+	for _, failure := range []error{&net.DNSError{Err: "no such host", IsNotFound: true}, x509.UnknownAuthorityError{}, errors.New("invalid HTTP configuration")} {
+		_, b := newFakeGitHub(t, true)
+		sleeps := recordSleeps(b)
+		calls := 0
+		b.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, failure
+		})}
+		if _, err := b.ListRepositories(t.Context()); !errors.Is(err, failure) {
+			t.Errorf("error = %v, want %v", err, failure)
+		}
+		if calls != 1 || len(*sleeps) != 0 {
+			t.Errorf("permanent failure retried: %d requests, %v waits", calls, *sleeps)
+		}
+	}
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

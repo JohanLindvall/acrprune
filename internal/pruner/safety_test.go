@@ -3,6 +3,7 @@ package pruner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -10,10 +11,60 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"github.com/JohanLindvall/acrprune/internal/progress"
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/registry/registrytest"
 )
+
+func TestWrappedDeletionFailuresAreNotMisclassified(t *testing.T) {
+	denied := registrytest.Forbidden("app")
+	for _, err := range []error{
+		fmt.Errorf("deletions: %w", errors.Join(denied, errors.New("network failure"))),
+		fmt.Errorf("deletions: %w", errors.Join(denied, context.Canceled)),
+	} {
+		if isDenied(err) {
+			t.Errorf("mixed failures were classified as only permission errors: %v", err)
+		}
+	}
+	if !isDenied(fmt.Errorf("deletions: %w", errors.Join(denied, denied))) {
+		t.Error("wrapped permission failures were not recognized")
+	}
+}
+
+// OCI indexes may omit platform descriptors and may point to nested indexes.
+// Retention must still see the platforms of the images reachable through them.
+func TestPlatformRetentionThroughIndexes(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		fake := registrytest.New()
+		old := time.Now().Add(-48 * time.Hour)
+		image := registrytest.Image("image")
+		config := fake.PutConfig("amd64", "linux")
+		image.Config = &config
+		leaf := fake.Add("app", image, registry.Attributes{LastUpdated: old})
+		child := registrytest.Child(leaf, "", "")
+		child.Platform = nil
+		if nested {
+			inner := fake.Add("app", registrytest.Index(child), registry.Attributes{LastUpdated: old})
+			child = registrytest.Child(inner, "", "")
+			child.MediaType, child.Platform = v1.MediaTypeImageIndex, nil
+		}
+		fake.Add("app", registrytest.Index(child), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old})
+		want := fake.Digests("app")
+		stale := fake.Add("app", registrytest.Image("stale"), registry.Attributes{LastUpdated: old, Architecture: "arm64", OS: "linux"})
+		p := fakePruner(t, fake)
+		if err := p.Prune(t.Context(), ruleSet(t, `[{"repo":"^app$","tagged":[{"arch":"^amd64$","os":"^linux$","keep":true},{"keep":false}],"untagged":[{"keep":false}]}]`)); err != nil {
+			t.Fatal(err)
+		}
+		if got := fake.Digests("app"); !slices.Equal(got, want) {
+			t.Errorf("nested %v: remaining = %v, want the amd64 index and its dependencies %v", nested, got, want)
+		}
+		if got := fake.Deleted(); !slices.Equal(got, refs("app", stale)) {
+			t.Errorf("nested %v: deleted = %v, want only the unreferenced arm64 image", nested, got)
+		}
+	}
+}
 
 // The tests in this file cover what keeps pruning from deleting more than the
 // rules ask for, or from deleting on the strength of a stale inspection.
@@ -159,6 +210,33 @@ func TestPruneMustDeleteEverythingKeepsLockedRepositories(t *testing.T) {
 	}
 	if got := fake.Digests("app"); !slices.Equal(got, want) {
 		t.Errorf("remaining = %v, want the repository untouched: %v", got, want)
+	}
+}
+
+func TestBulkPruneChecksLocksOfFreshReferrers(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		fake := registrytest.New()
+		old := time.Now().Add(-48 * time.Hour)
+		image := fake.Add("app", registrytest.Image("image"), registry.Attributes{LastUpdated: old})
+		tag := schemeTag(image, ".sig")
+		fake.Add("app", registrytest.Image("signature"), registry.Attributes{Tags: []string{tag}, LastUpdated: time.Now()})
+		fake.LockTag("app", tag)
+		want := fake.Digests("app")
+		p := fakePruner(t, fake)
+		p.DryRun, p.KeepYounger = dryRun, 24*time.Hour
+		log := captureLog(p)
+		if err := p.Prune(t.Context(), ruleSet(t, `[{"repo":"^app$","must_delete_everything":true,"untagged":[{"keep":false}],"tagged":[{"keep":false}]}]`)); err != nil {
+			t.Fatal(err)
+		}
+		if got := fake.Digests("app"); !slices.Equal(got, want) {
+			t.Errorf("dry run %v: remaining = %v, want %v", dryRun, got, want)
+		}
+		if strings.Contains(log.String(), "Dry-run: deleting") {
+			t.Errorf("locked referrer's repository selected for deletion: %s", log)
+		}
+		if fake.Calls("LockedTags") != 1 {
+			t.Error("the fresh referrer's tag lock was not checked")
+		}
 	}
 }
 
@@ -352,6 +430,36 @@ func TestPruneReportsDenialOnlyWhenEveryDeletionIsDenied(t *testing.T) {
 		if denied == mixed || mixed && !errors.Is(err, boom) {
 			t.Errorf("mixed %v: error = %v", mixed, err)
 		}
+	}
+}
+
+func TestPruneReportsCompletedDeletionsOnFailure(t *testing.T) {
+	for _, failure := range []error{registrytest.Forbidden("app"), errors.New("connection failed"), context.Canceled} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			fake := registrytest.New()
+			old := time.Now().Add(-48 * time.Hour)
+			fake.Add("app", registrytest.Image("a"), registry.Attributes{LastUpdated: old})
+			fake.Add("app", registrytest.Image("b"), registry.Attributes{LastUpdated: old})
+			fake.Add("app", registrytest.Image("kept"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old})
+			var calls atomic.Int32
+			fake.Fail = func(op, repo string) error {
+				if op == "DeleteManifest" && calls.Add(1) > 1 {
+					return failure
+				}
+				return nil
+			}
+			p := fakePruner(t, fake)
+			log := captureLog(p)
+			err := p.Prune(t.Context(), ruleSet(t, `[{"repo":"^app$","untagged":[{"keep":false}]}]`))
+			if err == nil || len(fake.Deleted()) != 1 {
+				t.Fatalf("error = %v, deleted = %v", err, fake.Deleted())
+			}
+			for _, want := range []string{"totals.deleted_manifests=1", "totals.kept_manifests=2", "totals.deleted_repos=0"} {
+				if !strings.Contains(log.String(), want) {
+					t.Errorf("missing %q in summary: %s", want, log)
+				}
+			}
+		})
 	}
 }
 

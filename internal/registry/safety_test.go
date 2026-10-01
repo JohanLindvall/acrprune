@@ -64,7 +64,7 @@ func TestDeleteParentsBeforeChildrenAndStopOnFailure(t *testing.T) {
 		}}
 		reg := newRegistry(t, backend, nil)
 		all := fetch(t, reg, "app", registry.FetchOptions{})
-		err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[amd], all[arm], all[idx]}, registry.DeleteOptions{})
+		_, err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[amd], all[arm], all[idx]}, registry.DeleteOptions{})
 		if (err != nil) != fail {
 			t.Fatalf("fail=%v: error=%v", fail, err)
 		}
@@ -112,7 +112,7 @@ func TestDeleteSubjectBeforeReferrers(t *testing.T) {
 		}}
 		reg := newRegistry(t, backend, nil)
 		all := fetch(t, reg, "app", registry.FetchOptions{})
-		err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[signature], all[cosign], all[image]}, registry.DeleteOptions{})
+		_, err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[signature], all[cosign], all[image]}, registry.DeleteOptions{})
 		if (err != nil) != fail {
 			t.Fatalf("fail=%v: error=%v", fail, err)
 		}
@@ -140,7 +140,7 @@ func TestDeleteIndexReferencingItsSubject(t *testing.T) {
 	}}
 	reg := newRegistry(t, backend, nil)
 	all := fetch(t, reg, "app", registry.FetchOptions{})
-	if err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[child], all[parent]}, registry.DeleteOptions{}); err != nil {
+	if _, err := reg.DeleteManifests(t.Context(), []*registry.Manifest{all[child], all[parent]}, registry.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(order, []string{parent, child}) {
@@ -189,7 +189,7 @@ func TestDeleteContinuesPastFailures(t *testing.T) {
 	reg, logs := newLoggedRegistry(t, backend, nil)
 	all := fetch(t, reg, "app", registry.FetchOptions{})
 
-	err := reg.DeleteManifests(t.Context(), slices.Collect(maps.Values(all)), registry.DeleteOptions{})
+	_, err := reg.DeleteManifests(t.Context(), slices.Collect(maps.Values(all)), registry.DeleteOptions{})
 	if !registry.IsPermissionError(err) || !errors.Is(err, boom) {
 		t.Errorf("error = %v, want both failures", err)
 	}
@@ -231,7 +231,7 @@ func TestDeletionBatchesValidateFirst(t *testing.T) {
 		"duplicate":          {all[a], all[b], all[a]},
 		"cycle":              {&cyclicA, &cyclicB},
 	} {
-		if err := reg.DeleteManifests(t.Context(), selection, registry.DeleteOptions{}); err == nil {
+		if _, err := reg.DeleteManifests(t.Context(), selection, registry.DeleteOptions{}); err == nil {
 			t.Errorf("%s: deletion should be refused", name)
 		}
 	}

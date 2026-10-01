@@ -1,6 +1,8 @@
 package pruner
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -8,8 +10,54 @@ import (
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/acrprune/internal/registry/registrytest"
 	"github.com/JohanLindvall/acrprune/internal/rules"
 )
+
+func TestRunningMatchUsesOnlyFirstRepositoryRule(t *testing.T) {
+	rules := ruleSet(t, `[{"repo":"^app$","tagged":[{"tag":"^v2$","keep":true}]},{"repo":".+","tagged":[{"keep":true}],"untagged":[{"keep":true}]}]`)
+	for _, m := range []*registry.Manifest{testManifest("tagged", time.Now(), "v1"), testManifest("untagged", time.Now())} {
+		if runningMatch(m, "app", rules) {
+			t.Error("a later repository rule marked an image as running")
+		}
+	}
+}
+
+func BenchmarkCountRunning(b *testing.B) {
+	const repositories = 1000
+	ruleset := make([]*rules.RepoRule, repositories)
+	for i := range ruleset {
+		ruleset[i] = &rules.RepoRule{Repo: regexp.MustCompile(fmt.Sprintf("^repo%d$", i)), Tagged: []rules.TaggedRule{{CommonRule: rules.CommonRule{Keep: true}}}}
+	}
+	manifests := make(map[string]*registry.Manifest, 1000)
+	for i := range 1000 {
+		m := testManifest(fmt.Sprint(i), time.Now(), "running")
+		manifests[m.Digest] = m
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		if countRunning(manifests, "repo999", ruleset) != len(manifests) {
+			b.Fatal("incorrect running count")
+		}
+	}
+}
+
+func TestStatsRetainsMetadataOfUnavailableManifests(t *testing.T) {
+	fake := registrytest.New()
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	fake.Add("app", registrytest.Image("image"), registry.Attributes{LastUpdated: now.Add(-time.Hour)})
+	fake.AddMissing("app", registry.Attributes{Digest: "sha256:" + strings.Repeat("a", 64), LastUpdated: now, Tags: []string{"running"}})
+	fake.AddMissing("app", registry.Attributes{Digest: "sha256:" + strings.Repeat("b", 64), LastUpdated: old})
+	stats, err := CollectRegistryStats(t.Context(), fakePruner(t, fake).Registry, generated(t, "myreg.azurecr.io/app:running"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stats[0]
+	if s.Count != 3 || s.Tagged != 1 || s.Untagged != 2 || s.Running != 1 || !s.Newest.Equal(now) || !s.Oldest.Equal(old) {
+		t.Errorf("missing manifests lost their known metadata: %+v", s)
+	}
+}
 
 func TestCalculateStats(t *testing.T) {
 	now := time.Now()

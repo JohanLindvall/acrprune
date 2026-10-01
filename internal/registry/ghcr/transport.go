@@ -3,7 +3,6 @@ package ghcr
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -34,19 +33,11 @@ const maxErrorBody = 64 << 10
 func (b *Backend) send(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	req.Header.Set("User-Agent", userAgent)
-	// Copy the client so a caller's redirect policy is preserved without
-	// mutating a shared client.
-	client := *b.client
-	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if err := b.checkRedirect(next, via); err != nil {
-			return &redirectError{err}
-		}
-		return nil
-	}
+	client := registry.NewHTTPClient(b.client)
 	failures := 0
 	var throttled time.Duration
 	for {
-		if wait := b.throttle.pause(b.now()); wait > 0 {
+		for wait := b.throttle.pause(b.now()); wait > 0; wait = b.throttle.pause(b.now()) {
 			if wait > b.maxThrottle-throttled {
 				return nil, fmt.Errorf("rate limit exceeded: %s %s would wait %s more for GitHub's rate limit to lift", req.Method, registry.RedactURL(req.URL), wait.Round(time.Second))
 			}
@@ -57,13 +48,16 @@ func (b *Backend) send(req *http.Request) (*http.Response, error) {
 		}
 		sent := b.now()
 		resp, err := client.Do(req.Clone(ctx))
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			err = registry.BufferResponse(resp)
+		}
 		var delay time.Duration
 		var reason string
 		switch {
 		case err != nil:
-			err = redactError(err)
+			err = registry.RedactError(err)
 			failures++
-			if _, refused := errors.AsType[*redirectError](err); refused || ctx.Err() != nil || failures >= b.maxAttempts {
+			if !registry.Transient(err) || ctx.Err() != nil || failures >= b.maxAttempts {
 				return nil, err
 			}
 			delay, reason = backoff(failures), err.Error()
@@ -93,44 +87,6 @@ func (b *Backend) send(req *http.Request) (*http.Response, error) {
 		}
 	}
 }
-
-// checkRedirect is the redirect policy. Go otherwise forwards credentials to
-// subdomains and across scheme/port changes on the same hostname, and follows
-// a DELETE redirected with a 301, 302 or 303 as a GET, whose success would
-// then pass for the deletion's.
-func (b *Backend) checkRedirect(next *http.Request, via []*http.Request) error {
-	if len(via) >= 10 {
-		return errors.New("stopped after 10 redirects")
-	}
-	if next.URL.User != nil || (next.URL.Scheme != "https" && next.URL.Scheme != "http") ||
-		(via[0].URL.Scheme == "https" && next.URL.Scheme != "https") {
-		return errors.New("refusing an unsafe redirect")
-	}
-	if next.Method != via[0].Method {
-		return fmt.Errorf("refusing a redirect that turns %s into %s", via[0].Method, next.Method)
-	}
-	if b.client.CheckRedirect != nil {
-		if err := b.client.CheckRedirect(next, via); err != nil {
-			return err
-		}
-	}
-	if !sameOrigin(next.URL, via[0].URL) {
-		if via[0].Method != http.MethodGet && via[0].Method != http.MethodHead {
-			return errors.New("refusing to redirect a mutation to another origin")
-		}
-		next.Header.Del("Authorization")
-		next.Header.Del("Proxy-Authorization")
-		next.Header.Del("Cookie")
-	}
-	return nil
-}
-
-// redirectError is a redirect the policy refused, which retrying the request
-// cannot change.
-type redirectError struct{ err error }
-
-func (e *redirectError) Error() string { return e.err.Error() }
-func (e *redirectError) Unwrap() error { return e.err }
 
 // throttle is the rate limiting a backend's requests share: when GitHub turns
 // one away, they all wait until the limit lifts instead of each running into
@@ -312,10 +268,6 @@ func discard(resp *http.Response) error {
 	return resp.Body.Close()
 }
 
-func sameOrigin(a, b *url.URL) bool {
-	return a.Scheme == b.Scheme && strings.EqualFold(a.Host, b.Host)
-}
-
 // redactURL is registry.RedactURL for a URL in text form.
 func redactURL(s string) string {
 	u, err := url.Parse(s)
@@ -323,16 +275,4 @@ func redactURL(s string) string {
 		return "(unparsable URL)"
 	}
 	return registry.RedactURL(u)
-}
-
-// redactError redacts the URL a failed request names. After a redirect it is
-// the blob storage URL, signature and all.
-func redactError(err error) error {
-	var urlErr *url.Error
-	if !errors.As(err, &urlErr) {
-		return err
-	}
-	clean := *urlErr
-	clean.URL = redactURL(urlErr.URL)
-	return &clean
 }

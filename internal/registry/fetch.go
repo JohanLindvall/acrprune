@@ -372,6 +372,7 @@ func (r *Registry) resolvePlatforms(ctx context.Context, repository string, mani
 
 	blobs, ok := r.backend.(BlobGetter)
 	if !fromConfig || !ok {
+		resolveIndexPlatforms(manifests)
 		return nil
 	}
 	// Images built alike share a config; download each config once.
@@ -395,7 +396,11 @@ func (r *Registry) resolvePlatforms(ctx context.Context, repository string, mani
 			return nil
 		})
 	}
-	return group.Wait()
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	resolveIndexPlatforms(manifests)
+	return nil
 }
 
 // Fill only absent platform fields, and only from a compatible descriptor.

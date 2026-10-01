@@ -42,8 +42,9 @@ type Pruner struct {
 }
 
 // PruneStats accumulates counts over one or more repository prunes. The
-// deleted counts are what the rules select for deletion: in a dry run, what
-// would be deleted.
+// deleted counts are confirmed deletions, including partial successes when a
+// repository fails. In a dry run they are what would be deleted. Bytes remain
+// estimates: registries do not report when garbage collection reclaims them.
 type PruneStats struct {
 	// DryRun logs the deleted counts as would_delete_*.
 	DryRun                                         bool
@@ -116,7 +117,11 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 		}
 		progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: repository})
 		stats, err := p.pruneRepository(ctx, repository, ruleSet[match])
+		if err != nil && stats.Repositories == 0 {
+			stats = untouched // failure before the repository could be inspected
+		}
 		outcome := progress.OK
+		var fatal error
 		remaining := len(repositories) - i - 1
 		switch {
 		case err == nil:
@@ -129,22 +134,26 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 			// caller has no access to. Skip those (rather than aborting the
 			// whole run) but report them and fail at the end.
 			denied = append(denied, repository)
-			stats, outcome = untouched, progress.Denied
+			outcome = progress.Denied
 			p.Logger.Warn("Insufficient permission to prune repository; skipping",
 				"repository", repository, "pruned", len(pruned), "denied", len(denied),
-				"remaining", remaining, "err", err)
+				"remaining", remaining, "deleted_manifests", stats.DeletedManifests, "err", err)
 		case skippable(err):
 			skipped = append(skipped, fmt.Errorf("%s: %w", repository, err))
-			stats, outcome = untouched, progress.Skipped
+			outcome = progress.Skipped
 			p.Logger.Warn("Skipping repository that cannot be pruned safely",
 				"repository", repository, "pruned", len(pruned), "skipped", len(skipped),
 				"remaining", remaining, "err", err)
 		default:
-			return fmt.Errorf("failed to prune repository %s: %w", repository, err)
+			outcome = progress.Skipped
+			fatal = fmt.Errorf("failed to prune repository %s: %w", repository, err)
 		}
 		total.Add(stats)
 		progress.Report(ctx, progress.Event{Kind: progress.Finished, Outcome: outcome})
 		p.Logger.Info("Processed", "totals", total)
+		if fatal != nil {
+			return fatal
+		}
 	}
 
 	var errs []error
@@ -177,6 +186,11 @@ func isDenied(err error) bool {
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		errs := joined.Unwrap()
 		return len(errs) > 0 && !slices.ContainsFunc(errs, func(err error) bool { return !isDenied(err) })
+	}
+	if _, response := err.(*registry.ResponseError); !response {
+		if cause := errors.Unwrap(err); cause != nil {
+			return isDenied(cause)
+		}
 	}
 	return registry.IsPermissionError(err)
 }
@@ -224,6 +238,12 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 // the repository again before deleting anything, and fails with
 // registry.ErrRepositoryChanged when anything changed since it was inspected.
 func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *rules.RepoRule) (PruneStats, error) {
+	// A generated inventory has a rule per repository. Find this one's rule
+	// once, rather than scanning the entire inventory for every manifest in
+	// each of the decision passes. Keep the caller's Pruner unchanged.
+	local := *p
+	local.Protect = runningRulesFor(repository, p.Protect)
+	p = &local
 	contents, found, err := p.Registry.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{
 		IgnoreMissing: rule.IgnoreMissingManifests,
 		Platforms:     rule.UsesPlatform(),
@@ -272,7 +292,14 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	}
 	selected := slices.DeleteFunc(slices.Clone(all), func(m *registry.Manifest) bool { _, ok := kept[m.Digest]; return ok })
 	if len(selected) > 0 {
-		if err := p.Registry.LoadTagLocks(ctx, repository, selected); err != nil {
+		lockCandidates := selected
+		if rule.MustDeleteEverything && !p.IncludeLocked {
+			// A referrer kept for its age alone does not protect this
+			// repository, but its tag lock does. Check it even though the
+			// first decision did not select that referrer for deletion.
+			lockCandidates = all
+		}
+		if err := p.Registry.LoadTagLocks(ctx, repository, lockCandidates); err != nil {
 			return PruneStats{}, err
 		}
 	}
@@ -312,8 +339,9 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	if p.DryRun {
 		deleted = "would_delete"
 	}
-	p.Logger.Info("Processed manifests", "repository", repository,
-		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), deleted, humanize.Bytes(seenBytes-keptBytes))
+	p.Logger.Info("Planned manifests", "repository", repository,
+		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), "selected", humanize.Bytes(seenBytes-keptBytes))
+	confirmed := toDelete // a dry run reports the plan
 
 	switch {
 	case p.DryRun:
@@ -357,20 +385,31 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 			err = p.Registry.DeleteRepository(ctx, repository, toDelete, opts)
 			if err == nil {
 				progress.Report(ctx, progress.Event{Kind: progress.Deleted, Count: len(toDelete)})
+			} else {
+				confirmed = nil
 			}
 		} else {
-			err = p.Registry.DeleteManifests(ctx, toDelete, opts)
+			confirmed, err = p.Registry.DeleteManifests(ctx, toDelete, opts)
 		}
 		if err != nil {
-			return PruneStats{}, err
+			// A failed request can follow successful, irreversible deletes.
+			// Count only confirmed successes; unconfirmed manifests and any
+			// blobs they reference still count as remaining.
+			removed := make(map[string]bool, len(confirmed))
+			for _, m := range confirmed {
+				removed[m.Digest] = true
+			}
+			toKeep = slices.DeleteFunc(slices.Clone(all), func(m *registry.Manifest) bool { return removed[m.Digest] })
+			keptBytes = calculateStats("", toKeep).Unique
+			deleteWholeRepository = false
 		}
 	}
 
 	stats := PruneStats{
 		Repositories:     1,
 		SeenManifests:    len(all),
-		KeptManifests:    len(kept),
-		DeletedManifests: len(toDelete),
+		KeptManifests:    len(toKeep),
+		DeletedManifests: len(confirmed),
 		SeenBytes:        seenBytes,
 		KeptBytes:        keptBytes,
 		DeletedBytes:     seenBytes - keptBytes,
@@ -378,7 +417,12 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 	if !deleteWholeRepository {
 		stats.KeptRepositories = 1
 	}
-	return stats, nil
+	if err != nil {
+		stats.SkippedRepositories = 1
+	}
+	p.Logger.Info("Processed manifests", "repository", repository,
+		"seen", humanize.Bytes(seenBytes), "kept", humanize.Bytes(keptBytes), deleted, humanize.Bytes(stats.DeletedBytes))
+	return stats, err
 }
 
 // leftAlone counts a skipped repository, keeping the manifests and bytes seen

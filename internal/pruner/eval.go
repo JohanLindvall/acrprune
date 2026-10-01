@@ -8,7 +8,6 @@ import (
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
 	"github.com/JohanLindvall/acrprune/internal/rules"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // evaluator decides, for a single repository under a single repository rule,
@@ -209,14 +208,8 @@ func matchesPlatform(rule rules.CommonRule, m *registry.Manifest) bool {
 	match := func(re *regexp.Regexp, value string) bool {
 		return re == nil || value != "" && value != "unknown" && re.MatchString(value)
 	}
-	platformMatches := func(platform v1.Platform) bool {
-		return match(rule.Architecture, platform.Architecture) && match(rule.OS, platform.OS)
-	}
-	if platformMatches(v1.Platform{Architecture: m.Architecture, OS: m.OS}) {
-		return true
-	}
-	for _, child := range m.Manifests {
-		if child.Platform != nil && platformMatches(*child.Platform) {
+	for platform := range m.Platforms() {
+		if match(rule.Architecture, platform.Architecture) && match(rule.OS, platform.OS) {
 			return true
 		}
 	}

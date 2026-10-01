@@ -15,7 +15,7 @@ PLATFORMS := linux/amd64 linux/arm64
 GOLANGCI_LINT_VERSION := v2.14.0
 GOLANGCI_LINT         := $(CURDIR)/bin/golangci-lint-$(GOLANGCI_LINT_VERSION)
 
-.PHONY: all build test test-race test-scripts coverage vet lint clean dist-all
+.PHONY: all build test test-race test-scripts coverage vet lint vuln clean dist-all
 
 all: build
 
@@ -39,6 +39,9 @@ coverage:
 
 vet:
 	go vet ./...
+
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run

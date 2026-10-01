@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"iter"
 	"log/slog"
 	"slices"
 	"strings"
@@ -66,6 +67,9 @@ type Manifest struct {
 	Size       uint64 // size of the manifest document itself
 	Orphaned   bool   // manifest is missing or has a broken dependency chain
 	HasOwner   bool   // referenced by an index manifest
+	// platforms is the resolved set of OS/architecture pairs, including
+	// those inherited through nested indexes. nil means not resolved yet.
+	platforms []v1.Platform
 }
 
 // Ref returns the repository@digest reference identifying the manifest. It is
@@ -98,16 +102,36 @@ func (m *Manifest) HasTimestamp() bool {
 	return !m.LastUpdated.IsZero()
 }
 
+// Platforms yields the manifest's platform and its index entries' platforms,
+// including platforms resolved from children whose descriptors omitted them.
+func (m *Manifest) Platforms() iter.Seq[v1.Platform] {
+	return func(yield func(v1.Platform) bool) {
+		if m.platforms != nil {
+			for _, platform := range m.platforms {
+				if !yield(platform) {
+					return
+				}
+			}
+			return
+		}
+		if !yield(v1.Platform{Architecture: m.Architecture, OS: m.OS}) {
+			return
+		}
+		for _, child := range m.Manifests {
+			if child.Platform != nil && !yield(*child.Platform) {
+				return
+			}
+		}
+	}
+}
+
 // Architectures returns the distinct known architectures of the manifest and,
 // for an index, of the manifests it references.
 func (m *Manifest) Architectures() []string {
 	var result []string
 	add := addKnown(&result)
-	add(m.Architecture)
-	for _, child := range m.Manifests {
-		if child.Platform != nil {
-			add(child.Platform.Architecture)
-		}
+	for platform := range m.Platforms() {
+		add(platform.Architecture)
 	}
 	return result
 }
@@ -117,11 +141,8 @@ func (m *Manifest) Architectures() []string {
 func (m *Manifest) OperatingSystems() []string {
 	var result []string
 	add := addKnown(&result)
-	add(m.OS)
-	for _, child := range m.Manifests {
-		if child.Platform != nil {
-			add(child.Platform.OS)
-		}
+	for platform := range m.Platforms() {
+		add(platform.OS)
 	}
 	return result
 }

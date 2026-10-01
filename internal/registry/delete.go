@@ -141,13 +141,13 @@ func sameSet(a, b []string) bool {
 // index that a lock or missing permission keeps, and the signatures of a kept
 // image. It does not stop anything else: in-flight requests complete, and
 // every independent manifest is still deleted. Only ctx cancels the rest. The
-// failures are returned joined, so IsPermissionError and IsNotFound see
-// through to them.
-func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, opts DeleteOptions) error {
+// successes are returned even on failure, in completion order, so callers can
+// report partial deletions accurately. The failures are returned joined.
+func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, opts DeleteOptions) ([]*Manifest, error) {
 	progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Deleting manifests"})
 	batches, parents, err := deletionBatches(manifests)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var unlocker Unlocker
 	if opts.Unlock {
@@ -155,6 +155,7 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, o
 	}
 	var mu sync.Mutex
 	var failures []error
+	var deleted []*Manifest
 	notDeleted := map[*Manifest]bool{}
 	for _, batch := range batches {
 		if ctx.Err() != nil {
@@ -174,9 +175,9 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, o
 			}
 			group.Go(func() error {
 				err := r.deleteManifest(ctx, unlocker, m)
+				mu.Lock()
+				defer mu.Unlock()
 				if err != nil {
-					mu.Lock()
-					defer mu.Unlock()
 					notDeleted[m] = true
 					// The interruption, returned below, is the only
 					// failure worth reporting of deletions it cut short;
@@ -184,13 +185,15 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, o
 					if ctx.Err() == nil || !canceled(err) {
 						failures = append(failures, err)
 					}
+				} else {
+					deleted = append(deleted, m)
 				}
 				return nil
 			})
 		}
 		_ = group.Wait()
 	}
-	return errors.Join(append(failures, ctx.Err())...)
+	return deleted, errors.Join(append(failures, ctx.Err())...)
 }
 
 // canceled reports whether err is a cancellation's, or a deadline's.

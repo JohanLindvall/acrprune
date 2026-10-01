@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,6 +19,38 @@ import (
 
 	"github.com/JohanLindvall/acrprune/internal/registry"
 )
+
+func TestRetriesTruncatedSuccessBodies(t *testing.T) {
+	for _, operation := range []string{"listing", "manifest"} {
+		t.Run(operation, func(t *testing.T) {
+			f, b := newFakeGitHub(t, true)
+			digest := f.push("app", manifestDoc("a"), time.Now(), "v1")
+			sleeps := recordSleeps(b)
+			var failed atomic.Bool
+			f.before = func(w http.ResponseWriter, r *http.Request) bool {
+				path := "/orgs/" + testOwner + "/packages"
+				if operation == "manifest" {
+					path = "/v2/" + testOwner + "/app/manifests/" + digest
+				}
+				if r.URL.Path != path || r.Header.Get("Authorization") == "" || failed.Swap(true) {
+					return false
+				}
+				w.Header().Set("Content-Length", "100")
+				_, _ = io.WriteString(w, "{")
+				return true
+			}
+			var err error
+			if operation == "manifest" {
+				_, err = b.GetManifest(t.Context(), "app", digest)
+			} else {
+				_, err = b.ListRepositories(t.Context())
+			}
+			if err != nil || len(*sleeps) != 1 {
+				t.Fatalf("error = %v, waits = %v; want the truncated body retried", err, *sleeps)
+			}
+		})
+	}
+}
 
 // failFirst makes the fake answer the first n REST requests with fail.
 func failFirst(f *fakeGitHub, n int, fail func(w http.ResponseWriter)) {
@@ -366,6 +399,34 @@ func TestRateLimitPauseOutlastingBudget(t *testing.T) {
 	cancel()
 	if _, err := b.ListRepositories(cancelled); !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want the cancellation", err)
+	}
+}
+
+func TestRateLimitRechecksAnExtendedPause(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	recordSleeps(b)
+	b.throttle.until = b.now().Add(time.Minute)
+	sleep := b.sleep
+	waits := 0
+	b.sleep = func(ctx context.Context, d time.Duration) error {
+		waits++
+		if waits == 1 {
+			// Another in-flight response extends the shared pause while we wait.
+			b.throttle.until = b.now().Add(2 * time.Minute)
+		}
+		return sleep(ctx, d)
+	}
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if b.throttle.pause(b.now()) > 0 {
+			t.Error("request sent before the extended rate-limit pause ended")
+		}
+		return false
+	}
+	if _, err := b.ListRepositories(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if waits != 2 {
+		t.Errorf("waited %d times, want the original pause and its extension", waits)
 	}
 }
 

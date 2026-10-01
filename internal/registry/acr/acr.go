@@ -77,9 +77,11 @@ func newBackend(opts Options, retry retryPolicy) (*Backend, error) {
 		retry.logger = slog.New(slog.DiscardHandler)
 	}
 	b := &Backend{pageSize: int32(opts.PageSize)}
+	transport := registry.NewHTTPClient(nil)
 	for _, client := range []**azcontainerregistry.Client{&b.metadata, &b.updates, &b.content} {
 		c, err := azcontainerregistry.NewClient(opts.Endpoint, opts.Credential, &azcontainerregistry.ClientOptions{
 			ClientOptions: azcore.ClientOptions{
+				Transport: transport,
 				Telemetry: policy.TelemetryOptions{ApplicationID: "acrprune"},
 				// retryPolicy replaces the SDK's retries, which are silent
 				// and give up on throttling within seconds. The token
@@ -101,7 +103,7 @@ func newBackend(opts Options, retry retryPolicy) (*Backend, error) {
 func (b *Backend) ListRepositories(ctx context.Context) ([]string, error) {
 	repositories := []string{}
 	pager := b.metadata.NewListRepositoriesPager(&azcontainerregistry.ClientListRepositoriesOptions{MaxNum: to.Ptr(b.pageSize)})
-	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListRepositoriesResponse) error {
+	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListRepositoriesResponse) *string { return page.Link }, func(page azcontainerregistry.ClientListRepositoriesResponse) error {
 		for _, repository := range page.Names {
 			if repository != nil {
 				repositories = append(repositories, *repository)
@@ -126,7 +128,7 @@ func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(
 		OrderBy: to.Ptr(azcontainerregistry.ArtifactManifestOrderByNone),
 		MaxNum:  to.Ptr(b.pageSize),
 	})
-	return forEachPage(ctx, pager, func(page azcontainerregistry.ClientListManifestsResponse) error {
+	return forEachPage(ctx, pager, func(page azcontainerregistry.ClientListManifestsResponse) *string { return page.Link }, func(page azcontainerregistry.ClientListManifestsResponse) error {
 		for _, attrs := range page.Attributes {
 			if err := fn(attributes(attrs)); err != nil {
 				return err
@@ -216,7 +218,7 @@ func deleted(err error) error {
 func (b *Backend) LockedTags(ctx context.Context, repository string) (map[string]bool, error) {
 	lockedTags := map[string]bool{}
 	pager := b.metadata.NewListTagsPager(repository, &azcontainerregistry.ClientListTagsOptions{MaxNum: to.Ptr(b.pageSize)})
-	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListTagsResponse) error {
+	err := forEachPage(ctx, pager, func(page azcontainerregistry.ClientListTagsResponse) *string { return page.Link }, func(page azcontainerregistry.ClientListTagsResponse) error {
 		for _, t := range page.Tags {
 			if t == nil || t.Name == nil || t.ChangeableAttributes == nil {
 				continue
@@ -317,12 +319,23 @@ func unlock(ctx context.Context, canDelete, canWrite *bool, update func(ctx cont
 }
 
 // forEachPage advances the pager to exhaustion, invoking fn on every page.
-// Errors from paging and from fn alike abort the walk.
-func forEachPage[T any](ctx context.Context, pager *runtime.Pager[T], fn func(T) error) error {
+// Errors from paging and from fn alike abort the walk. nextLink extracts the
+// continuation URL so a broken server cannot loop forever; it may be nil for
+// pagers without continuation URLs.
+func forEachPage[T any](ctx context.Context, pager *runtime.Pager[T], nextLink func(T) *string, fn func(T) error) error {
+	seen := map[string]bool{}
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return wrap(err)
+		}
+		if nextLink != nil {
+			if link := nextLink(page); link != nil && *link != "" {
+				if seen[*link] {
+					return errors.New("pagination repeated a continuation URL")
+				}
+				seen[*link] = true
+			}
 		}
 		if err := fn(page); err != nil {
 			return err

@@ -439,7 +439,7 @@ func (b *Backend) nextPage(link string) (string, error) {
 		}
 		target = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(target), "<"), ">")
 		u, err := url.Parse(target)
-		if err != nil || u.User != nil || u.Fragment != "" || !sameOrigin(u, b.apiURL) {
+		if err != nil || u.User != nil || u.Fragment != "" || !registry.SameOrigin(u, b.apiURL) {
 			return "", fmt.Errorf("refusing to follow the next page link %q away from %s", target, b.apiURL.Host)
 		}
 		return target, nil

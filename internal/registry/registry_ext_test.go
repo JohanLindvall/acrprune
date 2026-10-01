@@ -364,7 +364,7 @@ func TestDeleteManifests(t *testing.T) {
 	reg := newRegistry(t, fake, cache)
 	manifests := fetch(t, reg, "app", registry.FetchOptions{})
 
-	if err := reg.DeleteManifests(context.Background(), []*registry.Manifest{manifests[drop]}, registry.DeleteOptions{}); err != nil {
+	if _, err := reg.DeleteManifests(context.Background(), []*registry.Manifest{manifests[drop]}, registry.DeleteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := fake.Digests("app"); !slices.Equal(got, []string{keep}) {
@@ -378,7 +378,7 @@ func TestDeleteManifests(t *testing.T) {
 	}
 
 	fake.Fail = func(string, string) error { return registrytest.Forbidden("app") }
-	err := reg.DeleteManifests(context.Background(), []*registry.Manifest{manifests[keep]}, registry.DeleteOptions{})
+	_, err := reg.DeleteManifests(context.Background(), []*registry.Manifest{manifests[keep]}, registry.DeleteOptions{})
 	if !registry.IsPermissionError(err) || !strings.Contains(err.Error(), "app@"+keep) {
 		t.Errorf("delete error = %v, want the permission error naming the manifest", err)
 	}
@@ -502,12 +502,12 @@ func TestDeleteManifestsUnlocks(t *testing.T) {
 	locked, open := lockedRepository(t, fake, reg)
 	toDelete := []*registry.Manifest{locked, open}
 
-	err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{})
+	_, err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{})
 	if err == nil || len(fake.Deleted()) != 0 || len(fake.Unlocked()) != 0 {
 		t.Fatalf("without Unlock: error %v, deleted %v, unlocked %v; want the locks to refuse the deletion", err, fake.Deleted(), fake.Unlocked())
 	}
 
-	if err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{Unlock: true}); err != nil {
+	if _, err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{Unlock: true}); err != nil {
 		t.Fatal(err)
 	}
 	if want := []string{"app:v1", "app:v2", "app@" + locked.Digest}; !slices.Equal(fake.Unlocked(), want) {
@@ -526,7 +526,7 @@ func TestDeleteManifestsWithoutLocks(t *testing.T) {
 	m := fetch(t, newRegistry(t, fake, nil), "app", registry.FetchOptions{})[digest]
 	m.LockedTags = []string{"v1"}
 
-	if err := newRegistry(t, plain(fake), nil).DeleteManifests(context.Background(), []*registry.Manifest{m}, registry.DeleteOptions{Unlock: true}); err != nil {
+	if _, err := newRegistry(t, plain(fake), nil).DeleteManifests(context.Background(), []*registry.Manifest{m}, registry.DeleteOptions{Unlock: true}); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.Unlocked()) != 0 || len(fake.Deleted()) != 1 {
@@ -548,7 +548,7 @@ func TestUnlockFailuresAreTolerated(t *testing.T) {
 		return nil
 	}
 
-	err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked, open}, registry.DeleteOptions{Unlock: true})
+	_, err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked, open}, registry.DeleteOptions{Unlock: true})
 	if got := fake.Calls("UnlockTag"); got != 2 {
 		t.Errorf("UnlockTag called %d times, want once per locked tag", got)
 	}
@@ -591,7 +591,7 @@ func TestFailedDeletionRelocks(t *testing.T) {
 		return nil
 	}
 
-	err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{Unlock: true})
+	_, err := reg.DeleteManifests(context.Background(), toDelete, registry.DeleteOptions{Unlock: true})
 	if !errors.Is(err, boom) {
 		t.Fatalf("error = %v, want %v", err, boom)
 	}
@@ -629,7 +629,7 @@ func TestInterruptedDeletionRelocks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := newRegistry(t, interruptingBackend{Backend: fake, cancel: cancel}, nil).DeleteManifests(ctx, []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true})
+	_, err := newRegistry(t, interruptingBackend{Backend: fake, cancel: cancel}, nil).DeleteManifests(ctx, []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true})
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want the cancellation", err)
 	}
@@ -649,7 +649,7 @@ func TestInterruptedDeletionReportsRefusals(t *testing.T) {
 	defer cancel()
 
 	backend := interruptingBackend{Backend: fake, cancel: cancel, err: registrytest.Forbidden("app")}
-	err := newRegistry(t, backend, nil).DeleteManifests(ctx, []*registry.Manifest{m}, registry.DeleteOptions{})
+	_, err := newRegistry(t, backend, nil).DeleteManifests(ctx, []*registry.Manifest{m}, registry.DeleteOptions{})
 	if !errors.Is(err, context.Canceled) || !registry.IsPermissionError(err) {
 		t.Errorf("error = %v, want both the interruption and the refusal", err)
 	}
@@ -687,7 +687,7 @@ func TestFailedUnlockRelocks(t *testing.T) {
 		return nil
 	}
 
-	if err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true}); err == nil {
+	if _, err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true}); err == nil {
 		t.Fatal("the deletion should fail")
 	}
 	if got, want := fake.Relocked(), []string{"app@" + locked.Digest}; !slices.Equal(got, want) {
@@ -720,7 +720,7 @@ func TestRelockFailuresAreLogged(t *testing.T) {
 		return nil
 	}
 
-	if err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true}); err == nil {
+	if _, err := reg.DeleteManifests(context.Background(), []*registry.Manifest{locked}, registry.DeleteOptions{Unlock: true}); err == nil {
 		t.Fatal("the deletion should fail")
 	}
 	if got := fake.Relocked(); !slices.Equal(got, []string{"app@" + locked.Digest}) {

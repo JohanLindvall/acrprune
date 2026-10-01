@@ -94,7 +94,13 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 		}
 		repoStats := calculateStatsSeen(repository, slices.Collect(maps.Values(contents.Manifests)), seen)
 		countMissing(&repoStats, contents.Missing)
-		repoStats.Running = countRunning(contents.Manifests, repository, runningRules)
+		repositoryRunning := runningRulesFor(repository, runningRules)
+		repoStats.Running = countRunning(contents.Manifests, repository, repositoryRunning)
+		for _, attrs := range contents.Missing {
+			if runningMatch(&registry.Manifest{Attributes: attrs}, repository, repositoryRunning) {
+				repoStats.Running++
+			}
+		}
 		stats = append(stats, repoStats)
 		progress.Report(ctx, progress.Event{Kind: progress.Plan, Kept: repoStats.Count, Bytes: repoStats.Unique})
 		if onUpdate != nil {
@@ -125,11 +131,25 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 // the manifest counts. Their bytes are unknown.
 func countMissing(stats *RepositoryStats, missing []registry.Attributes) {
 	for _, attrs := range missing {
-		stats.Count++
-		if len(attrs.Tags) > 0 {
-			stats.Tagged++
-		} else {
-			stats.Untagged++
+		stats.countAttributes(attrs)
+	}
+}
+
+// countAttributes records metadata independently of whether the document was
+// downloadable. Missing content makes bytes unknown, not its tags or age.
+func (s *RepositoryStats) countAttributes(attrs registry.Attributes) {
+	s.Count++
+	if len(attrs.Tags) > 0 {
+		s.Tagged++
+	} else {
+		s.Untagged++
+	}
+	if updated := attrs.LastUpdated; !updated.IsZero() {
+		if s.Newest.IsZero() || updated.After(s.Newest) {
+			s.Newest = updated
+		}
+		if s.Oldest.IsZero() || updated.Before(s.Oldest) {
+			s.Oldest = updated
 		}
 	}
 }
@@ -138,6 +158,7 @@ func countMissing(stats *RepositoryStats, missing []registry.Attributes) {
 // images that appear in the running set. Only tags and digests are consulted —
 // all that rules generated from an image list constrain.
 func countRunning(manifests map[string]*registry.Manifest, repository string, ruleSet []*rules.RepoRule) int {
+	ruleSet = runningRulesFor(repository, ruleSet)
 	running := 0
 	for _, m := range manifests {
 		if runningMatch(m, repository, ruleSet) {
@@ -145,6 +166,17 @@ func countRunning(manifests map[string]*registry.Manifest, repository string, ru
 		}
 	}
 	return running
+}
+
+// runningRulesFor narrows an inventory to its first rule for the repository,
+// preserving rule order without allocating a new slice.
+func runningRulesFor(repository string, ruleSet []*rules.RepoRule) []*rules.RepoRule {
+	for i, rule := range ruleSet {
+		if rule.Repo.MatchString(repository) {
+			return ruleSet[i : i+1]
+		}
+	}
+	return nil
 }
 
 // runningMatch reports whether the manifest's first matching rule keeps it.
@@ -157,20 +189,15 @@ func runningMatch(m *registry.Manifest, repository string, ruleSet []*rules.Repo
 			continue
 		}
 		if len(m.Tags) > 0 {
-			matched := false
 			for _, tag := range m.Tags {
 				for _, r := range rule.Tagged {
 					if matchString(r.Tag, tag) && matchAny(r.Digest, digest) {
 						if r.Keep {
 							return true
 						}
-						matched = true
 						break
 					}
 				}
-			}
-			if matched {
-				return false
 			}
 		} else {
 			for _, r := range rule.Untagged {
@@ -179,6 +206,7 @@ func runningMatch(m *registry.Manifest, repository string, ruleSet []*rules.Repo
 				}
 			}
 		}
+		return false // later repository rules never apply
 	}
 	return false
 }
@@ -197,8 +225,7 @@ func calculateStats(repository string, manifests []*registry.Manifest) Repositor
 // later ones.
 func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen map[string]struct{}) RepositoryStats {
 	var unique, total uint64
-	var tagged, untagged int
-	var newest, oldest time.Time
+	stats := RepositoryStats{Name: repository}
 
 	// count adds a blob, charging it to Unique unless its digest is a repeat.
 	count := func(digest string, size uint64) {
@@ -215,19 +242,7 @@ func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen 
 	}
 
 	for _, m := range manifests {
-		if len(m.Tags) > 0 {
-			tagged++
-		} else {
-			untagged++
-		}
-		if updated := m.LastUpdated; m.HasTimestamp() {
-			if newest.IsZero() || updated.After(newest) {
-				newest = updated
-			}
-			if oldest.IsZero() || updated.Before(oldest) {
-				oldest = updated
-			}
-		}
+		stats.countAttributes(m.Attributes)
 
 		count(m.Digest, m.Size)
 		if m.Config != nil {
@@ -243,15 +258,6 @@ func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen 
 		shared = 1.0 - float64(unique)/float64(total)
 	}
 
-	return RepositoryStats{
-		Name:     repository,
-		Total:    total,
-		Unique:   unique,
-		Shared:   shared,
-		Count:    len(manifests),
-		Tagged:   tagged,
-		Untagged: untagged,
-		Newest:   newest,
-		Oldest:   oldest,
-	}
+	stats.Total, stats.Unique, stats.Shared = total, unique, shared
+	return stats
 }

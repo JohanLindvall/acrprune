@@ -2,12 +2,8 @@ package acr
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -124,6 +120,13 @@ func (p *retryPolicy) Do(req *policy.Request) (*http.Response, error) {
 			return nil, err
 		}
 		resp, err := req.Clone(ctx).Next()
+		// The SDK streams /v2/ manifest downloads, unlike its metadata
+		// calls, whose bodies it buffers itself. Read the stream here so
+		// an interrupted body gets the same retry policy as failed headers.
+		if err == nil && resp.StatusCode == http.StatusOK && req.Raw().Method == http.MethodGet && strings.HasPrefix(req.Raw().URL.Path, "/v2/") {
+			err = registry.BufferResponse(resp)
+		}
+		err = registry.RedactError(err)
 		if ctx.Err() != nil {
 			return resp, err
 		}
@@ -131,7 +134,7 @@ func (p *retryPolicy) Do(req *policy.Request) (*http.Response, error) {
 		var delay time.Duration
 		switch {
 		case err != nil:
-			if !transient(err) {
+			if !registry.Transient(err) {
 				return nil, err
 			}
 			reason = err.Error()
@@ -171,55 +174,6 @@ func (p *retryPolicy) backoff(retry int) time.Duration {
 		delay *= 2
 	}
 	return min(delay, p.maxDelay)
-}
-
-// transient reports whether a request that got no response failed for a
-// reason worth retrying: a timeout, a connection refused, reset or broken off,
-// or a response cut short. Failures that retrying cannot mend are final: a
-// host name that does not exist — a mistyped registry, say — a certificate
-// that does not verify, as behind a TLS-intercepting proxy, and errors the SDK
-// marks as not retriable, such as a failed token exchange, which is retried
-// within its own request. So is any failure not named here, rather than being
-// retried for a quarter of an hour.
-func transient(err error) bool {
-	var nonRetriable interface{ NonRetriable() }
-	if errors.As(err, &nonRetriable) {
-		return false
-	}
-	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
-		// Not found (NXDOMAIN) is permanent; a resolver timing out or
-		// failing temporarily is not.
-		return dnsErr.IsTimeout || dnsErr.IsTemporary
-	}
-	if untrustedCertificate(err) {
-		return false
-	}
-	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
-		return true
-	}
-	if opErr, ok := errors.AsType[*net.OpError](err); ok {
-		// Connecting, or the connection failing midway: refused, reset,
-		// unreachable. Not "remote error", a TLS alert the server sent.
-		switch opErr.Op {
-		case "dial", "read", "write", "proxyconnect":
-			return true
-		}
-		return false
-	}
-	// The connection closed before the response was complete, or net/http
-	// could not read it off a connection that broke.
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		strings.Contains(err.Error(), "transport connection broken")
-}
-
-// untrustedCertificate reports whether err is the registry's certificate
-// failing verification.
-func untrustedCertificate(err error) bool {
-	_, verification := errors.AsType[*tls.CertificateVerificationError](err)
-	_, authority := errors.AsType[x509.UnknownAuthorityError](err)
-	_, hostname := errors.AsType[x509.HostnameError](err)
-	_, invalid := errors.AsType[x509.CertificateInvalidError](err)
-	return verification || authority || hostname || invalid
 }
 
 // retryAfter returns how long a response asks to wait before retrying, or zero

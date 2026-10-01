@@ -180,3 +180,17 @@ func TestReadDocument(t *testing.T) {
 		t.Error("a runaway document should be refused")
 	}
 }
+
+func FuzzParseManifest(f *testing.F) {
+	for _, raw := range []string{imageManifest, `{"schemaVersion":2,"manifests":[]}`, `{"schemaVersion":1}`, `null`, `{"schemaVersion":2,"subject":{"size":-1}}`} {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > MaxDocumentSize {
+			t.Skip()
+		}
+		// Parser input includes cached and remote documents. Arbitrary
+		// JSON, including malformed descriptors, must never panic.
+		_, _ = parseManifest("app", godigest.FromBytes(raw).String(), raw)
+	})
+}

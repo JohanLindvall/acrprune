@@ -81,6 +81,8 @@ The layout adapts to resizing and honors `NO_COLOR`. The display retains the las
 
 The dashboard uses the controlling terminal, leaving stdout for JSON and stdin for rules; `statistics` writes JSON for stdout once the dashboard has closed, so that a terminal shows it too. Redirected stderr, `TERM=dumb`, and a terminal that cannot be initialized (such as a pseudo-terminal without a controlling terminal) get plain logs; `--progress=tui` reports an error instead.
 
+The dashboard's kept/selected counts describe the plan; deleted counts reflect successful API deletions. Plain logs distinguish `Planned manifests` from `Processed manifests`. If a repository fails partway through deletion, the processed totals still include successful deletions and count everything unconfirmed as remaining. A skipped or denied repository may therefore have been partially pruned. Byte counts remain estimates of referenced blobs, not reclaimed storage.
+
 ## Commands
 
 `prune`, `generate` and `top` read stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose.
@@ -128,7 +130,7 @@ These are kept whatever the rules say: manifests updated within the grace period
 
 #### Locked images
 
-A manifest or tag whose `deleteEnabled` or `writeEnabled` attribute is `false` (see [Lock a container image](https://learn.microsoft.com/azure/container-registry/container-registry-image-lock)) is locked, and ACR refuses to delete it. acrprune protects locked manifests, and manifests carrying a locked tag, logging each (`Keeping locked manifest; use --include-locked to delete it`). To find locked tags, it lists a repository's tags when the rules would delete one of its tagged manifests, in dry runs too.
+A manifest or tag whose `deleteEnabled` or `writeEnabled` attribute is `false` (see [Lock a container image](https://learn.microsoft.com/azure/container-registry/container-registry-image-lock)) is locked, and ACR refuses to delete it. acrprune protects locked manifests, and manifests carrying a locked tag, logging each (`Keeping locked manifest; use --include-locked to delete it`). To find locked tags, it lists a repository's tags when the rules would delete one of its tagged manifests, in dry runs too. Under `must_delete_everything`, it also checks the tags of retained signatures and other referrers: a lock on even a freshly pushed signature keeps the entire repository.
 
 **`--include-locked` bypasses this protection.** Just before deleting a locked manifest, acrprune enables delete and write on it and its locked tags, each manifest as its turn comes, so those the run never deletes stay locked: the children of an index that could not be deleted, and everything after an interruption. A whole-repository deletion unlocks the repository's locked manifests and tags just before it. If the deletion fails or the run is interrupted, the original `deleteEnabled`/`writeEnabled` values are restored, even after a failed unlock, which may have taken effect; a lock that cannot be restored is logged as a warning. A failed unlock is logged and the deletion attempted anyway; a lock whose state cannot be read is left alone. A dry run changes nothing, logging the manifests it would unlock with `locked=true`, tag locks included.
 
@@ -168,6 +170,8 @@ The output is a JSON array with one object per repository:
 | `running` | int | Manifests (tagged or digest-pinned) matching a keep rule from `--running` (`0` without it) |
 
 A blob several repositories reference counts towards the `unique` bytes of the alphabetically first of them only, so `unique` is not what deleting a repository frees when later repositories share its blobs.
+
+If a listed manifest cannot be downloaded, its known tags, timestamp and running-image status still contribute to the statistics; only its bytes are unknown.
 
 ### `generate`
 
@@ -319,6 +323,8 @@ Deleting a manifest deletes all of its tags, so a manifest is judged tag by tag:
 
 `arch` and `os` match an image index when any of its platforms matches, so `{"arch": "amd64", "keep": false}` also deletes multi-platform indexes including amd64. To target single-platform images, keep the other platforms first, as `rules/delete_amd64_only_images.json` does with its `arm64` keep rule.
 
+Platforms are resolved through nested indexes and from child images when an index omits its optional platform descriptors. Explicit descriptor constraints are preserved; conflicting reports never combine into an invented OS/architecture pair. These forms are permitted by the [OCI image index specification](https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md).
+
 `newest` ranks a manifest against the other manifests **the same rule matches**, not the whole repository. So these rules keep the three most recent release images however many newer feature-branch images sit alongside them:
 
 ```json
@@ -363,6 +369,7 @@ Every example applies to all repositories. Those deleting untagged manifests als
 
 ### Azure Container Registry
 
+- HTTP requests have a two-minute timeout, including reading the response body. Truncated manifest downloads are retried before content is parsed or cached. Redirects cannot change a deletion into a read or forward a mutation to another origin. Read redirects drop authentication credentials when the origin changes, and HTTPS requests never redirect to HTTP. Repeated pagination links fail instead of looping indefinitely.
 - Throttled requests (429) and failing ones (408, 500, 502, 503, 504, timeouts, connections refused, reset or cut short) are retried up to 10 times; a host name that does not resolve or a certificate that does not verify fails at once. acrprune waits as long as the registry asks (`Retry-After`, up to 3 minutes), or backs off exponentially from 2 seconds to 3 minutes, riding out about a quarter of an hour of throttling per request. Each retry is logged as a warning and counted down in the dashboard.
 - ACR access tokens are scoped to one repository and action. acrprune keeps separate clients for listing, attribute updates, and manifest content and deletion. The first request of each action on a repository fetches the token and the others reuse it, so a run exchanges only a few tokens per repository.
 
@@ -374,6 +381,7 @@ Every example applies to all repositories. Those deleting untagged manifests als
 - GHCR reports no image platforms. Images an index references take theirs from the index; for single-platform images, rules using `arch` or `os` download the image config (once per distinct config, cached). Other rules download nothing extra.
 - The last-updated time is the package version's `updated_at`.
 - GitHub rate limits are honoured. A throttled request pauses all of acrprune's GitHub requests, so that parallel workers do not keep hitting the limit, for as long as GitHub asks (`Retry-After`, or until the limit resets, by GitHub's `Date` header rather than the local clock). A secondary limit giving no wait time is waited out for a minute, doubling while it persists until a request gets through. Throttled requests are retried, with a warning, for up to two hours per request, riding out GitHub's hourly limits during a large cleanup. Server and network errors are retried a few times with exponential backoff.
+- Workers recheck a shared pause after waiting, so a later response extending the rate limit delays them too. Permanent DNS, certificate and redirect-policy failures fail immediately. Truncated success responses are retried, and response documents are bounded to 16 MiB. GHCR uses the same credential and method protections on redirects as ACR, including blob-storage redirects.
 - GitHub answers 404 both for a package that does not exist and for a private package the token may not read, so a literally named package (`^name$`) the token cannot see is reported missing rather than denied. If a package you expect is reported missing, check the token's access to it.
 - GitHub does not let a public package be deleted, in whole or in part, once one of its versions has been downloaded more than 5,000 times; acrprune reports GitHub's error for such a package.
 
@@ -402,18 +410,22 @@ make test-race   # Go race detector plus inventory tests
 make coverage    # race-enabled coverage.out and function coverage
 make vet
 make lint        # pinned golangci-lint, installed into ./bin on first use
+make vuln        # vulnerability scan, built with the active Go toolchain
 make dist-all    # Linux amd64/arm64 archives and checksums
 ```
 
-The tests use in-memory registries and HTTP test servers; they need no cloud credentials and delete no real packages. They cover rule validation, dependency and referrer lifecycles, pagination, throttling, credential redirects, cancellation and signals, atomic output, CLI workflows, and terminal simulation at multiple sizes. Fuzz targets exercise rule parsing and image-reference validation. For an extended local run:
+The tests use in-memory registries and HTTP test servers; they need no cloud credentials and delete no real packages. They cover rule validation, dependency and referrer lifecycles, nested indexes and omitted platforms, pagination loops, extended throttling, credential redirects, partial deletion summaries, cancellation and signals, atomic output, CLI workflows, and terminal simulation at multiple sizes. Fuzz targets exercise rule and manifest parsing and image-reference validation. For an extended local run:
 
 ```sh
 go test ./internal/rules -fuzz=FuzzParseAndCompile -fuzztime=30s
 go test ./internal/imageref -fuzz=FuzzSplit -fuzztime=30s
-govulncheck ./...
+go test ./internal/registry -fuzz=FuzzParseManifest -fuzztime=30s
+go test ./internal/pruner -run '^$' -bench BenchmarkCountRunning -benchmem
+go test ./internal/registry -run '^$' -bench BenchmarkIndexPlatforms -benchmem
+make vuln
 ```
 
-CI also runs `govulncheck ./...` with its Go 1.27 toolchain.
+CI also runs `make vuln` with its Go 1.27 toolchain. The target builds the checker with the active Go version, avoiding incompatibility with a previously installed checker built for an older Go release.
 
 ## Similar Work
 

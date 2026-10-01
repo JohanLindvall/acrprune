@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/JohanLindvall/acrprune/internal/registry"
+
 	"golang.org/x/sync/singleflight"
 )
 
@@ -137,7 +139,7 @@ func (b *Backend) parseChallenge(header string) (realm, service string, err erro
 	values := parseParams(params)
 	realm = values["realm"]
 	u, err := url.Parse(realm)
-	if err != nil || u.User != nil || u.Fragment != "" || !sameOrigin(u, b.registryURL) {
+	if err != nil || u.User != nil || u.Fragment != "" || !registry.SameOrigin(u, b.registryURL) {
 		return "", "", fmt.Errorf("refusing to authenticate at %q, away from %s", realm, b.registryURL.Host)
 	}
 	return realm, values["service"], nil

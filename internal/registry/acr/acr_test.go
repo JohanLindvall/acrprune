@@ -668,7 +668,7 @@ func TestTokenExchangesArePerRepositoryAndAction(t *testing.T) {
 			if err := reg.LoadTagLocks(ctx, name, all); err != nil {
 				t.Fatal(err)
 			}
-			if err := reg.DeleteManifests(ctx, all, registry.DeleteOptions{Unlock: true}); err != nil {
+			if _, err := reg.DeleteManifests(ctx, all, registry.DeleteOptions{Unlock: true}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -973,7 +973,7 @@ func TestTransient(t *testing.T) {
 		{"not retriable", fmt.Errorf("token: %w", nonRetriable{}), false},
 		{"anything else", errors.New("unforeseen"), false},
 	} {
-		if got := transient(tt.err); got != tt.want {
+		if got := registry.Transient(tt.err); got != tt.want {
 			t.Errorf("%s: transient(%v) = %v, want %v", tt.name, tt.err, got, tt.want)
 		}
 	}
@@ -1079,7 +1079,7 @@ func fakePager(values []int) *runtime.Pager[int] {
 
 func TestForEachPage(t *testing.T) {
 	var got []int
-	err := forEachPage(context.Background(), fakePager([]int{1, 2, 3}), func(page int) error {
+	err := forEachPage(context.Background(), fakePager([]int{1, 2, 3}), nil, func(page int) error {
 		got = append(got, page)
 		return nil
 	})
@@ -1089,7 +1089,7 @@ func TestForEachPage(t *testing.T) {
 
 	// A paging error aborts the walk, classified for the caller.
 	got = nil
-	err = forEachPage(context.Background(), fakePager([]int{1, -1, 3}), func(page int) error {
+	err = forEachPage(context.Background(), fakePager([]int{1, -1, 3}), nil, func(page int) error {
 		got = append(got, page)
 		return nil
 	})
@@ -1099,7 +1099,7 @@ func TestForEachPage(t *testing.T) {
 
 	// An fn error aborts the walk too.
 	boom := errors.New("boom")
-	err = forEachPage(context.Background(), fakePager([]int{1, 2}), func(int) error { return boom })
+	err = forEachPage(context.Background(), fakePager([]int{1, 2}), nil, func(int) error { return boom })
 	if !errors.Is(err, boom) {
 		t.Errorf("fn error not propagated: %v", err)
 	}
