@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 // TestPruneGHCRRechecksBeforeDeleting: GitHub numbers the pages of a version

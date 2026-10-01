@@ -11,8 +11,8 @@ import (
 
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/rules"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/rules"
 )
 
 // testManifest builds a manifest in repository "r" with the given digest,

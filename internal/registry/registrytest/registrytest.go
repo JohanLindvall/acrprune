@@ -14,7 +14,7 @@ import (
 	"github.com/opencontainers/image-spec/specs-go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 var (

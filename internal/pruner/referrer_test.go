@@ -12,9 +12,9 @@ import (
 	godigest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/registry/registrytest"
-	"github.com/JohanLindvall/acrprune/internal/rules"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
+	"github.com/JohanLindvall/crprune/internal/rules"
 )
 
 func TestReferrerFollowsSubject(t *testing.T) {

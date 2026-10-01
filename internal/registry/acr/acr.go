@@ -15,7 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/containers/azcontainerregistry"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 var (
@@ -82,7 +82,7 @@ func newBackend(opts Options, retry retryPolicy) (*Backend, error) {
 		c, err := azcontainerregistry.NewClient(opts.Endpoint, opts.Credential, &azcontainerregistry.ClientOptions{
 			ClientOptions: azcore.ClientOptions{
 				Transport: transport,
-				Telemetry: policy.TelemetryOptions{ApplicationID: "acrprune"},
+				Telemetry: policy.TelemetryOptions{ApplicationID: "crprune"},
 				// retryPolicy replaces the SDK's retries, which are silent
 				// and give up on throttling within seconds. The token
 				// exchanges of the client's challenge authentication use

@@ -16,17 +16,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry/ghcr"
+	"github.com/JohanLindvall/crprune/internal/registry/ghcr"
 )
 
 // TestHelperProcess is no test of its own: the signal tests run it as a
-// child process, running acrprune with the arguments after "--". It prints
-// "ready" on stderr once acrprune handles signals and waits: for its input on
+// child process, running crprune with the arguments after "--". It prints
+// "ready" on stderr once crprune handles signals and waits: for its input on
 // stdin, which no context cancels, or, with GH_TOKEN set, for the context
 // while connecting to GHCR. It prints "terminal restored" where a second
 // signal restores the terminal.
 func TestHelperProcess(t *testing.T) {
-	if os.Getenv("ACRPRUNE_HELPER_PROCESS") != "1" {
+	if os.Getenv("CRPRUNE_HELPER_PROCESS") != "1" {
 		return
 	}
 	stdinIsTerminal = func() bool {
@@ -40,7 +40,7 @@ func TestHelperProcess(t *testing.T) {
 	}
 	restoreTerminal = func() { fmt.Fprintln(os.Stderr, "terminal restored") }
 	args := os.Args[slices.Index(os.Args, "--")+1:]
-	os.Exit(run(append([]string{"acrprune"}, args...)))
+	os.Exit(run(append([]string{"crprune"}, args...)))
 }
 
 // output collects what the child process writes to stderr, and closes ready
@@ -68,13 +68,13 @@ func (o *output) String() string {
 	return o.text.String()
 }
 
-// startWaiting starts acrprune with args in a child process, as
+// startWaiting starts crprune with args in a child process, as
 // TestHelperProcess describes, and returns once it waits, with what it writes
 // to stderr.
 func startWaiting(t *testing.T, env []string, args ...string) (*exec.Cmd, *output) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], append([]string{"-test.run=^TestHelperProcess$", "--"}, args...)...)
-	cmd.Env = append(append(os.Environ(), "ACRPRUNE_HELPER_PROCESS=1"), env...)
+	cmd.Env = append(append(os.Environ(), "CRPRUNE_HELPER_PROCESS=1"), env...)
 	// Keep stdin open, so that reading it waits.
 	if _, err := cmd.StdinPipe(); err != nil {
 		t.Fatal(err)

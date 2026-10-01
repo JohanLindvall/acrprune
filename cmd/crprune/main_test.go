@@ -18,8 +18,8 @@ import (
 
 	"github.com/urfave/cli/v3"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/registry/registrytest"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 )
 
 // flagByName returns the root-level flag exposing the given name, or nil.
@@ -78,7 +78,7 @@ func TestVersionFlag(t *testing.T) {
 	version = "test-1.2.3"
 
 	got, runErr := captureStdout(t, func() error {
-		return newCommand().Run(context.Background(), []string{"acrprune", "--version"})
+		return newCommand().Run(context.Background(), []string{"crprune", "--version"})
 	})
 	if runErr != nil {
 		t.Fatalf("--version returned error: %v", runErr)
@@ -105,7 +105,7 @@ func TestTopRunsWithoutRegistry(t *testing.T) {
 	}
 
 	got, runErr := captureStdout(t, func() error {
-		return newCommand().Run(context.Background(), []string{"acrprune", "top", "--input", statsFile, "-k", "1"})
+		return newCommand().Run(context.Background(), []string{"crprune", "top", "--input", statsFile, "-k", "1"})
 	})
 	if runErr != nil {
 		t.Fatalf("top returned error: %v", runErr)
@@ -127,8 +127,8 @@ func TestTopRejectsAmbiguousInputs(t *testing.T) {
 	}
 
 	for name, args := range map[string][]string{
-		"two positional files":    {"acrprune", "top", statsFile, statsFile},
-		"--input plus positional": {"acrprune", "top", "--input", statsFile, statsFile},
+		"two positional files":    {"crprune", "top", statsFile, statsFile},
+		"--input plus positional": {"crprune", "top", "--input", statsFile, statsFile},
 	} {
 		_, runErr := captureStdout(t, func() error {
 			return newCommand().Run(context.Background(), args)
@@ -175,7 +175,7 @@ func TestGenerateForGHCR(t *testing.T) {
 	withStdin(t, "ghcr.io/acme/app:v1\nghcr.io/acme/team/api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\nghcr.io/other/app:v2\n")
 
 	got, runErr := captureStdout(t, func() error {
-		return newCommand().Run(context.Background(), []string{"acrprune", "-r", "ghcr.io/Acme", "generate"})
+		return newCommand().Run(context.Background(), []string{"crprune", "-r", "ghcr.io/Acme", "generate"})
 	})
 	if runErr != nil {
 		t.Fatalf("generate returned error: %v", runErr)
@@ -203,13 +203,13 @@ func TestRegistryFlagValidation(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"acrprune", "stats"}, "--registry"},
-		{[]string{"acrprune", "prune", "--in", rules}, "--registry"},
-		{[]string{"acrprune", "generate"}, "--registry"},
-		{[]string{"acrprune", "-r", "ghcr.io", "stats"}, "ghcr.io/<owner>"},
-		{[]string{"acrprune", "-r", "quay.io/acme", "prune", "--in", rules}, "unsupported registry"},
-		{[]string{"acrprune", "-r", "ghcr.io/acme", "stats"}, "no GitHub token"},
-		{[]string{"acrprune", "-r", "ghcr.io/acme", "prune", "--in", rules}, "no GitHub token"},
+		{[]string{"crprune", "stats"}, "--registry"},
+		{[]string{"crprune", "prune", "--in", rules}, "--registry"},
+		{[]string{"crprune", "generate"}, "--registry"},
+		{[]string{"crprune", "-r", "ghcr.io", "stats"}, "ghcr.io/<owner>"},
+		{[]string{"crprune", "-r", "quay.io/acme", "prune", "--in", rules}, "unsupported registry"},
+		{[]string{"crprune", "-r", "ghcr.io/acme", "stats"}, "no GitHub token"},
+		{[]string{"crprune", "-r", "ghcr.io/acme", "prune", "--in", rules}, "no GitHub token"},
 	}
 	for _, tt := range tests {
 		_, runErr := captureStdout(t, func() error {
@@ -337,7 +337,7 @@ func TestGenerateWarnsWhenNothingMatches(t *testing.T) {
 	stderr := captureStderr(t)
 	withStdin(t, "otherreg.azurecr.io/app:v1\n")
 	got, err := captureStdout(t, func() error {
-		return newCommand().Run(context.Background(), []string{"acrprune", "-r", "myreg", "generate"})
+		return newCommand().Run(context.Background(), []string{"crprune", "-r", "myreg", "generate"})
 	})
 	if err != nil || strings.TrimSpace(got) != "[]" {
 		t.Fatalf("generate = %q, %v; want an empty rule file", got, err)
@@ -359,7 +359,7 @@ func TestPruneReportsRuleProblems(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := registrytest.New()
-	err := commandForBackend(fake).Run(t.Context(), []string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--input", broken})
+	err := commandForBackend(fake).Run(t.Context(), []string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--input", broken})
 	if want := "rule file " + broken + ": line 2, column 18: duplicate key \"repo\""; err == nil || !strings.Contains(err.Error(), want) {
 		t.Errorf("error = %v, want it to contain %q", err, want)
 	}
@@ -368,7 +368,7 @@ func TestPruneReportsRuleProblems(t *testing.T) {
 	if err := os.WriteFile(shadowed, []byte(`[{"repo": ".+", "untagged": [{"match_older": "30d", "keep": false}]}, {"repo": "^app$"}]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := commandForBackend(fake).Run(t.Context(), []string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--input", shadowed}); err != nil {
+	if err := commandForBackend(fake).Run(t.Context(), []string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--input", shadowed}); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"level=WARN", "Rule never applies", "rule 2 never applies: rule 1 (repo \\\".+\\\") before it matches every repository"} {
@@ -401,7 +401,7 @@ func TestUnusableCacheFailsFast(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := captureStdout(t, func() error {
-		return newCommand().Run(context.Background(), []string{"acrprune", "-r", "myreg", "--cache", file, "--progress", "plain", "stats"})
+		return newCommand().Run(context.Background(), []string{"crprune", "-r", "myreg", "--cache", file, "--progress", "plain", "stats"})
 	})
 	if err == nil || !strings.Contains(err.Error(), "--cache") {
 		t.Errorf("error = %v, want the unusable --cache reported", err)
@@ -508,14 +508,14 @@ func TestImplicitStdinOnTerminal(t *testing.T) {
 			t.Error("connected without input")
 			return nil, errors.New("unexpected connection")
 		})
-		err := cmd.Run(t.Context(), append([]string{"acrprune", "--progress=plain"}, tt.args...))
+		err := cmd.Run(t.Context(), append([]string{"crprune", "--progress=plain"}, tt.args...))
 		if err == nil || !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "--input -") {
 			t.Errorf("%v: error = %v, want %q and the --input - hint", tt.args, err, tt.want)
 		}
 	}
 
 	withStdin(t, "[]")
-	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "top", "--input", "-"}) })
+	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "top", "--input", "-"}) })
 	if err != nil || !strings.Contains(out, "NAME") {
 		t.Errorf("top --input - on a terminal: output %q, error %v", out, err)
 	}
@@ -529,7 +529,7 @@ func TestTopInputs(t *testing.T) {
 	if err := os.WriteFile(statsFile, []byte(`[{"name": "alloy", "unique": 2816819627}]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "top", statsFile}) })
+	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "top", statsFile}) })
 	if err != nil || !strings.Contains(out, "alloy") {
 		t.Errorf("top FILE: output %q, error %v", out, err)
 	}
@@ -542,7 +542,7 @@ func TestTopInputs(t *testing.T) {
 		{broken, "statistics file " + broken + ": line 2, column 20: invalid character '}'"},
 		{filepath.Join(dir, "missing.json"), "statistics file: open " + filepath.Join(dir, "missing.json")},
 	} {
-		_, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "top", tt.path}) })
+		_, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "top", tt.path}) })
 		if err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("error = %v, want it to contain %q", err, tt.want)
 		}
@@ -574,7 +574,7 @@ func TestGenerateFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "rules.json")
-	if err := newCommand().Run(t.Context(), []string{"acrprune", "-r", "myreg", "generate", "--input", images, "-o", out}); err != nil {
+	if err := newCommand().Run(t.Context(), []string{"crprune", "-r", "myreg", "generate", "--input", images, "-o", out}); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(out)
@@ -609,15 +609,15 @@ func TestFlagsExplainThemselves(t *testing.T) {
 // TestUnknownCommandSuggests: a mistyped command used to be reported as "No
 // help topic", without the command meant; a command like none suggested "".
 func TestUnknownCommandSuggests(t *testing.T) {
-	_, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "stat"}) })
+	_, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "stat"}) })
 	if err == nil || !strings.Contains(err.Error(), `unknown command "stat"; did you mean "stats"?`) {
 		t.Errorf("error = %v, want a suggestion", err)
 	}
-	_, err = captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "xyzzy"}) })
+	_, err = captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "xyzzy"}) })
 	if err == nil || err.Error() != `unknown command "xyzzy" (see --help)` {
 		t.Errorf("error = %v, want no suggestion", err)
 	}
-	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune"}) })
+	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune"}) })
 	if err != nil || !strings.Contains(out, "COMMANDS:") {
 		t.Errorf("no command: output %q, error %v; want the help", out, err)
 	}

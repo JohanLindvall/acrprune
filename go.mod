@@ -1,4 +1,4 @@
-module github.com/JohanLindvall/acrprune
+module github.com/JohanLindvall/crprune
 
 go 1.26.0
 

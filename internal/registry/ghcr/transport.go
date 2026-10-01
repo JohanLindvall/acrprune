@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 // maxErrorBody bounds how much of an error response is read.

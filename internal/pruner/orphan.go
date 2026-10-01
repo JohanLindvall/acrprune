@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/rules"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/rules"
 )
 
 // markOrphans flags manifests whose dependency chain is broken, and records

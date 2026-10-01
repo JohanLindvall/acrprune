@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 
 	"golang.org/x/sync/singleflight"
 )

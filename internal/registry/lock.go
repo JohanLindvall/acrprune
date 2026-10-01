@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/imageref"
+	"github.com/JohanLindvall/crprune/internal/imageref"
 )
 
 // relockTimeout bounds how long restoring the locks of a failed deletion may

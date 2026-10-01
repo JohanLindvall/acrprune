@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 func TestRetriesTruncatedSuccessBodies(t *testing.T) {

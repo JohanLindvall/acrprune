@@ -11,7 +11,7 @@ import (
 
 	"github.com/opencontainers/go-digest"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 func TestManifestReadRetriesTruncatedBody(t *testing.T) {

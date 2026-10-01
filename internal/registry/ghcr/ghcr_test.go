@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry"
 )
 
 var ctx = context.Background()

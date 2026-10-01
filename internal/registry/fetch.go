@@ -17,8 +17,8 @@ import (
 	godigest "github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
-	"github.com/JohanLindvall/acrprune/internal/imageref"
-	"github.com/JohanLindvall/acrprune/internal/progress"
+	"github.com/JohanLindvall/crprune/internal/imageref"
+	"github.com/JohanLindvall/crprune/internal/progress"
 )
 
 // ManifestMediaTypes is the Accept header for manifest downloads, listing the

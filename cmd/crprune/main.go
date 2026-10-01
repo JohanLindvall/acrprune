@@ -1,4 +1,4 @@
-// Command acrprune prunes manifests and repositories of Azure Container
+// Command crprune prunes manifests and repositories of Azure Container
 // Registry and GitHub Container Registry using declarative JSON rules.
 package main
 
@@ -23,13 +23,13 @@ import (
 	"github.com/urfave/cli/v3"
 	"golang.org/x/term"
 
-	"github.com/JohanLindvall/acrprune/internal/fileio"
-	"github.com/JohanLindvall/acrprune/internal/progress"
-	"github.com/JohanLindvall/acrprune/internal/pruner"
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/registry/acr"
-	"github.com/JohanLindvall/acrprune/internal/registry/ghcr"
-	"github.com/JohanLindvall/acrprune/internal/rules"
+	"github.com/JohanLindvall/crprune/internal/fileio"
+	"github.com/JohanLindvall/crprune/internal/progress"
+	"github.com/JohanLindvall/crprune/internal/pruner"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry/acr"
+	"github.com/JohanLindvall/crprune/internal/registry/ghcr"
+	"github.com/JohanLindvall/crprune/internal/rules"
 )
 
 // version is set at build time via -ldflags "-X main.version=...". Other
@@ -103,7 +103,7 @@ func resolveVersion(info *debug.BuildInfo, ok bool) string {
 	return info.Main.Version
 }
 
-// newCommand builds the acrprune CLI command tree. It is split out from main
+// newCommand builds the crprune CLI command tree. It is split out from main
 // so tests can inspect the flag wiring.
 func newCommand() *cli.Command {
 	return newCommandWithConnector(connect)
@@ -122,7 +122,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 	cli.VersionFlag = &cli.BoolFlag{Name: "version", Usage: "print the version"}
 
 	cmd := &cli.Command{
-		Name:    "acrprune",
+		Name:    "crprune",
 		Version: resolveVersion(debug.ReadBuildInfo()),
 		Usage:   "prune Azure Container Registry and GitHub Container Registry manifests using declarative rules",
 		// Only an unknown command reaches the root action with arguments;

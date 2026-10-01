@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/progress"
-	"github.com/JohanLindvall/acrprune/internal/pruner"
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/registry/ghcr"
-	"github.com/JohanLindvall/acrprune/internal/registry/registrytest"
+	"github.com/JohanLindvall/crprune/internal/progress"
+	"github.com/JohanLindvall/crprune/internal/pruner"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry/ghcr"
+	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 	"github.com/urfave/cli/v3"
 )
 
@@ -32,7 +32,7 @@ func TestPruneCommandDryRunAndDeletion(t *testing.T) {
 	}
 	fake := registrytest.New()
 	fake.Add("app", registrytest.Image("old"), registry.Attributes{LastUpdated: time.Now().Add(-48 * time.Hour)})
-	args := []string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--input", path}
+	args := []string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--input", path}
 	if err := commandForBackend(fake).Run(t.Context(), args); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestPruneCommandProtectsRunningImages(t *testing.T) {
 	running := fake.Add("app", registrytest.Image("v1"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old})
 	fake.Add("app", registrytest.Image("v0"), registry.Attributes{Tags: []string{"v0"}, LastUpdated: old})
 
-	args := []string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", rulePath, "--running", runningPath}
+	args := []string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", rulePath, "--running", runningPath}
 	if err := commandForBackend(fake).Run(t.Context(), args); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestStatsKeepsSnapshotsOnFailure(t *testing.T) {
 	boom := errors.New("API unavailable")
 	fake := registrytest.New()
 	fake.Fail = func(string, string) error { return boom }
-	args := []string{"acrprune", "--progress=plain", "-r", "myreg", "stats", "--output", path}
+	args := []string{"crprune", "--progress=plain", "-r", "myreg", "stats", "--output", path}
 	if err := commandForBackend(fake).Run(t.Context(), args); !errors.Is(err, boom) {
 		t.Fatalf("error=%v", err)
 	}
@@ -145,7 +145,7 @@ func TestPruneCommandGracePeriod(t *testing.T) {
 	} {
 		fake := registrytest.New()
 		fake.Add("app", registrytest.Image("a"), registry.Attributes{LastUpdated: time.Now().Add(-tt.age)})
-		args := append([]string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", path}, tt.args...)
+		args := append([]string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", path}, tt.args...)
 		if err := commandForBackend(fake).Run(t.Context(), args); err != nil {
 			t.Fatal(err)
 		}
@@ -168,7 +168,7 @@ func TestPruneCommandIncludeLocked(t *testing.T) {
 		old := time.Now().Add(-48 * time.Hour)
 		locked := fake.Add("app", registrytest.Image("v1"), registry.Attributes{Tags: []string{"v1"}, LastUpdated: old, Locked: true})
 		fake.Add("app", registrytest.Image("v0"), registry.Attributes{Tags: []string{"v0"}, LastUpdated: old})
-		args := []string{"acrprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", path}
+		args := []string{"crprune", "--progress=plain", "-r", "myreg", "prune", "--dry-run=false", "--input", path}
 		if includeLocked {
 			args = append(args, "--include-locked")
 		}
@@ -202,7 +202,7 @@ func TestStatsThrottlesSnapshots(t *testing.T) {
 		}
 		return nil
 	}
-	if err := commandForBackend(fake).Run(t.Context(), []string{"acrprune", "--progress=plain", "-r", "myreg", "stats", "-o", path}); err != nil {
+	if err := commandForBackend(fake).Run(t.Context(), []string{"crprune", "--progress=plain", "-r", "myreg", "stats", "-o", path}); err != nil {
 		t.Fatal(err)
 	}
 	if stats, err := pruner.ReadStats(bytes.NewReader(snapshot)); err != nil || len(stats) != 1 {
@@ -236,7 +236,7 @@ func TestStatsWritesStdoutAfterDisplay(t *testing.T) {
 	fake := registrytest.New()
 	fake.Add("app", registrytest.Image("a"), registry.Attributes{})
 	out, err := captureStdout(t, func() error {
-		return commandForBackend(fake).Run(t.Context(), []string{"acrprune", "-r", "myreg", "stats"})
+		return commandForBackend(fake).Run(t.Context(), []string{"crprune", "-r", "myreg", "stats"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -273,7 +273,7 @@ func TestGHCRNeedsDeleteScopeOnlyForLivePrunes(t *testing.T) {
 			got = &opts.NeedDelete
 			return nil, stop
 		}
-		err := newCommand().Run(t.Context(), append([]string{"acrprune", "--progress=plain", "-r", "ghcr.io/acme"}, tt.args...))
+		err := newCommand().Run(t.Context(), append([]string{"crprune", "--progress=plain", "-r", "ghcr.io/acme"}, tt.args...))
 		if !errors.Is(err, stop) || got == nil || *got != tt.want {
 			t.Errorf("%v: error %v, NeedDelete %v; want %v", tt.args, err, got, tt.want)
 		}
@@ -317,7 +317,7 @@ func TestCommandRejectsInputsBeforeConnecting(t *testing.T) {
 			t.Errorf("%v: connected before validating inputs", args)
 			return nil, errors.New("unexpected connection")
 		})
-		if err := cmd.Run(t.Context(), append([]string{"acrprune", "--progress=plain", "-r", "myreg"}, args...)); err == nil {
+		if err := cmd.Run(t.Context(), append([]string{"crprune", "--progress=plain", "-r", "myreg"}, args...)); err == nil {
 			t.Errorf("accepted %v", args)
 		}
 	}
@@ -325,13 +325,13 @@ func TestCommandRejectsInputsBeforeConnecting(t *testing.T) {
 
 func TestExplicitStandardStreams(t *testing.T) {
 	withStdin(t, "[]")
-	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"acrprune", "top", "--input=-"}) })
+	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "top", "--input=-"}) })
 	if err != nil || !strings.Contains(out, "NAME") {
 		t.Fatalf("stdout=%q error=%v", out, err)
 	}
 	fake := registrytest.New()
 	out, err = captureStdout(t, func() error {
-		return commandForBackend(fake).Run(t.Context(), []string{"acrprune", "--progress=plain", "-r", "test", "stats", "--out=-"})
+		return commandForBackend(fake).Run(t.Context(), []string{"crprune", "--progress=plain", "-r", "test", "stats", "--out=-"})
 	})
 	if err != nil || strings.TrimSpace(out) != "[]" {
 		t.Fatalf("JSON stdout=%q error=%v", out, err)

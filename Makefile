@@ -1,5 +1,5 @@
-BINARY  := acrprune
-PKG     := ./cmd/acrprune
+BINARY  := crprune
+PKG     := ./cmd/crprune
 DISTDIR := dist
 
 # Version is derived from git and injected into the binary. Override on the

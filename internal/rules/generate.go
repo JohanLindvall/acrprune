@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/JohanLindvall/acrprune/internal/imageref"
+	"github.com/JohanLindvall/crprune/internal/imageref"
 )
 
 // repoKeeps accumulates what one repository's rule must keep.

@@ -33,7 +33,7 @@ func draw(screen tcell.Screen, s Snapshot, opts Options, v *viewState, now time.
 			mode = "DRY RUN"
 		}
 	}
-	put(0, accent, "ACRPRUNE  /  "+mode+"  /  "+opts.Registry)
+	put(0, accent, "CRPRUNE  /  "+mode+"  /  "+opts.Registry)
 	elapsed := max(now.Sub(s.Started), 0).Round(time.Second)
 	phase := s.Phase
 	if v.canceling {

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/JohanLindvall/acrprune/internal/registry"
-	"github.com/JohanLindvall/acrprune/internal/rules"
+	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/rules"
 )
 
 // evaluator decides, for a single repository under a single repository rule,

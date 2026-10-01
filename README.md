@@ -1,4 +1,4 @@
-# acrprune
+# crprune
 
 A Go tool that cleans up Azure Container Registry (ACR) and GitHub Container Registry (GHCR, `ghcr.io`) with declarative JSON rules. It prunes manifests by tag pattern, age, architecture and orphan status, and deletes entire repositories that become empty or match bulk-delete criteria.
 
@@ -9,10 +9,10 @@ A Go tool that cleans up Azure Container Registry (ACR) and GitHub Container Reg
 Requires Go 1.26 or later.
 
 ```sh
-go install github.com/JohanLindvall/acrprune/cmd/acrprune@latest
+go install github.com/JohanLindvall/crprune/cmd/crprune@latest
 ```
 
-`acrprune --version` prints the version `make build` and the release archives set, or else the module version Go recorded, such as `v0.2.0` for `go install …@v0.2.0`.
+`crprune --version` prints the version `make build` and the release archives set, or else the module version Go recorded, such as `v0.2.0` for `go install …@v0.2.0`.
 
 ## Authentication
 
@@ -20,28 +20,28 @@ go install github.com/JohanLindvall/acrprune/cmd/acrprune@latest
 
 Uses the Azure SDK's `DefaultAzureCredential` (environment variables, managed identity, Azure CLI, etc.).
 
-The registry token a credential obtains is valid for every registry the identity can reach, so acrprune sends Azure credentials only to ACR login servers: a registry name, or a host ending in `.azurecr.io`, `.azurecr.cn` or `.azurecr.us`, dedicated data endpoints such as `myreg-abc123.azurecr.io` included. Any other host is refused, look-alikes and typos like `myreg.azurecr.co` included. List another cloud's or a private suffix explicitly, comma-separated: `ACRPRUNE_ACR_SUFFIXES=.azurecr.de`.
+The registry token a credential obtains is valid for every registry the identity can reach, so crprune sends Azure credentials only to ACR login servers: a registry name, or a host ending in `.azurecr.io`, `.azurecr.cn` or `.azurecr.us`, dedicated data endpoints such as `myreg-abc123.azurecr.io` included. Any other host is refused, look-alikes and typos like `myreg.azurecr.co` included. List another cloud's or a private suffix explicitly, comma-separated: `CRPRUNE_ACR_SUFFIXES=.azurecr.de`.
 
 For Azure China (`.azurecr.cn`) and Azure Government (`.azurecr.us`) login servers, environment, workload identity and other Entra ID credentials authenticate against that cloud's authority. `AZURE_AUTHORITY_HOST` chooses the authority explicitly and takes precedence. The Azure CLI credential follows `az cloud set` either way.
 
 #### ABAC registries and scoped permissions
 
-acrprune works with [ABAC-enabled registries](https://learn.microsoft.com/azure/container-registry/container-registry-rbac-abac-repository-permissions), which grant permissions per repository. The `azcontainerregistry` SDK authenticates by challenge, requesting an access token scoped to exactly the repository each request touches: no wildcard scope is required, and there is no batch size to tune. So:
+crprune works with [ABAC-enabled registries](https://learn.microsoft.com/azure/container-registry/container-registry-rbac-abac-repository-permissions), which grant permissions per repository. The `azcontainerregistry` SDK authenticates by challenge, requesting an access token scoped to exactly the repository each request touches: no wildcard scope is required, and there is no batch size to tune. So:
 
-- **The catalog is listed only when needed.** When every rule targets a literal repository (`^name$`), acrprune addresses those repositories directly, and the `Container Registry Repository Catalog Lister` role is not required. Only a repository regex needs the listing; if it is denied, acrprune reports the missing role and suggests literal patterns.
+- **The catalog is listed only when needed.** When every rule targets a literal repository (`^name$`), crprune addresses those repositories directly, and the `Container Registry Repository Catalog Lister` role is not required. Only a repository regex needs the listing; if it is denied, crprune reports the missing role and suggests literal patterns.
 - **Partial access is tolerated.** A repository the caller cannot access is skipped, logging how many were pruned, denied and remaining, instead of aborting the run, which exits non-zero at the end listing the denied repositories. When *every* repository is denied, the error suggests checking the credential itself. `statistics` likewise skips denied repositories, still writes the others' statistics, and exits non-zero. To purge only what you own, prefer literal `^repo$` patterns.
 
 ### GitHub Container Registry
 
 Uses a GitHub token: `GH_TOKEN`, else `GITHUB_TOKEN`, else the [GitHub CLI](https://cli.github.com/)'s login (`gh auth token`).
 
-The token needs the `read:packages` scope, and `delete:packages` to prune. The packages API accepts [personal access tokens (classic)](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages#about-scopes-and-permissions-for-package-registries), not fine-grained ones. Classic tokens and GitHub CLI logins report their scopes, which acrprune checks before scanning: it refuses a token without `read:packages` (or `write:packages`, which includes it), and, for `prune --dry-run=false`, one without `delete:packages`. `gh auth refresh --scopes read:packages,delete:packages` gives a GitHub CLI login both. GitHub App tokens, such as a workflow's `GITHUB_TOKEN`, report no scopes; their permissions show only in use.
+The token needs the `read:packages` scope, and `delete:packages` to prune. The packages API accepts [personal access tokens (classic)](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages#about-scopes-and-permissions-for-package-registries), not fine-grained ones. Classic tokens and GitHub CLI logins report their scopes, which crprune checks before scanning: it refuses a token without `read:packages` (or `write:packages`, which includes it), and, for `prune --dry-run=false`, one without `delete:packages`. `gh auth refresh --scopes read:packages,delete:packages` gives a GitHub CLI login both. GitHub App tokens, such as a workflow's `GITHUB_TOKEN`, report no scopes; their permissions show only in use.
 
-Deleting requires admin access to the package. GitHub answers a deletion without it with 404, as if the version were already gone, so acrprune looks the version or package up again and counts a 404 as deleted only when it really is gone; the package is skipped and reported like a denied ACR repository. In GitHub Actions, grant the job `permissions: packages: write`, and give the workflow's repository the Admin role in each package's *Manage Actions access* settings, so that its `GITHUB_TOKEN` may delete.
+Deleting requires admin access to the package. GitHub answers a deletion without it with 404, as if the version were already gone, so crprune looks the version or package up again and counts a 404 as deleted only when it really is gone; the package is skipped and reported like a denied ACR repository. In GitHub Actions, grant the job `permissions: packages: write`, and give the workflow's repository the Admin role in each package's *Manage Actions access* settings, so that its `GITHUB_TOKEN` may delete.
 
 ```sh
 export GH_TOKEN=ghp_...
-acrprune -r ghcr.io/myorg -v prune --in rules/delete_untagged_images.json
+crprune -r ghcr.io/myorg -v prune --in rules/delete_untagged_images.json
 ```
 
 ## Global Flags
@@ -63,9 +63,9 @@ acrprune -r ghcr.io/myorg -v prune --in rules/delete_untagged_images.json
 `prune` and `statistics` show a live dashboard when stderr is a terminal, drawn with [tcell](https://github.com/gdamore/tcell) directly, without a widget framework. It shows the registry, a prominent **DRY RUN / LIVE DELETE** indicator, repository progress, the current inspection phase, manifest and cache counts, keep/delete decisions (for `statistics`, manifest counts and deduplicated bytes), estimated bytes, warnings, and API retry countdowns.
 
 ```sh
-acrprune -r myregistry --progress=tui prune --in rules/delete_untagged_images.json
-acrprune -r ghcr.io/myorg stats --out stats.json
-acrprune -r myregistry --progress=plain stats > stats.json
+crprune -r myregistry --progress=tui prune --in rules/delete_untagged_images.json
+crprune -r ghcr.io/myorg stats --out stats.json
+crprune -r myregistry --progress=plain stats > stats.json
 ```
 
 | Key | Action |
@@ -87,7 +87,7 @@ The dashboard's kept/selected counts describe the plan; deleted counts reflect s
 
 `prune`, `generate` and `top` read stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose.
 
-acrprune exits with status 0 on success and 1 on failure. `Ctrl-C` or `SIGTERM` cancels a run: acrprune says it is stopping, waits for the requests in flight, restores the [locks](#locked-images) it removed for deletions this cuts short, and reports what was done. A second signal exits at once, restoring the terminal if the dashboard owns it; when deleting locked images, it warns that pending lock restores may be abandoned. A run cut short exits with status 130, or 143 for `SIGTERM`.
+crprune exits with status 0 on success and 1 on failure. `Ctrl-C` or `SIGTERM` cancels a run: crprune says it is stopping, waits for the requests in flight, restores the [locks](#locked-images) it removed for deletions this cuts short, and reports what was done. A second signal exits at once, restoring the terminal if the dashboard owns it; when deleting locked images, it warns that pending lock restores may be abandoned. A run cut short exits with status 130, or 143 for `SIGTERM`.
 
 ### `prune`
 
@@ -105,23 +105,23 @@ Deletes manifests (and empty repositories) according to a JSON rule file. By def
 
 ```sh
 # Dry run (default), listing every manifest it would delete
-acrprune -r myregistry --progress=plain prune --in rules/cleanup_feature_branches.json
+crprune -r myregistry --progress=plain prune --in rules/cleanup_feature_branches.json
 
 # Actual deletion
-acrprune -r myregistry -v prune --dry-run=false --in rules/delete_untagged_images.json
+crprune -r myregistry -v prune --dry-run=false --in rules/delete_untagged_images.json
 
 # Read rules from stdin
-cat rules/delete_orphaned_manifests.json | acrprune -r myregistry prune --dry-run=false
+cat rules/delete_orphaned_manifests.json | crprune -r myregistry prune --dry-run=false
 
 # Also delete images that have been locked for protection
-acrprune -r myregistry -v prune --dry-run=false --include-locked --in rules/delete_untagged_images.json
+crprune -r myregistry -v prune --dry-run=false --include-locked --in rules/delete_untagged_images.json
 
 # Delete repositories untouched for two years, except those still running an image
 scripts/get_pod_images.sh > images.txt &&
-  acrprune -r myregistry prune --dry-run=false --in rules/delete_old_repos.json --running images.txt
+  crprune -r myregistry prune --dry-run=false --in rules/delete_old_repos.json --running images.txt
 
 # Prune the container packages of a GitHub organization
-acrprune -r ghcr.io/myorg -v prune --dry-run=false --in rules/delete_untagged_images.json
+crprune -r ghcr.io/myorg -v prune --dry-run=false --in rules/delete_untagged_images.json
 ```
 
 #### Protected manifests
@@ -130,9 +130,9 @@ These are kept whatever the rules say: manifests updated within the grace period
 
 #### Locked images
 
-A manifest or tag whose `deleteEnabled` or `writeEnabled` attribute is `false` (see [Lock a container image](https://learn.microsoft.com/azure/container-registry/container-registry-image-lock)) is locked, and ACR refuses to delete it. acrprune protects locked manifests, and manifests carrying a locked tag, logging each (`Keeping locked manifest; use --include-locked to delete it`). To find locked tags, it lists a repository's tags when the rules would delete one of its tagged manifests, in dry runs too. Under `must_delete_everything`, it also checks the tags of retained signatures and other referrers: a lock on even a freshly pushed signature keeps the entire repository.
+A manifest or tag whose `deleteEnabled` or `writeEnabled` attribute is `false` (see [Lock a container image](https://learn.microsoft.com/azure/container-registry/container-registry-image-lock)) is locked, and ACR refuses to delete it. crprune protects locked manifests, and manifests carrying a locked tag, logging each (`Keeping locked manifest; use --include-locked to delete it`). To find locked tags, it lists a repository's tags when the rules would delete one of its tagged manifests, in dry runs too. Under `must_delete_everything`, it also checks the tags of retained signatures and other referrers: a lock on even a freshly pushed signature keeps the entire repository.
 
-**`--include-locked` bypasses this protection.** Just before deleting a locked manifest, acrprune enables delete and write on it and its locked tags, each manifest as its turn comes, so those the run never deletes stay locked: the children of an index that could not be deleted, and everything after an interruption. A whole-repository deletion unlocks the repository's locked manifests and tags just before it. If the deletion fails or the run is interrupted, the original `deleteEnabled`/`writeEnabled` values are restored, even after a failed unlock, which may have taken effect; a lock that cannot be restored is logged as a warning. A failed unlock is logged and the deletion attempted anyway; a lock whose state cannot be read is left alone. A dry run changes nothing, logging the manifests it would unlock with `locked=true`, tag locks included.
+**`--include-locked` bypasses this protection.** Just before deleting a locked manifest, crprune enables delete and write on it and its locked tags, each manifest as its turn comes, so those the run never deletes stay locked: the children of an index that could not be deleted, and everything after an interruption. A whole-repository deletion unlocks the repository's locked manifests and tags just before it. If the deletion fails or the run is interrupted, the original `deleteEnabled`/`writeEnabled` values are restored, even after a failed unlock, which may have taken effect; a lock that cannot be restored is logged as a warning. A failed unlock is logged and the deletion attempted anyway; a lock whose state cannot be read is left alone. A dry run changes nothing, logging the manifests it would unlock with `locked=true`, tag locks included.
 
 GHCR has no image locks; there the flag has no effect.
 
@@ -146,8 +146,8 @@ Writes per-repository size and manifest statistics as JSON. A named output file 
 | `--running` | | | File of running images, read as for `prune`, to count per repository |
 
 ```sh
-acrprune -r myregistry stats --out stats.json
-acrprune -r ghcr.io/myorg stats --out stats.json --running images.txt
+crprune -r myregistry stats --out stats.json
+crprune -r ghcr.io/myorg stats --out stats.json --running images.txt
 # Sort output by unique bytes:
 jq 'sort_by(.unique)' stats.json
 # Repositories running no image (with --running), largest first:
@@ -186,8 +186,8 @@ It logs how many non-empty lines it read, matched and ignored, and warns when no
 
 ```sh
 scripts/get_pod_images.sh > images.txt &&
-  acrprune -r myregistry generate --in images.txt -o keep-rules.json &&
-  acrprune -r myregistry --progress=plain prune --in keep-rules.json 2> plan.log
+  crprune -r myregistry generate --in images.txt -o keep-rules.json &&
+  crprune -r myregistry --progress=plain prune --in keep-rules.json 2> plan.log
 # Review the planned deletions in plan.log, then rerun prune with --dry-run=false.
 ```
 
@@ -240,13 +240,13 @@ Sizes and counts sort largest first, `newest` most recent first, `oldest` oldest
 
 ```sh
 # Top 20 repositories by unique (deduplicated) size
-acrprune top stats.json
+crprune top stats.json
 
 # Top 10 by total size
-acrprune top stats.json -s total -k 10
+crprune top stats.json -s total -k 10
 
 # Straight from a fresh scan
-acrprune -r myregistry stats | acrprune top -s shared
+crprune -r myregistry stats | crprune top -s shared
 ```
 
 ```text
@@ -360,8 +360,8 @@ Every example applies to all repositories. Those deleting untagged manifests als
   { "tag": "^sha(256|512)-[0-9a-f]+(\\.(sig|att|sbom))?$", "match_older": "7d", "keep": false }
   ```
 
-- Listings are a point-in-time snapshot, so before deleting anything from a repository, manifest by manifest or outright, acrprune lists it again. New or missing manifests, and changed tags, timestamps or locks (tag locks included, when loaded), mean it changed during inspection: it is skipped with nothing deleted, the other repositories are still pruned, and the run exits non-zero naming it; rerun to prune it. This also catches a manifest a concurrent deletion hid from GHCR's page-numbered listing, whose platform images would otherwise look unreferenced. A manifest listed twice during pagination skips the repository the same way, rather than a decision from conflicting attributes; a repository someone else deleted meanwhile is skipped as well. The recheck narrows the race with concurrent writers, but registries offer no atomic compare-and-delete: avoid pushes and retagging during a prune, especially while unlocking protected images.
-- A manifest in a format acrprune cannot decode (Docker schema 1, pre-release OCI artifact manifests) hides what it references, so its repository is skipped with a warning; the other repositories are still processed, and the run exits non-zero naming it. `statistics` skips such repositories, and those that change during their scan, the same way. A signed schema 1 manifest is reported as unsupported, not as a digest mismatch. Invalid descriptor digests and negative blob sizes stop the run.
+- Listings are a point-in-time snapshot, so before deleting anything from a repository, manifest by manifest or outright, crprune lists it again. New or missing manifests, and changed tags, timestamps or locks (tag locks included, when loaded), mean it changed during inspection: it is skipped with nothing deleted, the other repositories are still pruned, and the run exits non-zero naming it; rerun to prune it. This also catches a manifest a concurrent deletion hid from GHCR's page-numbered listing, whose platform images would otherwise look unreferenced. A manifest listed twice during pagination skips the repository the same way, rather than a decision from conflicting attributes; a repository someone else deleted meanwhile is skipped as well. The recheck narrows the race with concurrent writers, but registries offer no atomic compare-and-delete: avoid pushes and retagging during a prune, especially while unlocking protected images.
+- A manifest in a format crprune cannot decode (Docker schema 1, pre-release OCI artifact manifests) hides what it references, so its repository is skipped with a warning; the other repositories are still processed, and the run exits non-zero naming it. `statistics` skips such repositories, and those that change during their scan, the same way. A signed schema 1 manifest is reported as unsupported, not as a digest mismatch. Invalid descriptor digests and negative blob sizes stop the run.
 - The per-repository byte counts `prune` logs deduplicate blobs within the repository only; the registry's garbage collector may not free layers shared with other repositories.
 - A manifest is orphaned when something it references is missing, an index child or a `subject` alike; the flag propagates up to the indexes referencing it and down to its children. A child still reachable through a healthy index or its own tag is not orphaned by a broken sibling.
 - When every rule targets a literal repository name (`^name$`), only those repositories are fetched, without listing the registry. A pattern with an active metacharacter is no literal name: `^my.repo$` matches `myXrepo` too, so it is resolved by listing the catalog. `^my\.repo$` (what `generate` emits) addresses a repository with a dot in its name directly.
@@ -370,26 +370,26 @@ Every example applies to all repositories. Those deleting untagged manifests als
 ### Azure Container Registry
 
 - HTTP requests have a two-minute timeout, including reading the response body. Truncated manifest downloads are retried before content is parsed or cached. Redirects cannot change a deletion into a read or forward a mutation to another origin. Read redirects drop authentication credentials when the origin changes, and HTTPS requests never redirect to HTTP. Repeated pagination links fail instead of looping indefinitely.
-- Throttled requests (429) and failing ones (408, 500, 502, 503, 504, timeouts, connections refused, reset or cut short) are retried up to 10 times; a host name that does not resolve or a certificate that does not verify fails at once. acrprune waits as long as the registry asks (`Retry-After`, up to 3 minutes), or backs off exponentially from 2 seconds to 3 minutes, riding out about a quarter of an hour of throttling per request. Each retry is logged as a warning and counted down in the dashboard.
-- ACR access tokens are scoped to one repository and action. acrprune keeps separate clients for listing, attribute updates, and manifest content and deletion. The first request of each action on a repository fetches the token and the others reuse it, so a run exchanges only a few tokens per repository.
+- Throttled requests (429) and failing ones (408, 500, 502, 503, 504, timeouts, connections refused, reset or cut short) are retried up to 10 times; a host name that does not resolve or a certificate that does not verify fails at once. crprune waits as long as the registry asks (`Retry-After`, up to 3 minutes), or backs off exponentially from 2 seconds to 3 minutes, riding out about a quarter of an hour of throttling per request. Each retry is logged as a warning and counted down in the dashboard.
+- ACR access tokens are scoped to one repository and action. crprune keeps separate clients for listing, attribute updates, and manifest content and deletion. The first request of each action on a repository fetches the token and the others reuse it, so a run exchanges only a few tokens per repository.
 
 ### GitHub Container Registry
 
-- Repositories are the owner's container packages, and manifests their package versions. ghcr.io's registry API can neither list untagged manifests nor delete, so acrprune lists and deletes through the [GitHub REST API](https://docs.github.com/en/rest/packages/packages) and downloads manifest content from ghcr.io. Deleting a manifest deletes its package version, with every tag pointing at it.
+- Repositories are the owner's container packages, and manifests their package versions. ghcr.io's registry API can neither list untagged manifests nor delete, so crprune lists and deletes through the [GitHub REST API](https://docs.github.com/en/rest/packages/packages) and downloads manifest content from ghcr.io. Deleting a manifest deletes its package version, with every tag pointing at it.
 - A multi-platform push stores its platform images and attestations as separate, *untagged* package versions. They are kept as dependencies of the index referencing them, so cleaning up untagged versions does not break multi-platform images.
-- GHCR refuses to delete a package's last tagged version ("You must delete the package instead"). When the rules would keep only untagged manifests of a package (a digest-pinned running image, say), acrprune also keeps the newest tagged image, with its dependencies and signatures, and logs a warning. When the rules keep nothing, the whole package is deleted. Deleted packages and versions can be [restored](https://docs.github.com/en/packages/learn-github-packages/deleting-and-restoring-a-package) for 30 days.
+- GHCR refuses to delete a package's last tagged version ("You must delete the package instead"). When the rules would keep only untagged manifests of a package (a digest-pinned running image, say), crprune also keeps the newest tagged image, with its dependencies and signatures, and logs a warning. When the rules keep nothing, the whole package is deleted. Deleted packages and versions can be [restored](https://docs.github.com/en/packages/learn-github-packages/deleting-and-restoring-a-package) for 30 days.
 - GHCR reports no image platforms. Images an index references take theirs from the index; for single-platform images, rules using `arch` or `os` download the image config (once per distinct config, cached). Other rules download nothing extra.
 - The last-updated time is the package version's `updated_at`.
-- GitHub rate limits are honoured. A throttled request pauses all of acrprune's GitHub requests, so that parallel workers do not keep hitting the limit, for as long as GitHub asks (`Retry-After`, or until the limit resets, by GitHub's `Date` header rather than the local clock). A secondary limit giving no wait time is waited out for a minute, doubling while it persists until a request gets through. Throttled requests are retried, with a warning, for up to two hours per request, riding out GitHub's hourly limits during a large cleanup. Server and network errors are retried a few times with exponential backoff.
+- GitHub rate limits are honoured. A throttled request pauses all of crprune's GitHub requests, so that parallel workers do not keep hitting the limit, for as long as GitHub asks (`Retry-After`, or until the limit resets, by GitHub's `Date` header rather than the local clock). A secondary limit giving no wait time is waited out for a minute, doubling while it persists until a request gets through. Throttled requests are retried, with a warning, for up to two hours per request, riding out GitHub's hourly limits during a large cleanup. Server and network errors are retried a few times with exponential backoff.
 - Workers recheck a shared pause after waiting, so a later response extending the rate limit delays them too. Permanent DNS, certificate and redirect-policy failures fail immediately. Truncated success responses are retried, and response documents are bounded to 16 MiB. GHCR uses the same credential and method protections on redirects as ACR, including blob-storage redirects.
 - GitHub answers 404 both for a package that does not exist and for a private package the token may not read, so a literally named package (`^name$`) the token cannot see is reported missing rather than denied. If a package you expect is reported missing, check the token's access to it.
-- GitHub does not let a public package be deleted, in whole or in part, once one of its versions has been downloaded more than 5,000 times; acrprune reports GitHub's error for such a package.
+- GitHub does not let a public package be deleted, in whole or in part, once one of its versions has been downloaded more than 5,000 times; crprune reports GitHub's error for such a package.
 
 ## Package Layout
 
 | Package | Responsibility |
 |---------|----------------|
-| `cmd/acrprune` | CLI wiring (flags, commands, I/O, credentials, signals) |
+| `cmd/crprune` | CLI wiring (flags, commands, I/O, credentials, signals) |
 | `internal/rules` | JSON rule format, validation/compilation, rule generation from image lists |
 | `internal/registry` | Registry-neutral access: `--registry` parsing, manifest model, parallel manifest download with digest verification, on-disk cache, platform resolution, deletion; the `Backend` interface a registry API implements |
 | `internal/registry/acr` | `Backend` for Azure Container Registry, on the `azcontainerregistry` data-plane client |
@@ -431,7 +431,7 @@ CI also runs `make vuln` with its Go 1.27 toolchain. The target builds the check
 
 - https://github.com/Azure/acr-cli
 
-acrprune adds declarative retention rules, dependency-aware cleanup, and support for both ACR and GHCR.
+crprune adds declarative retention rules, dependency-aware cleanup, and support for both ACR and GHCR.
 
 ## License
 

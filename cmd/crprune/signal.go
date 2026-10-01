@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/JohanLindvall/acrprune/internal/progress"
+	"github.com/JohanLindvall/crprune/internal/progress"
 )
 
 // Seams for tests: restoring the terminal from the progress display, and
