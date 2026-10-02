@@ -17,6 +17,27 @@ var (
 	exit            = os.Exit
 )
 
+// cancellationOnly recognizes a cancellation through wrappers without hiding
+// another error joined to it, such as a failure to restore an image lock.
+func cancellationOnly(err error) bool {
+	if err == context.Canceled {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() error }:
+		return cancellationOnly(wrapped.Unwrap())
+	case interface{ Unwrap() []error }:
+		errs := wrapped.Unwrap()
+		for _, inner := range errs {
+			if !cancellationOnly(inner) {
+				return false
+			}
+		}
+		return len(errs) > 0
+	}
+	return false
+}
+
 // signalCause is the cause of a run's cancellation by a signal.
 type signalCause struct {
 	os.Signal

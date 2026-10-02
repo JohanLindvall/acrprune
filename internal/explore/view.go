@@ -3,11 +3,11 @@ package explore
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/JohanLindvall/crprune/internal/pruner"
-	"github.com/JohanLindvall/crprune/internal/registry"
 	"github.com/JohanLindvall/crprune/internal/tui"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
@@ -35,7 +35,7 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 	}
 	put(1, t.Muted, a.opts.Source)
 	if a.repository != "" {
-		put(1, t.Base.Bold(true), "LIVE MANIFESTS  /  "+a.repository)
+		put(1, t.Base.Bold(true), "REPOSITORY IMAGES  /  "+a.repository)
 	}
 	if a.stale {
 		put(2, t.Warn, "Snapshot may be stale after live changes; rescan to refresh statistics")
@@ -48,12 +48,34 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 		if a.panel == "confirm" {
 			a.drawConfirmation(screen, t)
 		}
-	case a.panel == "message" || a.panel == "rule-details":
+	case a.panel == "message" || a.panel == "rule-details" || a.panel == "repository-details":
 		a.drawPage(screen, t, a.message)
 	case a.panel == "rule-picker":
 		a.drawRulePicker(screen, t)
 	case a.panel == "help":
-		a.drawPage(screen, t, []string{"KEYBOARD", "", "↑ ↓ / j k    Move through repositories, manifests, or preview targets", "PgUp / PgDn  Move a page; Home / End jumps to the first / last row", "/            Search repository names, or manifest digests and tags", "Enter / Esc  Accept search / restore previous search; Ctrl-U clears input", "s            Choose a sort column; ← / → or Tab cycles columns", "r            Reverse sort order; R reloads statistics or live manifests", "Enter        Show all details for the highlighted row", "Space        Mark / unmark a row", "a / c        Toggle all visible rows / clear all marks", "m            Browse live images and manifests of the current repository", "d            Preview deletion of marked rows, or the current row", "l / L        Choose bundled or local rules / load a JSON rule file", "p / P        Preview rules for the current repo / ALL snapshot repos", "? / Esc      Help / back; q quits; Ctrl-C interrupts", "", "The rule picker includes bundled examples and JSON files in --rules-dir (default ./rules). Enter selects one complete file; i shows its full descriptions and repository patterns. If no rules are selected, p or P opens the picker before preparing a preview.", "", "Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. All snapshot repositories includes filtered-out rows. A loaded rule only applies where its repo pattern matches.", "", "Unique bytes are charged to the first repository that referenced each blob during the original scan. Filtering does not recompute deduplication. Shared means repeated references, not reclaimable bytes. A running count of zero can mean no --running inventory was supplied. Deleting a tag's manifest removes ALL of its tags.", "", "This screen never rewrites your statistics file. After deletion, use R in the repository view to rescan live statistics, or run stats again for a file snapshot."})
+		a.drawPage(screen, t, []string{
+			"KEYBOARD", "",
+			"↑ ↓ / j k    Move through repositories, manifests, or preview targets",
+			"PgUp / PgDn  Move a page; Home / End jumps to the first / last row",
+			"/            Search names, digests, tags, platforms, or image types",
+			"Enter / Esc  Accept search / restore previous search; Ctrl-U clears input",
+			"s            Choose a sort column; ← / → or Tab cycles columns",
+			"r            Reverse sort order; R reloads statistics or live manifests",
+			"Enter        Open repository images, or full details for an image",
+			"i            Show repository statistics (also available without --registry)",
+			"Space        Mark / unmark a row",
+			"a / c        Toggle all visible rows / clear all marks",
+			"m            Browse live images from a repository row or its statistics",
+			"d            Preview deletion of marked rows, or the current row",
+			"l / L        Choose bundled or local rules / load a JSON rule file",
+			"p / P        Preview rules for the current repo / ALL snapshot repos",
+			"? / Esc      Help / back; q quits; Ctrl-C interrupts", "",
+			"Repository images include every listed manifest: tagged and untagged images, multiarch indexes, their platform children, and artifacts or referrers. Enter shows all tags, platforms, full digests, index children and parent indexes. Search for untagged, multiarch, or linux/arm64 to narrow the list. Image details require --registry; statistics files contain only aggregate counts.", "",
+			"The rule picker includes bundled examples and JSON files in --rules-dir (default ./rules). Enter selects one complete file; i shows its full descriptions and repository patterns. If no rules are selected, p or P opens the picker before preparing a preview.", "",
+			"Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. All snapshot repositories includes filtered-out rows. A loaded rule only applies where its repo pattern matches.", "",
+			"Unique bytes are charged to the first repository that referenced each blob during the original scan. Filtering does not recompute deduplication. Shared means repeated references, not reclaimable bytes. A running count of zero can mean no --running inventory was supplied. Deleting a tag's manifest removes ALL of its tags.", "",
+			"This screen never rewrites your statistics file. After deletion, use R in the repository view to rescan live statistics, or run stats again for a file snapshot.",
+		})
 	case a.panel == "sort":
 		lines := []string{"↑/↓ choose · Enter apply", ""}
 		for i, key := range a.keys() {
@@ -78,13 +100,21 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 	w, h := screen.Size()
 	l := a.list()
 	var total, unique uint64
-	var count, tagged, untagged int
+	var count, tagged, untagged, multiarch, children int
 	for _, s := range l.visible {
 		total += s.Total
 		unique += s.Unique
 		count += s.Count
 		tagged += s.Tagged
 		untagged += s.Untagged
+		if a.repository != "" {
+			if manifestKind(a.byDigest[s.Name]) == "multiarch" {
+				multiarch++
+			}
+			if len(a.parents[s.Name]) > 0 {
+				children++
+			}
+		}
 	}
 	top := 9
 	if h >= 18 && w >= 55 {
@@ -103,6 +133,8 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 			labels[0], labels[1] = "MATCHING MANIFESTS", "REFERENCED BYTES"
 			values[1] = humanize.Bytes(total)
 			notes[1] = "Includes repeated blobs"
+			labels[2], values[2] = "TAGGED / UNTAGGED", fmt.Sprintf("%d / %d", tagged, untagged)
+			notes[2] = fmt.Sprintf("%d multiarch, %d children", multiarch, children)
 		}
 		for i := range 3 {
 			x := 1 + i*(cardWidth+1)
@@ -142,6 +174,9 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 		a.drawInspector(screen, t, tableWidth+3, top-1, 36)
 	}
 	l.rows = max(1, h-top-3)
+	if a.repository != "" {
+		l.rows = max(1, l.rows/2)
+	}
 	l.clamp()
 	if a.repository == "" {
 		a.drawRepositories(screen, t, 1, top, tableWidth, direction)
@@ -170,9 +205,12 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 		status = "Enter details · Space mark · a mark visible · c clear marks"
 	}
 	tui.Text(screen, 1, h-2, w-2, t.Muted, status)
-	footer := "q quit  / search  s sort  m images  d delete  l rules  p/P preview  ? help"
+	footer := "Enter images  i stats  / search  s sort  d delete  l rules  ? help  q quit"
+	if a.opts.Client == nil {
+		footer = "Enter/i stats  / search  s sort  m images  l rules  ? help  q quit"
+	}
 	if a.repository != "" {
-		footer = "Esc repos  / search  Space mark  a all  d delete  R reload  Enter details  ? help"
+		footer = "Enter details  Esc repos  i stats  / search  R reload  ? help  q quit"
 	}
 	tui.Text(screen, 1, h-1, w-2, t.Accent, footer)
 }
@@ -300,17 +338,34 @@ func (a *app) drawRepositories(screen tcell.Screen, t tui.Theme, x, y, width int
 
 func (a *app) drawManifests(screen tcell.Screen, t tui.Theme, x, y, width int) {
 	l := &a.manifests
-	nameWidth := max(12, width-32)
+	nameWidth := width
+	if width >= 28 {
+		nameWidth -= 10
+	}
+	if width >= 50 {
+		nameWidth -= 11
+	}
+	if width >= 75 {
+		nameWidth -= 12
+	}
 	tui.Rule(screen, x, y-1, width, t, "")
 	tui.Text(screen, x+4, y-1, nameWidth-4, t.Accent, "TAGS / DIGEST")
-	tui.Text(screen, x+nameWidth, y-1, width-nameWidth, t.Muted, "TYPE       SIZE       UPDATED")
+	if width >= 28 {
+		tui.Text(screen, x+nameWidth, y-1, 9, t.Muted, "TYPE")
+	}
+	if width >= 50 {
+		tui.Text(screen, x+nameWidth+10, y-1, 10, t.Muted, "SIZE")
+	}
+	if width >= 75 {
+		tui.Text(screen, x+nameWidth+21, y-1, 11, t.Muted, "UPDATED")
+	}
 	for i := l.offset; i < min(len(l.visible), l.offset+l.rows); i++ {
 		s := l.visible[i]
 		m := a.byDigest[s.Name]
-		row, style := y+i-l.offset, t.Base
+		row, style, secondary := y+2*(i-l.offset), t.Base, t.Muted
 		if i == l.cursor {
-			style = t.Selected
-			tui.Fill(screen, x, row, width, 1, style)
+			style, secondary = t.Selected, t.Selected
+			tui.Fill(screen, x, row, width, 2, style)
 			tui.Text(screen, x, row, 1, style, "›")
 		}
 		if l.marked[s.Name] {
@@ -321,26 +376,17 @@ func (a *app) drawManifests(screen tcell.Screen, t tui.Theme, x, y, width int) {
 			label = m.Digest
 		}
 		tui.Text(screen, x+4, row, nameWidth-5, style, label)
-		tui.Text(screen, x+nameWidth, row, 10, style, manifestKind(m))
-		tui.Text(screen, x+nameWidth+11, row, 10, style, humanize.Bytes(s.Total))
-		tui.Text(screen, x+nameWidth+22, row, width-nameWidth-22, style, date(m.LastUpdated))
+		if width >= 28 {
+			tui.Text(screen, x+nameWidth, row, 9, style, manifestKind(m))
+		}
+		if width >= 50 {
+			tui.Text(screen, x+nameWidth+10, row, 10, style, humanize.Bytes(s.Total))
+		}
+		if width >= 75 {
+			tui.Text(screen, x+nameWidth+21, row, 11, style, date(m.LastUpdated))
+		}
+		tui.Text(screen, x+4, row+1, width-4, secondary, a.manifestSummary(m))
 	}
-}
-
-func manifestKind(m *registry.Manifest) string {
-	if m.IsLocked() {
-		return "locked"
-	}
-	if m.SubjectDigest() != "" {
-		return "referrer"
-	}
-	if len(m.Manifests) > 0 {
-		return "index"
-	}
-	if m.ArtifactType != "" {
-		return "artifact"
-	}
-	return "image"
 }
 
 func (a *app) drawInspector(screen tcell.Screen, t tui.Theme, x, y, width int) {
@@ -352,8 +398,13 @@ func (a *app) drawInspector(screen tcell.Screen, t tui.Theme, x, y, width int) {
 	tui.Rule(screen, x, y, width, t, "DETAILS")
 	if a.repository != "" {
 		m := a.byDigest[s.Name]
-		lines := []string{tags(m.Tags), "", manifestKind(m), humanize.Bytes(s.Total) + " referenced", date(m.LastUpdated), "", m.Digest[:min(len(m.Digest), width)], "", "Enter for full digest and tags"}
+		lines := []string{tags(m.Tags), "", manifestKind(m), manifestPlatforms(m), humanize.Bytes(s.Total) + " own referenced", date(m.LastUpdated),
+			fmt.Sprintf("%d children · %d parent indexes", len(m.Manifests), len(a.parents[m.Digest])), fmt.Sprintf("Locked: %t", m.IsLocked()), "", m.Digest, "", "Enter for full image details"}
+		_, h := screen.Size()
 		for i, line := range lines {
+			if y+2+i >= h-2 {
+				break
+			}
 			tui.Text(screen, x, y+2+i, width, t.Base, line)
 		}
 		return
@@ -419,13 +470,27 @@ func (a *app) details() {
 	s := l.visible[l.cursor]
 	if a.repository != "" {
 		m := a.byDigest[s.Name]
-		a.showMessage("MANIFEST DETAILS", a.repository, m.Digest, "Tags: "+tags(m.Tags), "Type: "+manifestKind(m), "Media type: "+m.MediaType,
-			fmt.Sprintf("Referenced size: %s (%d bytes)", humanize.Bytes(s.Total), s.Total), "Updated: "+timestamp(m.LastUpdated),
-			fmt.Sprintf("Locked: %t; child manifests: %d", m.IsLocked(), len(m.Manifests)), "Subject: "+m.SubjectDigest(), "",
-			"Deleting this manifest removes every tag above. Image indexes also select their children; a kept image's dependencies remain protected.")
+		a.showMessage("IMAGE / MANIFEST DETAILS", a.manifestDetails(m)...)
 		return
 	}
-	lines := []string{s.Name, ""}
+	a.repositoryDetails()
+}
+
+func (a *app) repositoryDetails() {
+	name := a.repository
+	if name == "" {
+		name = a.repos.current()
+	}
+	i := slices.IndexFunc(a.repos.data, func(s pruner.RepositoryStats) bool { return s.Name == name })
+	if i < 0 {
+		return
+	}
+	s := a.repos.data[i]
+	images := "Enter or m: browse all live images, including untagged manifests and index children."
+	if a.opts.Client == nil {
+		images = "This snapshot contains aggregate statistics. Reopen with --registry to browse individual images."
+	}
+	lines := []string{s.Name, images, ""}
 	for _, key := range sortKeys {
 		if key != "name" {
 			lines = append(lines, fmt.Sprintf("%-10s %s", key, statValue(s, key)))
@@ -433,7 +498,8 @@ func (a *app) details() {
 	}
 	lines = append(lines, "", fmt.Sprintf("Exact bytes: unique %d / total %d", s.Unique, s.Total), "Newest: "+timestamp(s.Newest), "Oldest: "+timestamp(s.Oldest), "",
 		"Unique bytes are attributed by the original scan order. They are not a reclaimable-storage estimate. A zero running count may mean no inventory was supplied.")
-	a.showMessage("REPOSITORY DETAILS", lines...)
+	a.showMessage("REPOSITORY STATISTICS", lines...)
+	a.panel = "repository-details"
 }
 
 func (a *app) drawPage(screen tcell.Screen, t tui.Theme, paragraphs []string) {
@@ -451,7 +517,11 @@ func (a *app) drawPage(screen tcell.Screen, t tui.Theme, paragraphs []string) {
 		}
 		tui.Text(screen, 2, 3+i, w-4, style, line)
 	}
-	tui.Text(screen, 1, h-1, w-2, t.Muted, "↑/↓ scroll · PgUp/PgDn page · Esc back · q quit")
+	footer := "↑/↓ scroll · PgUp/PgDn page · Esc back · q quit"
+	if a.panel == "repository-details" && a.opts.Client != nil {
+		footer = "Enter/m images · ↑/↓ scroll · PgUp/PgDn page · Esc back · q quit"
+	}
+	tui.Text(screen, 1, h-1, w-2, t.Muted, footer)
 }
 
 func wrap(text string, width int) []string {

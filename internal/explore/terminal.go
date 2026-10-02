@@ -96,6 +96,7 @@ type app struct {
 	repos, manifests                 listState
 	repository                       string
 	byDigest                         map[string]*registry.Manifest
+	parents                          map[string][]*registry.Manifest
 	panel, input, status             string
 	message                          []string
 	panelOffset, sortCursor          int
@@ -316,10 +317,17 @@ func (a *app) finish(r result) {
 		a.panel, a.planCursor, a.planOffset, a.input = "plan", 0, 0, ""
 	case "manifests":
 		a.repository, a.byDigest = r.repository, map[string]*registry.Manifest{}
+		a.parents = map[string][]*registry.Manifest{}
 		var data []pruner.RepositoryStats
 		labels := map[string]string{}
 		for _, m := range r.manifests {
-			a.byDigest[m.Digest], labels[m.Digest] = m, strings.Join(m.Tags, " ")
+			a.byDigest[m.Digest] = m
+			for _, child := range m.Manifests {
+				digest := string(child.Digest)
+				if !slices.Contains(a.parents[digest], m) {
+					a.parents[digest] = append(a.parents[digest], m)
+				}
+			}
 			s := pruner.RepositoryStats{Name: m.Digest, Count: 1, Total: manifestBytes(m), Newest: m.LastUpdated, Oldest: m.LastUpdated}
 			if len(m.Tags) > 0 {
 				s.Tagged = 1
@@ -328,8 +336,12 @@ func (a *app) finish(r result) {
 			}
 			data = append(data, s)
 		}
+		for _, m := range r.manifests {
+			labels[m.Digest] = strings.Join(m.Tags, " ") + " " + manifestKind(m) + " " + a.manifestSummary(m)
+		}
 		a.manifests = newList(data, "newest", "", false)
 		a.manifests.labels = labels
+		a.panel = ""
 		a.status = fmt.Sprintf("Loaded %d live manifests from %s", len(data), r.repository)
 	case "reload", "statistics":
 		old := a.repos
@@ -537,6 +549,14 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 		return false, nil
 	}
 	if a.panel != "" {
+		if a.panel == "repository-details" && (key.Key() == tcell.KeyEnter || key.Rune() == 'm') {
+			name := a.repository
+			if name == "" {
+				name = a.repos.current()
+			}
+			a.loadManifests(ctx, name)
+			return false, nil
+		}
 		switch {
 		case key.Key() == tcell.KeyEsc || key.Rune() == '?':
 			if a.panel == "rule-details" {
@@ -573,7 +593,13 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 			l.refilter(l.current())
 		}
 	case key.Key() == tcell.KeyEnter:
-		a.details()
+		if a.repository == "" && a.opts.Client != nil {
+			a.loadManifests(ctx, l.current())
+		} else {
+			a.details()
+		}
+	case key.Rune() == 'i':
+		a.repositoryDetails()
 	case key.Rune() == '/':
 		l.searching, l.beforeQuery = true, l.query
 	case key.Rune() == 's':

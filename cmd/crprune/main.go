@@ -365,6 +365,11 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 			&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "log debug messages"},
 		},
 		ExitErrHandler: func(ctx context.Context, cmd *cli.Command, err error) {
+			// Keep the interrupt exit status without reporting the user's
+			// cancellation as a failure (e.g. Ctrl-C in the explorer).
+			if cancellationOnly(err) {
+				return
+			}
 			logger.Error("An error occurred", "err", err)
 		},
 	}

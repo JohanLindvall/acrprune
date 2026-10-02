@@ -272,19 +272,26 @@ crprune -r myregistry explore --running images.txt --keep-younger 7d stats.json
 |-----|--------|
 | `↑` / `↓`, `k` / `j` | Move through rows |
 | `PgUp` / `PgDn`, `Home` / `End` | Page or jump through rows |
-| `/` | Search names, or live manifest digests and tags; `Enter` accepts, `Esc` restores the previous search, `Ctrl-U` clears input |
+| `/` | Search names, or live manifest digests, tags, platforms and types; `Enter` accepts, `Esc` restores the previous search, `Ctrl-U` clears input |
 | `s` | Choose a sort column; `←` / `→` or `Tab` cycles columns |
 | `r` | Reverse sorting |
-| `Enter` | Show full details, including exact byte counts or complete digests and tags |
+| `Enter` | Open a repository's live image list; on an image, show its full details; without `--registry`, show repository statistics |
+| `i` | Show repository statistics, including exact byte counts |
 | `Space` | Mark or unmark a row; marks survive filtering and sorting |
 | `a` / `c` | Toggle all visible marks / clear all marks |
-| `m` | Fetch and browse live images and manifests in the current repository |
+| `m` | Fetch and browse live images from a repository row or its statistics page |
 | `d` | Preview deletion of marked repositories or manifests; with no marks, use the highlighted row |
 | `l` / `L` | Choose an automatically loaded rule file / load and validate another file by path |
 | `p` / `P` | Preview the selected rules for the current repository / **all repositories in the loaded snapshot**, including filtered-out rows; opens the rule picker if nothing is selected |
 | `R` | Rescan live statistics or reload the statistics file; reload live manifests when browsing a repository |
 | `?` / `Esc` | Help / back; help and full details scroll |
 | `q` / `Ctrl-C` | Quit / interrupt; active requests and lock restores finish before the terminal closes |
+
+With `--registry`, highlight a repository and press `Enter` to see every listed manifest, including tagged and untagged images, multiarch indexes, their platform children, artifacts and referrers. Each row shows its tags or digest, type, size, update time, platforms, tag status, index membership and locks. The summary shows tagged/untagged counts and the number of multiarch indexes and index children. Search for `untagged`, `multiarch`, or `linux/arm64` to narrow the list.
+
+Press `Enter` on an image for complete tags and digests, platforms, locks, artifact/subject information, and the children or parent indexes connecting it to a multiarch image. Child descriptors also show platform variants when supplied by the registry. Sizes count each manifest's own document, config and layers; index children are counted in their own rows. `Esc` returns to the list, then to repositories. `i` opens the repository's aggregate statistics. A statistics file alone does not contain individual image details; add `--registry` to fetch them. Image browsing resolves missing platforms from image configs when supported by the registry.
+
+Ctrl-C exits with interrupt status 130 without logging cancellation as an error. Other failures, including cleanup errors accompanying an interruption, are still reported.
 
 The explorer automatically loads the bundled example rules and `*.json` files directly in `--rules-dir` (default `./rules`, relative to the working directory). Bundled rules are available even outside a checkout. Identical local copies are omitted; modified copies appear as separate choices with their own paths. The default directory may be absent; an explicitly supplied directory must exist. Invalid rule files remain visible with their errors and cannot be selected.
 

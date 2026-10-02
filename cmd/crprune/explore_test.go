@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -298,5 +299,39 @@ func TestExploreHelpExplainsSnapshotScope(t *testing.T) {
 	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "explore", "--help"}) })
 	if err != nil || !strings.Contains(out, "all snapshot repositories") || !strings.Contains(out, "--rules-dir") || !strings.Contains(out, "scans --registry") {
 		t.Fatal(out, err)
+	}
+}
+
+func TestExploreExitLogging(t *testing.T) {
+	for _, tt := range []struct {
+		name, logged string
+		err          error
+		code         int
+	}{
+		{"quit", "", nil, 0},
+		{"ctrl-c", "", context.Canceled, 130},
+		{"wrapped cancellation", "", fmt.Errorf("explore: %w", context.Canceled), 130},
+		{"timeout", "context deadline exceeded", context.DeadlineExceeded, 1},
+		{"terminal failure", "terminal event stream closed", errors.New("terminal event stream closed"), 1},
+		{"cancellation and failure", "failed to restore locks", errors.Join(context.Canceled, errors.New("failed to restore locks")), 130},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stderr := captureStderr(t)
+			withStdin(t, "[]")
+			original := runExplorer
+			t.Cleanup(func() { runExplorer = original })
+			runExplorer = func(context.Context, []pruner.RepositoryStats, explore.Options) error { return tt.err }
+			if code := run([]string{"crprune", "explore"}); code != tt.code {
+				t.Fatalf("exit status = %d, want %d", code, tt.code)
+			}
+			logs := stderr()
+			if tt.logged != "" {
+				if !strings.Contains(logs, "level=ERROR") || !strings.Contains(logs, tt.logged) {
+					t.Fatalf("failure not reported: %q", logs)
+				}
+			} else if logs != "" {
+				t.Fatalf("normal explorer exit logged an error: %q", logs)
+			}
+		})
 	}
 }

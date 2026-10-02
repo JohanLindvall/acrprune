@@ -51,7 +51,7 @@ func (c *Client) manifests(ctx context.Context, logger *slog.Logger, repository 
 		return nil, err
 	}
 	progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: repository})
-	contents, _, err := reg.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{})
+	contents, _, err := reg.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{Platforms: true})
 	if err != nil {
 		return nil, err
 	}
