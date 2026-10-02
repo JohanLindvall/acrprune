@@ -77,7 +77,7 @@ func newBackend(opts Options, retry retryPolicy) (*Backend, error) {
 		retry.logger = slog.New(slog.DiscardHandler)
 	}
 	b := &Backend{pageSize: int32(opts.PageSize)}
-	transport := registry.NewHTTPClient(nil)
+	transport := documentTransport{registry.NewHTTPClient(nil)}
 	for _, client := range []**azcontainerregistry.Client{&b.metadata, &b.updates, &b.content} {
 		c, err := azcontainerregistry.NewClient(opts.Endpoint, opts.Credential, &azcontainerregistry.ClientOptions{
 			ClientOptions: azcore.ClientOptions{

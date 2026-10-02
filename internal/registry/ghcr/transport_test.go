@@ -578,7 +578,6 @@ func TestBlobRedirectDropsAuthorization(t *testing.T) {
 // API's origin.
 func TestNextPage(t *testing.T) {
 	apiURL, _ := url.Parse("https://api.github.com")
-	b := &Backend{apiURL: apiURL}
 	tests := []struct {
 		link, want string
 		ok         bool
@@ -590,7 +589,7 @@ func TestNextPage(t *testing.T) {
 		{`<http://api.github.com/x?page=2>; rel="next"`, "", false},
 	}
 	for _, tt := range tests {
-		got, err := b.nextPage(tt.link)
+		got, err := registry.NextPage([]string{tt.link}, apiURL)
 		if got != tt.want || (err == nil) != tt.ok {
 			t.Errorf("nextPage(%q) = %q, %v; want %q, ok=%v", tt.link, got, err, tt.want, tt.ok)
 		}

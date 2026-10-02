@@ -285,13 +285,15 @@ Every cleanup first produces a **fixed preview of the digests and all tags it wi
 
 Cleanup uses the pruning engine's protections, dependency and referrer handling, last-tag handling, and lock restoration. Selecting an image index also selects its children, retaining children needed by kept images. Bulk repository deletion is all-or-nothing within each repository: a protected image keeps that repository. The default 24-hour grace period applies to manual selections too; choose `--keep-younger` when opening the explorer. Rules retain their original repository patterns and first-match behavior; selecting a repository does not force a nonmatching rule onto it. No action scoped to the snapshot can reach another repository in the registry.
 
-Before executing, the explorer verifies all affected repositories against the reviewed snapshots and checks each again immediately before deletion. Changes require a new preview and confirmation. Errors and cancellations report confirmed partial deletions, and a plan can only be executed once. Registries still offer no atomic compare-and-delete, so avoid concurrent pushes and retagging during cleanup.
+If any selected repository or listed manifest cannot be inspected, the entire preview is refused; it cannot execute a partial selection. Before executing, the explorer verifies all affected repositories against the reviewed snapshots and checks each again immediately before deletion. Changes require a new preview and confirmation. Errors and cancellations report confirmed partial deletions, and a plan can only be executed once. Registries still offer no atomic compare-and-delete, so avoid concurrent pushes and retagging during cleanup.
 
 The explorer never rewrites the input file. After cleanup it marks the snapshot as potentially stale; run `stats` again to refresh sizes and counts. Filtering sums the file's existing values without recalculating cross-repository deduplication: `unique` remains attributed by the original scan order, and is not a reclaimable-space estimate. A zero `running` count can mean no running-image inventory was supplied.
 
 ### `top`
 
 Prints the top repositories of a statistics file (as `statistics` writes it) as an aligned table, sizes human-readable and `shared` as a percentage. It runs locally, needing no registry access or `--registry`. The file may be given as a positional argument instead of `--input`, but not both, and only one.
+
+Both `top` and `explore` reject duplicate repository names, negative manifest counts, and a `shared` value outside 0–1. In JSON, `shared` is a fraction (`0.25` for 25%), not a percentage.
 
 | Flag | Alias | Default | Description |
 |------|-------|---------|-------------|
@@ -425,14 +427,14 @@ Every example applies to all repositories. Those deleting untagged manifests als
 
 - Listings are a point-in-time snapshot, so before deleting anything from a repository, manifest by manifest or outright, crprune lists it again. New or missing manifests, and changed tags, timestamps or locks (tag locks included, when loaded), mean it changed during inspection: it is skipped with nothing deleted, the other repositories are still pruned, and the run exits non-zero naming it; rerun to prune it. This also catches a manifest a concurrent deletion hid from GHCR's page-numbered listing, whose platform images would otherwise look unreferenced. A manifest listed twice during pagination skips the repository the same way, rather than a decision from conflicting attributes; a repository someone else deleted meanwhile is skipped as well. The recheck narrows the race with concurrent writers, but registries offer no atomic compare-and-delete: avoid pushes and retagging during a prune, especially while unlocking protected images.
 - A manifest in a format crprune cannot decode (Docker schema 1, pre-release OCI artifact manifests) hides what it references, so its repository is skipped with a warning; the other repositories are still processed, and the run exits non-zero naming it. `statistics` skips such repositories, and those that change during their scan, the same way. A signed schema 1 manifest is reported as unsupported, not as a digest mismatch. Invalid descriptor digests and negative blob sizes stop the run.
-- The per-repository byte counts `prune` logs deduplicate blobs within the repository only; the registry's garbage collector may not free layers shared with other repositories.
+- The per-repository byte counts `prune` logs deduplicate blobs within the repository only; the registry's garbage collector may not free layers shared with other repositories. Conflicting sizes for the same blob digest within a repository, and totals that overflow the byte counter, fail the scan before pruning.
 - A manifest is orphaned when something it references is missing, an index child or a `subject` alike; the flag propagates up to the indexes referencing it and down to its children. A child still reachable through a healthy index or its own tag is not orphaned by a broken sibling.
 - When every rule targets a literal repository name (`^name$`), only those repositories are fetched, without listing the registry. A pattern with an active metacharacter is no literal name: `^my.repo$` matches `myXrepo` too, so it is resolved by listing the catalog. `^my\.repo$` (what `generate` emits) addresses a repository with a dot in its name directly.
 - Cached manifests are stored under `<cache>/<canonical-registry>/` (for example `myreg.azurecr.io` or `ghcr.io/myorg`), created when a command starts (an unusable path is an error), and removed when deleted from the registry. Image configs read for `arch`/`os` rules on GHCR are cached alongside them. Cached content is verified against its digest on every read, and reads are bounded to 16 MiB. Writes replace files atomically but are not flushed to disk, since a damaged file is simply downloaded again; the first failure to write is logged as a warning. New cache directories and files are private.
 
 ### Azure Container Registry
 
-- HTTP requests have a two-minute timeout, including reading the response body. Truncated manifest downloads are retried before content is parsed or cached. Redirects cannot change a deletion into a read or forward a mutation to another origin. Read redirects drop authentication credentials when the origin changes, and HTTPS requests never redirect to HTTP. Repeated pagination links fail instead of looping indefinitely.
+- HTTP requests have a two-minute timeout, including reading the response body. Response documents, including metadata, tokens and errors, are bounded to 16 MiB before the SDK reads them, and truncated downloads are retried before decoding. Malformed token responses fail without panicking or exposing tokens in errors. Redirects cannot change a deletion into a read or forward a mutation to another origin. Read redirects drop authentication credentials when the origin changes, and HTTPS requests never redirect to HTTP. Both registry backends read all pagination `Link` headers and support relative URLs; malformed, ambiguous or off-origin next-page links fail the scan. Repeated pagination links fail instead of looping indefinitely.
 - Throttled requests (429) and failing ones (408, 500, 502, 503, 504, timeouts, connections refused, reset or cut short) are retried up to 10 times; a host name that does not resolve or a certificate that does not verify fails at once. crprune waits as long as the registry asks (`Retry-After`, up to 3 minutes), or backs off exponentially from 2 seconds to 3 minutes, riding out about a quarter of an hour of throttling per request. Each retry is logged as a warning and counted down in the dashboard.
 - ACR access tokens are scoped to one repository and action. crprune keeps separate clients for listing, attribute updates, and manifest content and deletion. The first request of each action on a repository fetches the token and the others reuse it, so a run exchanges only a few tokens per repository.
 
@@ -485,8 +487,10 @@ The tests use in-memory registries and HTTP test servers; they need no cloud cre
 go test ./internal/rules -fuzz=FuzzParseAndCompile -fuzztime=30s
 go test ./internal/imageref -fuzz=FuzzSplit -fuzztime=30s
 go test ./internal/registry -fuzz=FuzzParseManifest -fuzztime=30s
+go test ./internal/registry -fuzz=FuzzNextPage -fuzztime=30s
 go test ./internal/pruner -run '^$' -bench BenchmarkCountRunning -benchmem
 go test ./internal/registry -run '^$' -bench BenchmarkIndexPlatforms -benchmem
+go test ./internal/rules -run '^$' -bench BenchmarkWarningsLiteralInventory -benchmem
 make vuln
 ```
 

@@ -44,7 +44,8 @@ func StatSortKeys() []string {
 // gives its offset, a mistyped value at the value's start. ReadStats rejects
 // entries whose name is no valid repository name, which a statistics file
 // from elsewhere could use to smuggle terminal escape sequences into the
-// table.
+// table. Names must be unique so explorer selections are unambiguous; counts
+// must be non-negative and shared must be a fraction between zero and one.
 func ReadStats(r io.Reader) ([]RepositoryStats, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -67,9 +68,20 @@ func ReadStats(r io.Reader) ([]RepositoryStats, error) {
 		}
 		return nil, jsonError(data, base, "after statistics JSON", err)
 	}
+	seen := make(map[string]int, len(stats))
 	for i, s := range stats {
 		if !imageref.ValidRepository(s.Name) {
 			return nil, fmt.Errorf("statistics entry %d: invalid repository name %q", i+1, s.Name)
+		}
+		if first, ok := seen[s.Name]; ok {
+			return nil, fmt.Errorf("statistics entry %d: duplicate repository %q (first at entry %d)", i+1, s.Name, first)
+		}
+		seen[s.Name] = i + 1
+		if s.Count < 0 || s.Tagged < 0 || s.Untagged < 0 || s.Running < 0 {
+			return nil, fmt.Errorf("statistics entry %d (%s): manifest counts must not be negative", i+1, s.Name)
+		}
+		if s.Shared < 0 || s.Shared > 1 {
+			return nil, fmt.Errorf("statistics entry %d (%s): shared must be a fraction between 0 and 1", i+1, s.Name)
 		}
 	}
 	return stats, nil

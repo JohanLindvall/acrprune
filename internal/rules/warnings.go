@@ -14,8 +14,9 @@ import (
 // the warnings.
 func Warnings(ruleSet []*RepoRule) []string {
 	var warnings []string
+	shadows := repositoryShadows(ruleSet)
 	for i, rule := range ruleSet {
-		if warning := shadowed(ruleSet, i); warning != "" {
+		if warning := shadows[i]; warning != "" {
 			// What its lists would do is moot.
 			warnings = append(warnings, warning)
 			continue
@@ -36,28 +37,59 @@ func Warnings(ruleSet []*RepoRule) []string {
 	return warnings
 }
 
-// shadowed describes why the i-th repository rule never applies, or returns
-// "" if it may: an earlier rule matches every repository, or the rule names
-// a single repository an earlier rule already matches.
-func shadowed(ruleSet []*RepoRule, i int) string {
-	rule := ruleSet[i]
-	literal, isLiteral := rule.LiteralRepoName()
-	for j, earlier := range ruleSet[:i] {
-		// Name the earlier rule by its pattern too: that is what shadows.
-		by := fmt.Sprintf("rule %d (repo %q)", j+1, earlier.Repo)
-		if earlier.Description != "" {
-			by = fmt.Sprintf("rule %d (%q, repo %q)", j+1, earlier.Description, earlier.Repo)
+// repositoryShadows names the earliest rule shadowing each unreachable rule.
+// Index literal names and parse each catch-all pattern only once: generated
+// inventories contain one literal rule per repository, and checking every
+// pair used quadratic time and memory before any registry request was made.
+func repositoryShadows(ruleSet []*RepoRule) map[int]string {
+	warnings := map[int]string{}
+	literals := map[string]int{}
+	var patterns []int
+	catchAll := -1
+	for i, rule := range ruleSet {
+		literal, isLiteral := rule.LiteralRepoName()
+		shadow := catchAll
+		if isLiteral {
+			if j, ok := literals[literal]; ok && (shadow < 0 || j < shadow) {
+				shadow = j
+			}
+			for _, j := range patterns {
+				if shadow >= 0 && j >= shadow {
+					break
+				}
+				if ruleSet[j].Repo.MatchString(literal) {
+					shadow = j
+					break
+				}
+			}
 		}
-		switch {
-		case matchesAnyName(earlier.Repo):
-			return fmt.Sprintf("%s never applies: %s before it matches every repository, and only the first matching rule applies to a repository",
-				ruleName(i, rule.Description), by)
-		case isLiteral && earlier.Repo.MatchString(literal):
-			return fmt.Sprintf("%s never applies: %s before it also matches repository %q, and only the first matching rule applies to a repository",
-				ruleName(i, rule.Description), by, literal)
+		if shadow >= 0 {
+			earlier := ruleSet[shadow]
+			by := fmt.Sprintf("rule %d (repo %q)", shadow+1, earlier.Repo)
+			if earlier.Description != "" {
+				by = fmt.Sprintf("rule %d (%q, repo %q)", shadow+1, earlier.Description, earlier.Repo)
+			}
+			why := "matches every repository"
+			if shadow != catchAll {
+				why = fmt.Sprintf("also matches repository %q", literal)
+			}
+			warnings[i] = fmt.Sprintf("%s never applies: %s before it %s, and only the first matching rule applies to a repository",
+				ruleName(i, rule.Description), by, why)
+		}
+		if catchAll >= 0 {
+			continue // later rules can never be the earliest match
+		}
+		if isLiteral {
+			if _, seen := literals[literal]; !seen {
+				literals[literal] = i
+			}
+		} else if matchesAnyName(rule.Repo) {
+			catchAll = i
+		} else {
+			patterns = append(patterns, i)
 		}
 	}
-	return ""
+	return warnings
 }
 
 // unreachable describes the entries of a tagged or untagged list that follow

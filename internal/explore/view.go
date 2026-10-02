@@ -19,10 +19,10 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 	screen.SetStyle(t.Base)
 	screen.Clear()
 	w, h := screen.Size()
+	a.reviewable = w >= 60 && h >= 18
 	if w <= 0 || h <= 0 {
 		return
 	}
-	a.reviewable = w >= 60 && h >= 18
 	put := func(y int, style tcell.Style, text string) { tui.Text(screen, 1, y, w-2, style, text) }
 	tui.Fill(screen, 1, 0, w-2, 1, t.Panel)
 	put(0, t.OnPanel(t.Accent), "CRPRUNE  /  STATS EXPLORER")

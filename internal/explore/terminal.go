@@ -313,12 +313,9 @@ func (a *app) finish(r result) {
 }
 
 func manifestBytes(m *registry.Manifest) uint64 {
-	size := m.Size
-	if m.Config != nil {
-		size += uint64(m.Config.Size)
-	}
-	for _, layer := range m.Layers {
-		size += uint64(layer.Size)
+	var size uint64
+	for _, blobSize := range m.Blobs() {
+		size += blobSize
 	}
 	return size
 }

@@ -131,6 +131,12 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 			pruned = append(pruned, repository)
 			if stats.SkippedRepositories > 0 {
 				outcome = progress.Skipped
+				if p.preview != nil {
+					// A batch run can leave an unavailable repository alone,
+					// but a reviewed plan must not silently omit part of the
+					// requested scope and remain executable.
+					fatal = fmt.Errorf("%s: repository could not be fully inspected; prepare a new preview", repository)
+				}
 			}
 		case isDenied(err):
 			// On an ABAC registry a broad rule can match repositories the
@@ -174,7 +180,7 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 		errs = append(errs, fmt.Errorf("skipped %d of %d repositories that could not be pruned safely (pruned %d): %w",
 			len(skipped), len(repositories), len(pruned), errors.Join(skipped...)))
 	}
-	return errors.Join(errs...)
+	return errors.Join(append(errs, ctx.Err())...)
 }
 
 // untouched counts a repository skipped with nothing deleted, whose manifests

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,34 @@ import (
 	"github.com/JohanLindvall/crprune/internal/registry"
 	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 )
+
+func TestFetchRejectsUnreliableBlobSizes(t *testing.T) {
+	for _, kind := range []string{"config", "layer", "overflow"} {
+		t.Run(kind, func(t *testing.T) {
+			b := registrytest.New()
+			first, second := registrytest.Image("first"), registrytest.Image("second")
+			want := "inconsistent sizes"
+			switch kind {
+			case "config":
+				second.Config.Digest = first.Config.Digest
+				second.Config.Size = first.Config.Size + 1
+			case "layer":
+				second.Layers[0].Digest = first.Layers[0].Digest
+				second.Layers[0].Size = first.Layers[0].Size + 1
+			case "overflow":
+				first.Layers[0].Size, second.Layers[0].Size = math.MaxInt64, math.MaxInt64
+				want = "size overflow"
+			}
+			b.Add("app", first, registry.Attributes{})
+			b.Add("app", second, registry.Attributes{})
+			reg := newRegistry(t, b, nil)
+			_, _, err := reg.FetchRepositoryManifests(t.Context(), "app", registry.FetchOptions{})
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("error=%v; want %s", err, want)
+			}
+		})
+	}
+}
 
 type interceptedBackend struct {
 	registry.Backend

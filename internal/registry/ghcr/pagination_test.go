@@ -3,6 +3,7 @@ package ghcr
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -12,6 +13,41 @@ import (
 
 	"github.com/JohanLindvall/crprune/internal/registry"
 )
+
+// Ignoring the second Link header would hide the kept version on page two
+// from both the inspection and its recheck, allowing a whole-package delete.
+func TestPruneReadsEveryLinkHeader(t *testing.T) {
+	f, b := newFakeGitHub(t, true)
+	b.pageSize = 1
+	old := time.Now().Add(-48 * time.Hour)
+	keep := f.push("app", manifestDoc("release"), old, "release")
+	f.push("app", manifestDoc("debris"), old)
+	f.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/versions") {
+			return false
+		}
+		response := httptest.NewRecorder()
+		f.serveAPI(response, r, r.URL.EscapedPath())
+		if response.Header().Get("Link") != "" {
+			w.Header().Add("Link", "<"+f.url+r.URL.Path+">; rel=first")
+		}
+		for name, values := range response.Header() {
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		w.WriteHeader(response.Code)
+		_, _ = w.Write(response.Body.Bytes())
+		return true
+	}
+	err := stackPruner(t, b, false).Prune(t.Context(), compile(t, `[{"repo":"^app$","untagged":[{"keep":false}]}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.remaining("app"); !slices.Equal(got, []string{keep}) {
+		t.Fatalf("remaining=%v; the release on page two must survive", got)
+	}
+}
 
 // TestPruneGHCRRechecksBeforeDeleting: GitHub numbers the pages of a version
 // listing. When another job deletes a version from a page already read, every

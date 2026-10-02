@@ -78,6 +78,26 @@ func (m *Manifest) Ref() string {
 	return m.Repository + "@" + m.Digest
 }
 
+// Blobs yields the manifest document, config and each layer reference, with
+// their declared sizes. Child manifests and subjects are counted through their
+// own documents. Sizes are non-negative after parsing; repeats are preserved
+// so callers can choose whether to count references or distinct blobs.
+func (m *Manifest) Blobs() iter.Seq2[string, uint64] {
+	return func(yield func(string, uint64) bool) {
+		if !yield(m.Digest, m.Size) {
+			return
+		}
+		if m.Config != nil && !yield(string(m.Config.Digest), uint64(m.Config.Size)) {
+			return
+		}
+		for _, layer := range m.Layers {
+			if !yield(string(layer.Digest), uint64(layer.Size)) {
+				return
+			}
+		}
+	}
+}
+
 // SubjectDigest returns the digest of the manifest this one refers to, when it
 // is a referrer such as a signature, attestation or SBOM: its OCI subject, or
 // else the subject its tags name (TagSubject). It returns "" for a manifest

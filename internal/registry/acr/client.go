@@ -2,9 +2,13 @@ package acr
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -14,6 +18,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 
 	"github.com/JohanLindvall/crprune/internal/registry"
@@ -47,6 +52,22 @@ func Cloud(host string) cloud.Configuration {
 		return cloud.AzureGovernment
 	}
 	return cloud.Configuration{}
+}
+
+// documentTransport bounds every response before the SDK's body download
+// policy reads it into memory, including error and token responses. Reading
+// here also puts truncated streaming responses inside the retry loop.
+type documentTransport struct{ policy.Transporter }
+
+func (t documentTransport) Do(req *http.Request) (*http.Response, error) {
+	resp, err := t.Transporter.Do(req)
+	if err != nil {
+		return resp, err
+	}
+	if err := registry.BufferResponse(resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // gates lets the first request of each action on a repository go alone. The
@@ -120,11 +141,15 @@ func (p *retryPolicy) Do(req *policy.Request) (*http.Response, error) {
 			return nil, err
 		}
 		resp, err := req.Clone(ctx).Next()
-		// The SDK streams /v2/ manifest downloads, unlike its metadata
-		// calls, whose bodies it buffers itself. Read the stream here so
-		// an interrupted body gets the same retry policy as failed headers.
-		if err == nil && resp.StatusCode == http.StatusOK && req.Raw().Method == http.MethodGet && strings.HasPrefix(req.Raw().URL.Path, "/v2/") {
-			err = registry.BufferResponse(resp)
+		// Validate before the generated response handlers run. The SDK
+		// assumes well-formed pagination links and non-nil token fields.
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			switch path := req.Raw().URL.Path; {
+			case strings.HasPrefix(path, "/acr/v1/"):
+				err = normalizePagination(resp, req.Raw().URL)
+			case path == "/oauth2/token" || path == "/oauth2/exchange":
+				err = validateTokenResponse(resp, path)
+			}
 		}
 		err = registry.RedactError(err)
 		if ctx.Err() != nil {
@@ -160,6 +185,45 @@ func (p *retryPolicy) Do(req *policy.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
+}
+
+// The SDK dereferences these token fields without checking whether a 200
+// response included them. Reject malformed responses without logging tokens.
+func validateTokenResponse(resp *http.Response, path string) error {
+	// The SDK's generated decoder matches exact JSON keys, unlike a Go
+	// struct decoder, which also accepts differently capitalized names.
+	var fields map[string]json.RawMessage
+	if err := runtime.UnmarshalAsJSON(resp, &fields); err != nil {
+		return errors.New("invalid registry token response")
+	}
+	key := "access_token"
+	if path == "/oauth2/exchange" {
+		key = "refresh_token"
+	}
+	var value string
+	if err := json.Unmarshal(fields[key], &value); err != nil || strings.TrimSpace(value) == "" {
+		return errors.New("registry token response carries no token")
+	}
+	return nil
+}
+
+// The SDK assumes Link starts with '<' and contains '>', and panics when it
+// does not. It also appends the target to its endpoint even for absolute URLs.
+// Validate before its response handler runs and give it only a relative URI.
+func normalizePagination(resp *http.Response, origin *url.URL) error {
+	next, err := registry.NextPage(resp.Header.Values("Link"), resp.Request.URL)
+	if err != nil {
+		return err
+	}
+	resp.Header.Del("Link")
+	if next != "" {
+		u, _ := url.Parse(next)
+		if !registry.SameOrigin(u, origin) {
+			return fmt.Errorf("refusing to follow the next page link away from %s", origin.Host)
+		}
+		resp.Header.Set("Link", "<"+u.RequestURI()+">; rel=\"next\"")
+	}
+	return nil
 }
 
 // backoff returns the delay before the given retry, counted from zero, of a

@@ -84,6 +84,22 @@ func TestReadStatsRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestReadStatsRejectsAmbiguousOrInvalidValues(t *testing.T) {
+	for _, test := range []struct{ input, want string }{
+		{`[{"name":"app"},{"name":"app"}]`, `duplicate repository "app" (first at entry 1)`},
+		{`[{"name":"app","count":-1}]`, "counts must not be negative"},
+		{`[{"name":"app","tagged":-1}]`, "counts must not be negative"},
+		{`[{"name":"app","untagged":-1}]`, "counts must not be negative"},
+		{`[{"name":"app","running":-1}]`, "counts must not be negative"},
+		{`[{"name":"app","shared":-0.1}]`, "shared must be a fraction"},
+		{`[{"name":"app","shared":50}]`, "shared must be a fraction"},
+	} {
+		if _, err := ReadStats(strings.NewReader(test.input)); err == nil || !strings.Contains(err.Error(), test.want) {
+			t.Errorf("ReadStats(%s) = %v; want %q", test.input, err, test.want)
+		}
+	}
+}
+
 // TestReadStatsReportsPositions: a hand-edited statistics file is hard to fix
 // from encoding/json's message alone, which gives no position.
 func TestReadStatsReportsPositions(t *testing.T) {

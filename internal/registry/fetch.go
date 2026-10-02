@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"regexp"
 	"slices"
 	"strings"
@@ -159,6 +160,9 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	if err := group.Wait(); err != nil {
 		return Contents{}, false, err
 	}
+	if err := validateBlobSizes(manifests); err != nil {
+		return Contents{}, false, err
+	}
 
 	r.deriveTagSubjects(manifests, seen)
 	if opts.Platforms {
@@ -169,6 +173,28 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	}
 	slices.SortFunc(missing, func(a, b Attributes) int { return strings.Compare(a.Digest, b.Digest) })
 	return Contents{Manifests: manifests, Missing: missing}, true, nil
+}
+
+// A digest identifies one size. Conflicting descriptors otherwise make byte
+// counts depend on map iteration order, and can make kept bytes exceed seen
+// bytes so subtraction wraps. Also reject totals that overflow uint64 before
+// either pruning or the explorer uses them for its estimates.
+func validateBlobSizes(manifests map[string]*Manifest) error {
+	sizes := map[string]uint64{}
+	var total uint64
+	for _, m := range manifests {
+		for digest, size := range m.Blobs() {
+			if previous, ok := sizes[digest]; ok && previous != size {
+				return fmt.Errorf("manifest %s: inconsistent sizes for blob %s: %d and %d", m.Ref(), digest, previous, size)
+			}
+			sizes[digest] = size
+			if size > math.MaxUint64-total {
+				return fmt.Errorf("repository %s: blob size overflow", m.Repository)
+			}
+			total += size
+		}
+	}
+	return nil
 }
 
 // deriveTagSubjects sets the TagSubject of the manifests without an OCI

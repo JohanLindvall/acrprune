@@ -317,16 +317,9 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					if err := pruner.SortStatsBy(nil, cmd.String("sort")); err != nil {
 						return err
 					}
-					// Refuse ambiguity instead of silently ignoring an input.
-					if cmd.Args().Len() > 1 {
-						return fmt.Errorf("expected at most one stats file argument, got %d", cmd.Args().Len())
-					}
-					inPath := cmd.String("input")
-					if inPath != "" && cmd.Args().Len() > 0 {
-						return errors.New("--input and a stats file argument are mutually exclusive")
-					}
-					if inPath == "" {
-						inPath = cmd.Args().First()
+					inPath, err := statisticsPath(cmd)
+					if err != nil {
+						return err
 					}
 					stats, err := parseInput(inPath, "statistics file", pruner.ReadStats)
 					if err != nil {

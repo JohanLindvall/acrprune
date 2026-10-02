@@ -244,12 +244,8 @@ func calculateStatsSeen(repository string, manifests []*registry.Manifest, seen 
 	for _, m := range manifests {
 		stats.countAttributes(m.Attributes)
 
-		count(m.Digest, m.Size)
-		if m.Config != nil {
-			count(string(m.Config.Digest), uint64(m.Config.Size))
-		}
-		for _, layer := range m.Layers {
-			count(string(layer.Digest), uint64(layer.Size))
+		for digest, size := range m.Blobs() {
+			count(digest, size)
 		}
 	}
 

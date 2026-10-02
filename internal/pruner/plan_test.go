@@ -3,13 +3,46 @@ package pruner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/JohanLindvall/crprune/internal/registry"
 	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 )
+
+func TestPrepareRejectsIncompleteScope(t *testing.T) {
+	for _, missingDocument := range []bool{false, true} {
+		t.Run(fmt.Sprint(missingDocument), func(t *testing.T) {
+			b := registrytest.New()
+			old := time.Now().Add(-48 * time.Hour)
+			b.Add("good", registrytest.Image("good"), registry.Attributes{LastUpdated: old})
+			if missingDocument {
+				b.AddMissing("unavailable", registry.Attributes{Digest: "sha256:" + strings.Repeat("a", 64), LastUpdated: old})
+			}
+			p := fakePruner(t, b)
+			plan, err := p.Prepare(t.Context(), ruleSet(t, `[{"repo":"^good$","untagged":[{"keep":false}]},{"repo":"^unavailable$","untagged":[{"keep":false}]}]`))
+			if plan != nil || err == nil || !strings.Contains(err.Error(), "unavailable") {
+				t.Fatalf("plan=%v, err=%v; want no executable plan after an incomplete scan", plan, err)
+			}
+			if b.Calls("DeleteManifest")+b.Calls("DeleteRepository") != 0 {
+				t.Fatal("incomplete preview mutated registry")
+			}
+		})
+	}
+}
+
+func TestPrepareCanceledEmptyScopeHasNoPlan(t *testing.T) {
+	p := fakePruner(t, registrytest.New())
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	plan, err := p.Prepare(ctx, nil)
+	if plan != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("plan=%v, err=%v; want cancellation even without candidates", plan, err)
+	}
+}
 
 func TestPreparedPlanIsReadOnlyDetachedAndSingleUse(t *testing.T) {
 	b := registrytest.New()

@@ -1,11 +1,30 @@
 package rules
 
 import (
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func BenchmarkWarningsLiteralInventory(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			rules := make([]*RepoRule, size)
+			for i := range rules {
+				rules[i] = &RepoRule{Repo: regexp.MustCompile(fmt.Sprintf("^team/app-%d$", i))}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if got := Warnings(rules); len(got) != 0 {
+					b.Fatal(got)
+				}
+			}
+		})
+	}
+}
 
 // TestWarnings covers rules that are valid but can never apply: pruning uses
 // only the first repository rule matching a repository and, within it, the
@@ -29,6 +48,15 @@ func TestWarnings(t *testing.T) {
 		{"literal rule repeated",
 			`[{"repo": "^app$"}, {"repo": "^app$"}]`,
 			[]string{`rule 2 never applies: rule 1 (repo "^app$") before it also matches repository "app", and only the first matching rule applies to a repository`}},
+		{"literal precedes matching regex and catch-all",
+			`[{"repo":"^app$"},{"repo":"^ap"},{"repo":".+"},{"repo":"^app$"}]`,
+			[]string{`rule 4 never applies: rule 1 (repo "^app$") before it also matches repository "app", and only the first matching rule applies to a repository`}},
+		{"regex precedes matching literal and catch-all",
+			`[{"repo":"^ap"},{"repo":"^app$"},{"repo":".+"},{"repo":"^app$"}]`,
+			[]string{
+				`rule 2 never applies: rule 1 (repo "^ap") before it also matches repository "app", and only the first matching rule applies to a repository`,
+				`rule 4 never applies: rule 1 (repo "^ap") before it also matches repository "app", and only the first matching rule applies to a repository`,
+			}},
 		{"lists of a rule that never applies",
 			`[{"repo": ".+"}, {"repo": "^app$", "tagged": [{"keep": false}, {"tag": "^v"}]}]`,
 			[]string{`rule 2 never applies: rule 1 (repo ".+") before it matches every repository, and only the first matching rule applies to a repository`}},

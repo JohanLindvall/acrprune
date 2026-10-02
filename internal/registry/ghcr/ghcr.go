@@ -417,34 +417,17 @@ func (b *Backend) paginate(ctx context.Context, u string, fn func(io.Reader) err
 		if err != nil {
 			return err
 		}
-		if u, err = b.nextPage(resp.Header.Get("Link")); err != nil {
+		if u, err = registry.NextPage(resp.Header.Values("Link"), resp.Request.URL); err != nil {
 			return err
+		}
+		if u != "" {
+			next, _ := url.Parse(u) // NextPage already validated it
+			if !registry.SameOrigin(next, b.apiURL) {
+				return fmt.Errorf("refusing to follow the next page link away from %s", b.apiURL.Host)
+			}
 		}
 	}
 	return nil
-}
-
-// nextPage returns the rel="next" target of a Link header, or "" on the last
-// page. Requests to it carry the token, so it must stay on the API's origin.
-func (b *Backend) nextPage(link string) (string, error) {
-	for _, entry := range strings.Split(link, ",") {
-		target, params, _ := strings.Cut(entry, ";")
-		next := false
-		for _, param := range strings.Split(params, ";") {
-			param = strings.TrimSpace(param)
-			next = next || strings.EqualFold(param, `rel="next"`) || strings.EqualFold(param, "rel=next")
-		}
-		if !next {
-			continue
-		}
-		target = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(target), "<"), ">")
-		u, err := url.Parse(target)
-		if err != nil || u.User != nil || u.Fragment != "" || !registry.SameOrigin(u, b.apiURL) {
-			return "", fmt.Errorf("refusing to follow the next page link %q away from %s", target, b.apiURL.Host)
-		}
-		return target, nil
-	}
-	return "", nil
 }
 
 // registryGet downloads a manifest or blob from the registry API,

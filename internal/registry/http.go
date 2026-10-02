@@ -140,7 +140,7 @@ func RedactError(err error) error {
 	return &clean
 }
 
-// BufferResponse reads a successful document while still inside the backend's
+// BufferResponse reads a response document while still inside the backend's
 // retry loop. A server can send success headers and then truncate or stall its
 // body; handing that stream to the caller would bypass retries. The network
 // body is always closed and memory use is bounded by MaxDocumentSize.

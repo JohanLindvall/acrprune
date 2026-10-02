@@ -334,11 +334,13 @@ func TestPreviewAndConfirmationRemainReviewableAfterResize(t *testing.T) {
 		t.Fatal(text)
 	}
 	typeText(t, a, a.confirmPhrase())
-	s.SetSize(40, 10)
-	a.draw(s, time.Now())
-	press(t, a, tcell.KeyEnter, 0)
-	if a.job != nil || b.Calls("DeleteRepository") != 0 {
-		t.Fatal("confirmed on a screen too small to review")
+	for _, size := range [][2]int{{0, 0}, {40, 10}} {
+		s.SetSize(size[0], size[1])
+		a.draw(s, time.Now())
+		press(t, a, tcell.KeyEnter, 0)
+		if a.job != nil || b.Calls("DeleteRepository") != 0 {
+			t.Fatal("confirmed on a screen too small to review")
+		}
 	}
 	s.SetSize(80, 24)
 	a.draw(s, time.Now())
