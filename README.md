@@ -408,12 +408,23 @@ Manifests of equal age rank by digest, so repeated runs over an unchanged reposi
 | File | Description |
 |------|-------------|
 | `rules/cleanup_feature_branches.json` | Deletes feature branch/PR images older than 14 days, and untagged manifests older than 24 hours |
+| `rules/delete_all_but_latest.json` | Keeps the most recently updated tagged image per repository, all its tags, platform manifests and referrers; deletes other images |
 | `rules/delete_untagged_images.json` | Deletes untagged manifests older than 24 hours |
 | `rules/delete_orphaned_manifests.json` | Deletes manifests with missing dependencies |
 | `rules/delete_old_repos.json` | Deletes all content from repos where everything is older than 730 days |
 | `rules/delete_amd64_only_images.json` | Deletes repos that contain only amd64 images (no arm64) |
 
 Every example applies to all repositories. Those deleting untagged manifests also delete digest-pinned images whose tag has since moved to a newer build; protect running ones with `--running`. `cleanup_feature_branches.json` recognizes one team's date-stamped build tags: `YYYYMMDD-br`, and `YYYYMMDD.N-<kind>.<name>` where `<kind>` is `br`, `pr`, `ft`, `local` or `db` (for example `20260930.2-pr.1234`). It keeps every other tag, so adapt its `tag` regex to your own branch tags, such as `^(pr|feature)-`.
+
+`delete_all_but_latest.json` uses the registry's last-updated time to select the newest tagged image or multi-arch index in each repository. A multi-arch index counts as one image; its platform manifests, nested indexes and referrers follow it, even if they have their own tags or newer timestamps. All tags on retained manifests survive. Tag names do not determine recency: a stale `latest` tag or a higher version number does not outrank a more recently updated image. Untagged manifests survive only as dependencies or referrers of the retained image, or through the usual [protections](#protected-manifests). A repository with no tagged image is deleted unless a protection keeps something.
+
+The default 24-hour grace period can retain additional recent images. To preview keeping only the newest tagged image regardless of age, use:
+
+```sh
+crprune -r myregistry --progress=plain prune --in rules/delete_all_but_latest.json --keep-younger=0s
+```
+
+This is a dry run; add `--dry-run=false` to apply it. Locked, running and undated manifests still retain their usual protections.
 
 ## Behaviour Notes
 

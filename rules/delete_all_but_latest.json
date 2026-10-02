@@ -1,0 +1,22 @@
+[
+  {
+    "description": "Keeps the most recently updated tagged image in each repository, with all its tags and multi-arch dependencies, and deletes all other images",
+    "repo": ".+",
+    "ignore_missing_manifests": true,
+    "delete_orphaned_manifests": false,
+    "untagged": [
+      {
+        "keep": false
+      }
+    ],
+    "tagged": [
+      {
+        "newest": 1,
+        "keep": true
+      },
+      {
+        "keep": false
+      }
+    ]
+  }
+]
