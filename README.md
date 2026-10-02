@@ -6,7 +6,15 @@ A Go tool that cleans up Azure Container Registry (ACR) and GitHub Container Reg
 
 ## Install
 
-Requires Go 1.26 or later.
+Install the latest release binary into `~/.local/bin`:
+
+```sh
+curl -fsSL https://github.com/JohanLindvall/crprune/releases/latest/download/download.sh | sh -s -- ~/.local/bin
+```
+
+The script, [`scripts/download.sh`](scripts/download.sh), downloads the release archive for this machine (Linux amd64 or arm64), verifies it against the release's SHA-256 checksums, and replaces `crprune` in the given directory (default: the current one) atomically. It needs curl or GNU Wget, `tar`, and `sha256sum` or `shasum`. `-v VERSION` installs a specific release, e.g. `sh -s -- -v v0.1.13 ~/.local/bin`; releases from before the rename (v0.1.12 and earlier) install as `acrprune`. Set `GH_TOKEN` or `GITHUB_TOKEN` when GitHub's API rate limit for anonymous requests gets in the way, as on shared CI runners. For a system-wide install, run `sudo sh -s -- /usr/local/bin` instead.
+
+To build from source instead (requires Go 1.26 or later):
 
 ```sh
 go install github.com/JohanLindvall/crprune/cmd/crprune@latest
@@ -405,8 +413,8 @@ Every example applies to all repositories. Those deleting untagged manifests als
 
 ```sh
 make build       # local binary, version from git
-make test        # Go tests and mocked Kubernetes inventory tests (requires jq)
-make test-race   # Go race detector plus inventory tests
+make test        # Go tests plus the mocked script tests (the inventory tests require jq)
+make test-race   # Go race detector plus the script tests
 make coverage    # race-enabled coverage.out and function coverage
 make vet
 make lint        # pinned golangci-lint, installed into ./bin on first use
@@ -426,6 +434,8 @@ make vuln
 ```
 
 CI also runs `make vuln` with its Go 1.27 toolchain. The target builds the checker with the active Go version, avoiding incompatibility with a previously installed checker built for an older Go release.
+
+Every CI run keeps the `make dist-all` archives and checksums of its commit as a workflow artifact named `crprune-<commit>`. Every push to `main` publishes a GitHub release with them and `download.sh`.
 
 ## Similar Work
 

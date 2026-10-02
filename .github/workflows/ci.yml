@@ -34,6 +34,15 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+      # Every build keeps its binaries as a workflow artifact: the release
+      # archives and checksums, versioned by commit.
+      - name: Build binaries
+        run: make dist-all
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crprune-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
 
   release:
     needs: build-test
@@ -84,4 +93,4 @@ jobs:
           gh release create "${{ steps.version.outputs.version }}" \
             --title "${{ steps.version.outputs.version }}" \
             --generate-notes \
-            dist/*.tar.gz dist/checksums-*.txt
+            dist/*.tar.gz dist/checksums-*.txt scripts/download.sh

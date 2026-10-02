@@ -32,6 +32,7 @@ test-race:
 
 test-scripts:
 	sh scripts/get_pod_images_test.sh
+	sh scripts/download_test.sh
 
 coverage:
 	go test -race -coverpkg=./... -coverprofile=coverage.out ./...
