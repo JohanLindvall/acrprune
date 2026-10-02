@@ -132,7 +132,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 				return cli.ShowRootCommandHelp(cmd)
 			}
 			name := cmd.Args().First()
-			if suggestion := cli.SuggestCommand(cmd.Commands, name); suggestion != "" {
+			if suggestion := cli.SuggestCommand(cmd.Commands, name); suggestion != "" && nearCommand(name, suggestion) {
 				return fmt.Errorf("unknown command %q; did you mean %q? (see --help)", name, suggestion)
 			}
 			return fmt.Errorf("unknown command %q (see --help)", name)
@@ -300,6 +300,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 					return writeOutput(cmd.String("output"), specs)
 				},
 			},
+			exploreCommand(connect, logger),
 			{
 				Name:  "top",
 				Usage: "print the top repositories from a statistics JSON file as a table",
@@ -363,7 +364,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 		},
 
 		Flags: []cli.Flag{
-			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "ACR registry name (myreg) or login server (myreg.azurecr.io), or ghcr.io/<owner> (required except for top)"},
+			&cli.StringFlag{Name: "registry", Aliases: []string{"r"}, Usage: "ACR registry name (myreg) or login server (myreg.azurecr.io), or ghcr.io/<owner> (required except for top and local explore)"},
 			&cli.StringFlag{Name: "cache", Aliases: []string{"c"}, Usage: "directory for caching downloaded manifests, created if missing"},
 			&cli.IntFlag{Name: "page-size", Aliases: []string{"pagesize"}, Value: 250, Usage: "items per listing request (GHCR caps it at 100)"},
 			&cli.IntFlag{Name: "parallelism", Value: 16, Usage: "number of concurrent registry requests"},
@@ -488,7 +489,7 @@ func connect(ctx context.Context, cmd *cli.Command, addr registry.Address, logge
 	case registry.GHCR:
 		// Only a run that deletes needs to delete; checking the token for
 		// that up front saves a scan that would end in denied deletions.
-		needDelete := cmd.Name == "prune" && !cmd.Bool("dry-run")
+		needDelete := cmd.Name == "prune" && !cmd.Bool("dry-run") || ctx.Value(explorerWriteKey{}) == true
 		backend, err = connectGHCR(ctx, addr, cmd.Int("page-size"), needDelete, logger)
 	default:
 		backend, err = connectACR(addr, cmd.Int("page-size"), logger)

@@ -39,6 +39,9 @@ type Pruner struct {
 	// image list: a manifest they keep is never deleted, whatever the rules
 	// say.
 	Protect []*rules.RepoRule
+	// preview captures the exact, protected decision for interactive review.
+	// Only Prepare sets it, on a private dry-run copy of the pruner.
+	preview *DeletionPlan
 }
 
 // PruneStats accumulates counts over one or more repository prunes. The
@@ -331,6 +334,12 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 
 	seenBytes := calculateStats("", all).Unique
 	keptBytes := calculateStats("", toKeep).Unique
+	if p.preview != nil && len(toDelete) > 0 {
+		p.preview.repositories = append(p.preview.repositories, repositoryDeletion{
+			name: repository, all: all, selected: toDelete, whole: deleteWholeRepository,
+			seenBytes: seenBytes, keptBytes: keptBytes,
+		})
+	}
 	// A live run reports its plan once the recheck confirmed it, so that a
 	// repository skipped then counts no selected manifests.
 	plan := progress.Event{Kind: progress.Plan, Kept: len(toKeep), Count: len(toDelete), Bytes: seenBytes - keptBytes}

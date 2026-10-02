@@ -7,7 +7,8 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode"
+
+	"github.com/JohanLindvall/crprune/internal/tui"
 )
 
 // logHandler captures structured logs while the TUI owns the terminal, using
@@ -94,11 +95,9 @@ func truncate(s string, limit int) string {
 
 // clean prevents control characters and bidi formatting in remote messages
 // from changing the meaning or layout of the display or completion summary.
-func clean(s string) string {
-	return strings.Map(func(r rune) rune {
-		if !unicode.IsGraphic(r) {
-			return ' '
-		}
-		return r
-	}, s)
+func clean(s string) string { return tui.Clean(s) }
+
+// Logger captures activity for a tracker while retaining the base level filter.
+func (t *Tracker) Logger(base *slog.Logger) *slog.Logger {
+	return slog.New(&logHandler{tracker: t, base: base.Handler()})
 }

@@ -132,6 +132,14 @@ func NewTracker() *Tracker {
 	return &Tracker{s: Snapshot{Started: time.Now(), Phase: "Connecting to registry"}}
 }
 
+// Reset starts another operation using the same captured logger. Call after
+// the previous operation's workers have stopped.
+func (t *Tracker) Reset() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.s = Snapshot{Started: time.Now(), Phase: "Connecting to registry"}
+}
+
 // Context returns a context whose Report calls update t.
 func (t *Tracker) Context(ctx context.Context) context.Context {
 	return context.WithValue(ctx, contextKey{}, t)

@@ -64,11 +64,11 @@ crprune -r ghcr.io/myorg -v prune --in rules/delete_untagged_images.json
 | `--verbose` | `-v` | `false` | Enable debug logging |
 | `--version` | | | Print the version |
 
-¹ Required by every command except `top`, which runs locally.
+¹ Required by every command except `top` and local `explore`. Explorer registry actions require `--registry`.
 
 ### Interactive batch progress
 
-`prune` and `statistics` show a live dashboard when stderr is a terminal, drawn with [tcell](https://github.com/gdamore/tcell) directly, without a widget framework. It shows the registry, a prominent **DRY RUN / LIVE DELETE** indicator, repository progress, the current inspection phase, manifest and cache counts, keep/delete decisions (for `statistics`, manifest counts and deduplicated bytes), estimated bytes, warnings, and API retry countdowns.
+`prune` and `statistics` show a live dashboard when stderr is a terminal, drawn with [tcell](https://github.com/gdamore/tcell) directly, without a widget framework. It shows the registry, a prominent **DRY RUN / LIVE DELETE** indicator, repository progress and percentage, the current inspection phase, manifest and cache counts, keep/delete decisions (for `statistics`, manifest counts and deduplicated bytes), estimated bytes, warnings, and API retry countdowns. The display uses clear sections, distinct warning and error colors, a compact layout for small terminals, and an overlaid keyboard guide.
 
 ```sh
 crprune -r myregistry --progress=tui prune --in rules/delete_untagged_images.json
@@ -93,7 +93,7 @@ The dashboard's kept/selected counts describe the plan; deleted counts reflect s
 
 ## Commands
 
-`prune`, `generate` and `top` read stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose.
+`prune`, `generate`, `top` and `explore` read stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose.
 
 crprune exits with status 0 on success and 1 on failure. `Ctrl-C` or `SIGTERM` cancels a run: crprune says it is stopping, waits for the requests in flight, restores the [locks](#locked-images) it removed for deletions this cuts short, and reports what was done. A second signal exits at once, restoring the terminal if the dashboard owns it; when deleting locked images, it warns that pending lock restores may be abandoned. A run cut short exits with status 130, or 143 for `SIGTERM`.
 
@@ -233,6 +233,61 @@ rules:
 The inventory misses images referenced only by manifests not applied to a scanned cluster (Git repositories, Helm charts, deployment pipelines), by other custom resources (such as Argo Rollouts or Knative Services), or by clusters outside the scanned contexts. Add those to the list before running `generate`.
 
 The script buffers its results and emits nothing if any query fails: chain it as above, or with your shell's `pipefail`. It assumes no cluster names and launches no temporary pods. To include historical Mimir/Loki images, set `MIMIR_URL` and/or `LOKI_URL` to full label-values API URLs reachable from the local machine (through port forwarding, say); these optional sources require `curl` and must succeed too.
+
+### `explore`
+
+Opens an interactive statistics explorer with searchable repository names, sortable columns, totals for the matching rows, size and manifest breakdowns, and full repository details. It reads the same JSON as `top`, from a positional filename, `--input`, or stdin. Local browsing needs no registry credentials. It requires an interactive terminal on stderr, honors `NO_COLOR`, and adapts to resizing; `top` remains available for plain output.
+
+```sh
+crprune explore ghcr.json
+crprune explore --sort untagged --filter commons ghcr.json
+cat ghcr.json | crprune explore
+
+# Enable live image browsing and cleanup, with a rule file ready to apply:
+crprune -r ghcr.io/myorg explore --rules rules/delete_untagged_images.json ghcr.json
+
+# The same protections as prune are available:
+crprune -r myregistry explore --running images.txt --keep-younger 7d stats.json
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input`, `--in`, `--infile` | stdin | Statistics JSON file; alternatively give one positional filename |
+| `--sort`, `-s` | `unique` | Initial sort column; same keys as `top` |
+| `--reverse` | `false` | Reverse the initial sort order |
+| `--filter`, `-f` | | Initial name search |
+| `--rules` | | Named JSON rule file; also loadable with `L` |
+| `--keep-younger` | `24h` | Grace period for live cleanup |
+| `--include-locked` | `false` | Allow reviewed cleanup to unlock and delete locked ACR images |
+| `--running` | | Running-image inventory to protect during cleanup |
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓`, `k` / `j` | Move through rows |
+| `PgUp` / `PgDn`, `Home` / `End` | Page or jump through rows |
+| `/` | Search names, or live manifest digests and tags; `Enter` accepts, `Esc` restores the previous search, `Ctrl-U` clears input |
+| `s` | Choose a sort column; `←` / `→` or `Tab` cycles columns |
+| `r` | Reverse sorting |
+| `Enter` | Show full details, including exact byte counts or complete digests and tags |
+| `Space` | Mark or unmark a row; marks survive filtering and sorting |
+| `a` / `c` | Toggle all visible marks / clear all marks |
+| `m` | Fetch and browse live images and manifests in the current repository |
+| `d` | Preview deletion of marked repositories or manifests; with no marks, use the highlighted row |
+| `L` | Load and validate a rule file |
+| `p` / `P` | Preview rules for the current repository / **all repositories in the loaded snapshot**, including filtered-out rows |
+| `R` | Reload the statistics file, or reload live manifests when browsing a repository |
+| `?` / `Esc` | Help / back; help and full details scroll |
+| `q` / `Ctrl-C` | Quit / interrupt; active requests and lock restores finish before the terminal closes |
+
+Live actions require an explicit `--registry`. Snapshots do not record which registry they came from; the connected registry is displayed in the explorer, preview, and confirmation. Opening the explorer does not connect. GHCR image browsing checks read access; preparing a cleanup also checks deletion credentials.
+
+Every cleanup first produces a **fixed preview of the digests and all tags it will remove**. Scroll the preview, use `Enter` for full target details or `w` for warnings, then press `c` and type `delete <registry>` exactly to execute. `Esc` discards the preview. Nothing is deleted by marking rows, loading rules, or preparing a preview.
+
+Cleanup uses the pruning engine's protections, dependency and referrer handling, last-tag handling, and lock restoration. Selecting an image index also selects its children, retaining children needed by kept images. Bulk repository deletion is all-or-nothing within each repository: a protected image keeps that repository. The default 24-hour grace period applies to manual selections too; choose `--keep-younger` when opening the explorer. Rules retain their original repository patterns and first-match behavior; selecting a repository does not force a nonmatching rule onto it. No action scoped to the snapshot can reach another repository in the registry.
+
+Before executing, the explorer verifies all affected repositories against the reviewed snapshots and checks each again immediately before deletion. Changes require a new preview and confirmation. Errors and cancellations report confirmed partial deletions, and a plan can only be executed once. Registries still offer no atomic compare-and-delete, so avoid concurrent pushes and retagging during cleanup.
+
+The explorer never rewrites the input file. After cleanup it marks the snapshot as potentially stale; run `stats` again to refresh sizes and counts. Filtering sums the file's existing values without recalculating cross-repository deduplication: `unique` remains attributed by the original scan order, and is not a reclaimable-space estimate. A zero `running` count can mean no running-image inventory was supplied.
 
 ### `top`
 
@@ -405,6 +460,8 @@ Every example applies to all repositories. Those deleting untagged manifests als
 | `internal/registry/registrytest` | In-memory `Backend` and log recorder for tests |
 | `internal/pruner` | Rule evaluation, orphan detection, keep/delete decisions, statistics |
 | `internal/progress` | Concurrent progress tracking, bounded logs, and the lightweight terminal dashboard |
+| `internal/explore` | Statistics and live-image explorer, scoped cleanup actions, and confirmation workflow |
+| `internal/tui` | Shared terminal drawing, colors, and restoration for both interfaces |
 | `internal/imageref` | Shared repository and image-reference validation |
 | `internal/jsonpos` | Line and column of JSON decoding errors |
 | `internal/fileio` | Atomic file snapshots |

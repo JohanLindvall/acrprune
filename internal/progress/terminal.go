@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
-	"sync"
 	"time"
 
+	"github.com/JohanLindvall/crprune/internal/tui"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"golang.org/x/term"
@@ -81,68 +81,16 @@ func Run(ctx context.Context, opts Options, logger *slog.Logger, work func(conte
 	return err
 }
 
-// displays holds the screens through which progress displays own the
-// terminal, for RestoreTerminal. Its lock also keeps a display from drawing
-// on a screen while the screen is being finalized.
-var displays struct {
-	sync.Mutex
-	screens map[tcell.Screen]bool
-}
+// Both interfaces share ownership, including forced restoration on a signal.
+var (
+	own      = tui.Own
+	disown   = tui.Disown
+	onScreen = tui.OnScreen
+	release  = tui.Release
+)
 
-// own records that the display on screen owns the terminal.
-func own(screen tcell.Screen) {
-	displays.Lock()
-	defer displays.Unlock()
-	if displays.screens == nil {
-		displays.screens = map[tcell.Screen]bool{}
-	}
-	displays.screens[screen] = true
-}
-
-// disown restores the terminal from screen, unless RestoreTerminal already
-// did.
-func disown(screen tcell.Screen) {
-	displays.Lock()
-	defer displays.Unlock()
-	if displays.screens[screen] {
-		delete(displays.screens, screen)
-		screen.Fini()
-	}
-}
-
-// onScreen runs fn, which draws on screen, unless RestoreTerminal has restored
-// the terminal from it.
-func onScreen(screen tcell.Screen, fn func()) {
-	displays.Lock()
-	defer displays.Unlock()
-	if displays.screens[screen] {
-		fn()
-	}
-}
-
-// RestoreTerminal restores the terminal from the progress display, if one
-// owns it: it leaves the display's alternate screen and restores the modes it
-// set, echo among them. Run does so itself when it returns; RestoreTerminal
-// is for a process about to exit while Run still runs, such as on a second
-// interrupt. It is safe to call from any goroutine, any number of times; the
-// display draws nothing more.
-func RestoreTerminal() {
-	displays.Lock()
-	defer displays.Unlock()
-	for screen := range displays.screens {
-		delete(displays.screens, screen)
-		screen.Fini()
-	}
-}
-
-// release closes a screen whose Init failed, which may still hold the
-// terminal device open. tcell's Fini panics after some of those failures,
-// closing a channel Init had not made yet; the terminal was not engaged then,
-// so there is nothing to restore and the panic is ignored.
-func release(screen tcell.Screen) {
-	defer func() { _ = recover() }()
-	screen.Fini()
-}
+// RestoreTerminal restores any active crprune terminal interface.
+func RestoreTerminal() { tui.RestoreTerminal() }
 
 // summarize leaves the outcome, and the warnings the display retained, in
 // scrollback once the terminal is restored.
