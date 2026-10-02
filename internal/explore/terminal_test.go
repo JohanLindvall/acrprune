@@ -3,6 +3,7 @@ package explore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/JohanLindvall/crprune/internal/registry"
+	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 	"github.com/JohanLindvall/crprune/internal/tui"
 	"github.com/gdamore/tcell/v2"
 )
@@ -86,6 +88,56 @@ func TestRunHandlesInputResizeAndRestoresTerminal(t *testing.T) {
 	}
 	if s.finis.Load() != 1 {
 		t.Fatal("terminal not restored exactly once")
+	}
+}
+
+func TestRunScansRegistryWithoutSnapshot(t *testing.T) {
+	for _, count := range []int{0, 1} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			s := fakeScreen(t)
+			b := registrytest.New()
+			if count > 0 {
+				b.Add("app", registrytest.Image("app"), registry.Attributes{})
+			}
+			done := make(chan error, 1)
+			go func() { done <- Run(t.Context(), nil, Options{LiveStats: true, Client: testClient(b)}) }()
+			s.wait(t, fmt.Sprintf("Loaded live statistics for %d repositories", count))
+			s.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+			if err := waitRun(t, done); err != nil {
+				t.Fatal(err)
+			}
+			if b.Calls("ListRepositories") != 1 || s.finis.Load() != 1 {
+				t.Fatal("scan did not run once or terminal was not restored")
+			}
+		})
+	}
+}
+
+func TestLiveStatisticsStartupCanBeCanceled(t *testing.T) {
+	s := fakeScreen(t)
+	canceled := make(chan struct{})
+	c := &Client{Registry: "ghcr.io/test", Connect: func(ctx context.Context, _ *slog.Logger, write bool) (*registry.Registry, error) {
+		if write {
+			return nil, errors.New("statistics requested deletion credentials")
+		}
+		<-ctx.Done()
+		close(canceled)
+		return nil, ctx.Err()
+	}}
+	done := make(chan error, 1)
+	go func() { done <- Run(t.Context(), nil, Options{LiveStats: true, Client: c}) }()
+	s.wait(t, "Scanning registry statistics")
+	s.InjectKey(tcell.KeyRune, 'q', tcell.ModNone)
+	if err := waitRun(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("scan was not canceled")
+	}
+	if s.finis.Load() != 1 {
+		t.Fatal("terminal was not restored")
 	}
 }
 

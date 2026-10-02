@@ -48,10 +48,12 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 		if a.panel == "confirm" {
 			a.drawConfirmation(screen, t)
 		}
-	case a.panel == "message":
+	case a.panel == "message" || a.panel == "rule-details":
 		a.drawPage(screen, t, a.message)
+	case a.panel == "rule-picker":
+		a.drawRulePicker(screen, t)
 	case a.panel == "help":
-		a.drawPage(screen, t, []string{"KEYBOARD", "", "↑ ↓ / j k    Move through repositories, manifests, or preview targets", "PgUp / PgDn  Move a page; Home / End jumps to the first / last row", "/            Search repository names, or manifest digests and tags", "Enter / Esc  Accept search / restore previous search; Ctrl-U clears input", "s            Choose a sort column; ← / → or Tab cycles columns", "r            Reverse sort order; R reloads the file or live manifests", "Enter        Show all details for the highlighted row", "Space        Mark / unmark a row", "a / c        Toggle all visible rows / clear all marks", "m            Browse live images and manifests of the current repository", "d            Preview deletion of marked rows, or the current row", "L            Load a JSON rule file", "p / P        Preview rules for the current repo / ALL snapshot repos", "? / Esc      Help / back; q quits; Ctrl-C interrupts", "", "Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. All snapshot repositories includes filtered-out rows. A loaded rule only applies where its repo pattern matches.", "", "Unique bytes are charged to the first repository that referenced each blob during the original scan. Filtering does not recompute deduplication. Shared means repeated references, not reclaimable bytes. A running count of zero can mean no --running inventory was supplied. Deleting a tag's manifest removes ALL of its tags.", "", "This screen never rewrites your statistics file. After deletion, run stats again to get current counts and sizes."})
+		a.drawPage(screen, t, []string{"KEYBOARD", "", "↑ ↓ / j k    Move through repositories, manifests, or preview targets", "PgUp / PgDn  Move a page; Home / End jumps to the first / last row", "/            Search repository names, or manifest digests and tags", "Enter / Esc  Accept search / restore previous search; Ctrl-U clears input", "s            Choose a sort column; ← / → or Tab cycles columns", "r            Reverse sort order; R reloads statistics or live manifests", "Enter        Show all details for the highlighted row", "Space        Mark / unmark a row", "a / c        Toggle all visible rows / clear all marks", "m            Browse live images and manifests of the current repository", "d            Preview deletion of marked rows, or the current row", "l / L        Choose bundled or local rules / load a JSON rule file", "p / P        Preview rules for the current repo / ALL snapshot repos", "? / Esc      Help / back; q quits; Ctrl-C interrupts", "", "The rule picker includes bundled examples and JSON files in --rules-dir (default ./rules). Enter selects one complete file; i shows its full descriptions and repository patterns. If no rules are selected, p or P opens the picker before preparing a preview.", "", "Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. All snapshot repositories includes filtered-out rows. A loaded rule only applies where its repo pattern matches.", "", "Unique bytes are charged to the first repository that referenced each blob during the original scan. Filtering does not recompute deduplication. Shared means repeated references, not reclaimable bytes. A running count of zero can mean no --running inventory was supplied. Deleting a tag's manifest removes ALL of its tags.", "", "This screen never rewrites your statistics file. After deletion, use R in the repository view to rescan live statistics, or run stats again for a file snapshot."})
 	case a.panel == "sort":
 		lines := []string{"↑/↓ choose · Enter apply", ""}
 		for i, key := range a.keys() {
@@ -158,17 +160,69 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 	}
 	status := a.status
 	if status == "" && a.opts.Client != nil {
-		status = "Rules: " + a.opts.Client.RuleSource + "   p current repo · P all snapshot repos · L load"
+		source := a.opts.Client.RuleSource
+		if source == "" {
+			source = "none selected"
+		}
+		status = "Rules: " + source + "   l choose · p current repo · P all snapshot repos"
 	}
 	if status == "" {
 		status = "Enter details · Space mark · a mark visible · c clear marks"
 	}
 	tui.Text(screen, 1, h-2, w-2, t.Muted, status)
-	footer := "q quit  / search  s sort  r reverse  m images  d delete  p/P rules  ? help"
+	footer := "q quit  / search  s sort  m images  d delete  l rules  p/P preview  ? help"
 	if a.repository != "" {
 		footer = "Esc repos  / search  Space mark  a all  d delete  R reload  Enter details  ? help"
 	}
 	tui.Text(screen, 1, h-1, w-2, t.Accent, footer)
+}
+
+func (a *app) drawRulePicker(screen tcell.Screen, t tui.Theme) {
+	w, h := screen.Size()
+	tui.Text(screen, 1, 3, w-2, t.Accent, "CHOOSE RULE FILE")
+	scope := "Select one file, then p previews the current repository or P all snapshot repositories."
+	if a.ruleRequest != nil {
+		scope = "Select and preview: " + a.ruleScope
+	}
+	tui.Text(screen, 1, 4, w-2, t.Muted, scope)
+	details := min(7, max(0, h-12))
+	a.ruleRows = max(1, h-8-details)
+	a.ruleOffset = max(0, min(a.ruleOffset, len(a.opts.RuleFiles)-a.ruleRows))
+	if a.ruleCursor < a.ruleOffset {
+		a.ruleOffset = a.ruleCursor
+	}
+	if a.ruleCursor >= a.ruleOffset+a.ruleRows {
+		a.ruleOffset = a.ruleCursor - a.ruleRows + 1
+	}
+	for i := a.ruleOffset; i < min(len(a.opts.RuleFiles), a.ruleOffset+a.ruleRows); i++ {
+		file := a.opts.RuleFiles[i]
+		style, label := t.Base, "  "+file.Source
+		if file.Err != nil {
+			label += " [invalid]"
+			style = t.Warn
+		}
+		if a.opts.Client != nil && file.Source == a.opts.Client.RuleSource {
+			label += " [selected]"
+		}
+		if i == a.ruleCursor {
+			style, label = t.Selected, "› "+label[2:]
+			tui.Fill(screen, 1, 6+i-a.ruleOffset, w-2, 1, style)
+		}
+		tui.Text(screen, 1, 6+i-a.ruleOffset, w-2, style, label)
+	}
+	if len(a.opts.RuleFiles) == 0 {
+		tui.Text(screen, 1, 6, w-2, t.Muted, "No rule files available. Press L to load a file.")
+	} else if details > 0 {
+		var lines []string
+		for _, line := range ruleDetails(a.opts.RuleFiles[a.ruleCursor]) {
+			lines = append(lines, wrap(line, max(1, w-4))...)
+		}
+		for i, line := range lines[:min(len(lines), details)] {
+			tui.Text(screen, 2, h-2-details+i, w-4, t.Muted, line)
+		}
+	}
+	tui.Text(screen, 1, h-2, w-2, t.Warn, a.status)
+	tui.Text(screen, 1, h-1, w-2, t.Accent, "↑/↓ choose · Enter select · i details · L load file · Esc cancel")
 }
 
 type column struct {

@@ -32,6 +32,31 @@ func compileRules(t *testing.T, doc string) []*rules.RepoRule {
 }
 func quiet() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
+func TestStatisticsUsesReadAccessAndRunningInventory(t *testing.T) {
+	b := registrytest.New()
+	for _, name := range []string{"one", "two"} {
+		b.Add(name, registrytest.Image("shared"), registry.Attributes{Tags: []string{"running"}})
+	}
+	c := testClient(b)
+	c.Protect = compileRules(t, `[{"repo":"^one$","tagged":[{"tag":"^running$","keep":true}]}]`)
+	c.Connect = func(_ context.Context, logger *slog.Logger, write bool) (*registry.Registry, error) {
+		if write {
+			t.Fatal("statistics requested deletion credentials")
+		}
+		return registry.New(b, logger, 4, nil)
+	}
+	stats, err := c.statistics(t.Context(), quiet())
+	if err != nil || len(stats) != 2 {
+		t.Fatal(stats, err)
+	}
+	if stats[0].Name != "one" || stats[0].Count != 1 || stats[0].Running != 1 || stats[0].Unique == 0 || stats[1].Running != 0 || stats[1].Unique != 0 {
+		t.Fatal(stats)
+	}
+	if len(b.Deleted()) != 0 || len(b.DeletedRepositories()) != 0 {
+		t.Fatal("statistics deleted data")
+	}
+}
+
 func TestScopedRulesPreservePatternsAndFirstMatch(t *testing.T) {
 	r := compileRules(t, `[{"repo":"^app$","tagged":[{"keep":true}]},{"repo":"^app","tagged":[{"keep":false}]}]`)
 	s := scopedRules(r, []string{"app.extra", "other", "app", "app"})

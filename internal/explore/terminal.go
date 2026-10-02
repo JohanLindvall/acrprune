@@ -19,12 +19,14 @@ import (
 	"golang.org/x/term"
 )
 
-// Options identifies the local snapshot and optional live registry connection.
+// Options identifies the statistics source and optional live registry connection.
 type Options struct {
 	Source, Sort, Filter string
 	Reverse              bool
+	LiveStats            bool // Scan Client on startup and when reloading statistics.
 	Reload               func() ([]pruner.RepositoryStats, error)
 	Client               *Client
+	RuleFiles            []RuleFile
 	Logger               *slog.Logger
 	OnLogger             func(*slog.Logger)
 }
@@ -101,6 +103,9 @@ type app struct {
 	targets                          []pruner.DeletionTarget
 	planCursor, planOffset, planRows int
 	scope                            string
+	ruleCursor, ruleOffset, ruleRows int
+	ruleRequest                      *request
+	ruleScope                        string
 	stale                            bool
 	reviewable                       bool
 	tracker                          *progress.Tracker
@@ -117,7 +122,11 @@ func newApp(stats []pruner.RepositoryStats, opts Options) *app {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
 	t := progress.NewTracker()
-	return &app{opts: opts, repos: newList(stats, opts.Sort, opts.Filter, opts.Reverse), tracker: t, logger: t.Logger(opts.Logger)}
+	a := &app{opts: opts, repos: newList(stats, opts.Sort, opts.Filter, opts.Reverse), tracker: t, logger: t.Logger(opts.Logger)}
+	if opts.Client != nil && opts.Client.RuleSource != "" {
+		a.rememberRules(RuleFile{Source: opts.Client.RuleSource, Rules: opts.Client.Rules})
+	}
+	return a
 }
 
 func (a *app) list() *listState {
@@ -151,6 +160,9 @@ func (a *app) run(ctx context.Context, screen tcell.Screen) error {
 	}()
 	tick := time.NewTicker(125 * time.Millisecond)
 	defer tick.Stop()
+	if a.opts.LiveStats {
+		a.loadStatistics(ctx)
+	}
 	canceled := ctx.Done()
 	var closing error
 	for {
@@ -234,6 +246,10 @@ func (a *app) prepare(ctx context.Context, req request, scope string) {
 		a.status = "No repositories selected"
 		return
 	}
+	if req.kind == "rules" && a.opts.Client.RuleSource == "" && len(a.opts.Client.Rules) == 0 {
+		a.chooseRules(&req, scope)
+		return
+	}
 	a.scope, a.panel, a.plan = scope, "", nil
 	a.start(ctx, "Preparing deletion preview", func(ctx context.Context) result {
 		plan, err := a.opts.Client.prepare(ctx, a.logger, req)
@@ -251,6 +267,16 @@ func (a *app) loadManifests(ctx context.Context, name string) {
 	})
 }
 
+func (a *app) loadStatistics(ctx context.Context) {
+	if !a.live() {
+		return
+	}
+	a.start(ctx, "Scanning registry statistics", func(ctx context.Context) result {
+		stats, err := a.opts.Client.statistics(ctx, a.logger)
+		return result{kind: "statistics", stats: stats, err: err}
+	})
+}
+
 func (a *app) showMessage(title string, lines ...string) {
 	a.panel, a.panelOffset = "message", 0
 	a.message = append([]string{title, ""}, lines...)
@@ -262,15 +288,19 @@ func (a *app) finish(r result) {
 		a.plan, a.targets, a.panel = nil, nil, ""
 		a.stale = true
 		a.repos.marked, a.manifests.marked = map[string]bool{}, map[string]bool{}
+		refresh := "Run stats again to refresh byte counts."
+		if a.opts.LiveStats {
+			refresh = "Use R in the repository view to rescan statistics."
+		}
 		lines := []string{fmt.Sprintf("Confirmed deletions: %d manifests, %d repositories.", r.outcome.DeletedManifests, r.outcome.Repositories-r.outcome.KeptRepositories),
-			"The loaded statistics snapshot is now potentially stale. Run stats again to refresh byte counts. Use R in the manifest view to reload live images."}
+			"The loaded statistics snapshot is now potentially stale. " + refresh + " Use R in the manifest view to reload live images."}
 		if r.err != nil {
 			lines = append(lines, "Stopped: "+r.err.Error(), "Some deletions may have succeeded. Prepare a new preview before retrying.")
 		}
 		a.showMessage("DELETION RESULT", lines...)
 		return
 	}
-	if r.err != nil {
+	if r.err != nil && (r.kind != "statistics" || r.stats == nil) {
 		a.showMessage("ACTION FAILED", r.err.Error())
 		return
 	}
@@ -301,13 +331,23 @@ func (a *app) finish(r result) {
 		a.manifests = newList(data, "newest", "", false)
 		a.manifests.labels = labels
 		a.status = fmt.Sprintf("Loaded %d live manifests from %s", len(data), r.repository)
-	case "reload":
+	case "reload", "statistics":
 		old := a.repos
 		a.repos = newList(r.stats, old.sortKey, old.query, old.reverse)
 		a.repos.refilter(old.current())
 		a.status = "Reloaded snapshot; it may predate live changes"
+		if r.kind == "statistics" {
+			a.status = fmt.Sprintf("Loaded live statistics for %d repositories", len(r.stats))
+			if r.err == nil {
+				a.stale = false
+			} else {
+				a.status = fmt.Sprintf("Loaded partial statistics for %d repositories", len(r.stats))
+				a.showMessage("PARTIAL STATISTICS", a.status+". Press Esc to browse them, then R to retry the scan.", r.err.Error())
+			}
+		}
 	case "rules":
 		a.opts.Client.Rules, a.opts.Client.RuleSource = r.rules, r.source
+		a.rememberRules(RuleFile{Source: r.source, Rules: r.rules})
 		a.panel, a.status = "", fmt.Sprintf("Loaded %d repository rules from %s", len(r.rules), r.source)
 	}
 }
@@ -401,6 +441,49 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 	if key.Rune() == 'q' {
 		return true, nil
 	}
+	if a.panel == "rule-picker" {
+		switch {
+		case key.Key() == tcell.KeyEsc:
+			a.panel, a.ruleRequest = "", nil
+		case key.Rune() == 'L':
+			if a.live() {
+				a.manualRules()
+			}
+		case key.Key() == tcell.KeyUp || key.Rune() == 'k':
+			a.ruleCursor--
+		case key.Key() == tcell.KeyDown || key.Rune() == 'j':
+			a.ruleCursor++
+		case key.Key() == tcell.KeyPgUp:
+			a.ruleCursor -= max(1, a.ruleRows)
+		case key.Key() == tcell.KeyPgDn:
+			a.ruleCursor += max(1, a.ruleRows)
+		case key.Key() == tcell.KeyHome:
+			a.ruleCursor = 0
+		case key.Key() == tcell.KeyEnd:
+			a.ruleCursor = len(a.opts.RuleFiles) - 1
+		case key.Rune() == 'i':
+			if len(a.opts.RuleFiles) > 0 {
+				a.showMessage("RULE FILE", ruleDetails(a.opts.RuleFiles[a.ruleCursor])...)
+				a.panel = "rule-details"
+			}
+		case key.Key() == tcell.KeyEnter:
+			if len(a.opts.RuleFiles) > 0 {
+				file := a.opts.RuleFiles[a.ruleCursor]
+				if file.Err != nil {
+					a.status = "Cannot select invalid rules: " + file.Err.Error()
+				} else if a.live() {
+					a.opts.Client.Rules, a.opts.Client.RuleSource = file.Rules, file.Source
+					a.panel, a.status = "", "Selected rules: "+file.Source
+					if req := a.ruleRequest; req != nil {
+						a.ruleRequest = nil
+						a.prepare(ctx, *req, a.ruleScope)
+					}
+				}
+			}
+		}
+		a.ruleCursor = max(0, min(a.ruleCursor, len(a.opts.RuleFiles)-1))
+		return false, nil
+	}
 	if a.panel == "plan" {
 		switch {
 		case key.Key() == tcell.KeyEsc:
@@ -456,9 +539,12 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 	if a.panel != "" {
 		switch {
 		case key.Key() == tcell.KeyEsc || key.Rune() == '?':
-			a.panel = ""
-			if a.plan != nil {
+			if a.panel == "rule-details" {
+				a.panel = "rule-picker"
+			} else if a.plan != nil {
 				a.panel = "plan"
+			} else {
+				a.panel = ""
 			}
 		case key.Key() == tcell.KeyUp || key.Rune() == 'k':
 			a.panelOffset--
@@ -514,6 +600,8 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 	case key.Rune() == 'R':
 		if a.repository != "" {
 			a.loadManifests(ctx, a.repository)
+		} else if a.opts.LiveStats {
+			a.loadStatistics(ctx)
 		} else if a.opts.Reload != nil {
 			a.start(ctx, "Reloading statistics", func(context.Context) result {
 				stats, err := a.opts.Reload()
@@ -524,8 +612,10 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 		}
 	case key.Rune() == 'L':
 		if a.live() {
-			a.panel, a.input, a.status = "rules", a.opts.Client.RuleSource, ""
+			a.manualRules()
 		}
+	case key.Rune() == 'l':
+		a.chooseRules(nil, "")
 	case key.Rune() == 'd':
 		req := request{kind: "repositories", repositories: l.selected()}
 		if a.repository != "" {

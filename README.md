@@ -93,7 +93,7 @@ The dashboard's kept/selected counts describe the plan; deleted counts reflect s
 
 ## Commands
 
-`prune`, `generate`, `top` and `explore` read stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose.
+`prune`, `generate`, `top` and `explore` read piped stdin when no input file is given, and `-` names stdin or stdout explicitly. When stdin is a terminal, a missing input is an error rather than a silent wait; `--input -` reads the terminal on purpose. For `explore`, omitting input instead scans `--registry` when stdin is a terminal or empty.
 
 crprune exits with status 0 on success and 1 on failure. `Ctrl-C` or `SIGTERM` cancels a run: crprune says it is stopping, waits for the requests in flight, restores the [locks](#locked-images) it removed for deletions this cuts short, and reports what was done. A second signal exits at once, restoring the terminal if the dashboard owns it; when deleting locked images, it warns that pending lock restores may be abandoned. A run cut short exits with status 130, or 143 for `SIGTERM`.
 
@@ -236,9 +236,15 @@ The script buffers its results and emits nothing if any query fails: chain it as
 
 ### `explore`
 
-Opens an interactive statistics explorer with searchable repository names, sortable columns, totals for the matching rows, size and manifest breakdowns, and full repository details. It reads the same JSON as `top`, from a positional filename, `--input`, or stdin. Local browsing needs no registry credentials. It requires an interactive terminal on stderr, honors `NO_COLOR`, and adapts to resizing; `top` remains available for plain output.
+Opens an interactive statistics explorer with searchable repository names, sortable columns, totals for the matching rows, size and manifest breakdowns, and full repository details. With `--registry` and no file or piped input, it scans the registry and keeps statistics in memory, showing progress while loading. It also reads the same JSON as `top`, from a positional filename, `--input`, or stdin. Local browsing needs no registry credentials. It requires an interactive terminal on stderr, honors `NO_COLOR`, and adapts to resizing; `top` remains available for plain output.
 
 ```sh
+# Scan and explore directly, without writing a statistics file:
+crprune -r ghcr.io/myorg explore
+
+# Add custom rules to the picker alongside the bundled examples:
+crprune -r ghcr.io/myorg explore --rules-dir ~/crprune-rules
+
 crprune explore ghcr.json
 crprune explore --sort untagged --filter commons ghcr.json
 cat ghcr.json | crprune explore
@@ -252,14 +258,15 @@ crprune -r myregistry explore --running images.txt --keep-younger 7d stats.json
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input`, `--in`, `--infile` | stdin | Statistics JSON file; alternatively give one positional filename |
+| `--input`, `--in`, `--infile` | piped stdin or live scan | Statistics JSON file; alternatively give one positional filename; `-` explicitly requires stdin |
 | `--sort`, `-s` | `unique` | Initial sort column; same keys as `top` |
 | `--reverse` | `false` | Reverse the initial sort order |
 | `--filter`, `-f` | | Initial name search |
-| `--rules` | | Named JSON rule file; also loadable with `L` |
+| `--rules` | | Initially selected JSON rule file; also loadable with `L` |
+| `--rules-dir` | `./rules` | Directory of JSON rule files to load alongside the bundled examples |
 | `--keep-younger` | `24h` | Grace period for live cleanup |
 | `--include-locked` | `false` | Allow reviewed cleanup to unlock and delete locked ACR images |
-| `--running` | | Running-image inventory to protect during cleanup |
+| `--running` | | Running-image inventory to annotate live statistics and protect during cleanup |
 
 | Key | Action |
 |-----|--------|
@@ -273,13 +280,17 @@ crprune -r myregistry explore --running images.txt --keep-younger 7d stats.json
 | `a` / `c` | Toggle all visible marks / clear all marks |
 | `m` | Fetch and browse live images and manifests in the current repository |
 | `d` | Preview deletion of marked repositories or manifests; with no marks, use the highlighted row |
-| `L` | Load and validate a rule file |
-| `p` / `P` | Preview rules for the current repository / **all repositories in the loaded snapshot**, including filtered-out rows |
-| `R` | Reload the statistics file, or reload live manifests when browsing a repository |
+| `l` / `L` | Choose an automatically loaded rule file / load and validate another file by path |
+| `p` / `P` | Preview the selected rules for the current repository / **all repositories in the loaded snapshot**, including filtered-out rows; opens the rule picker if nothing is selected |
+| `R` | Rescan live statistics or reload the statistics file; reload live manifests when browsing a repository |
 | `?` / `Esc` | Help / back; help and full details scroll |
 | `q` / `Ctrl-C` | Quit / interrupt; active requests and lock restores finish before the terminal closes |
 
-Live actions require an explicit `--registry`. Snapshots do not record which registry they came from; the connected registry is displayed in the explorer, preview, and confirmation. Opening the explorer does not connect. GHCR image browsing checks read access; preparing a cleanup also checks deletion credentials.
+The explorer automatically loads the bundled example rules and `*.json` files directly in `--rules-dir` (default `./rules`, relative to the working directory). Bundled rules are available even outside a checkout. Identical local copies are omitted; modified copies appear as separate choices with their own paths. The default directory may be absent; an explicitly supplied directory must exist. Invalid rule files remain visible with their errors and cannot be selected.
+
+Press `l` to choose a rule file with the arrow keys and `Enter`; `i` shows its full descriptions and repository patterns. One file is active at a time, preserving its rule order. Choosing from `l` selects the file; choosing after `p` or `P` also prepares the requested preview. `Esc` cancels the choice. `--rules FILE` preselects a file, and `L` loads another file into the picker.
+
+Live actions require an explicit `--registry`. File snapshots do not record which registry they came from; the connected registry is displayed in the explorer, preview, and confirmation. Opening a file or piped snapshot does not connect. Opening without input scans the registry with read access, as does `R` in that mode. GHCR image browsing also checks read access; preparing a cleanup checks deletion credentials.
 
 Every cleanup first produces a **fixed preview of the digests and all tags it will remove**. Scroll the preview, use `Enter` for full target details or `w` for warnings, then press `c` and type `delete <registry>` exactly to execute. `Esc` discards the preview. Nothing is deleted by marking rows, loading rules, or preparing a preview.
 
@@ -287,7 +298,7 @@ Cleanup uses the pruning engine's protections, dependency and referrer handling,
 
 If any selected repository or listed manifest cannot be inspected, the entire preview is refused; it cannot execute a partial selection. Before executing, the explorer verifies all affected repositories against the reviewed snapshots and checks each again immediately before deletion. Changes require a new preview and confirmation. Errors and cancellations report confirmed partial deletions, and a plan can only be executed once. Registries still offer no atomic compare-and-delete, so avoid concurrent pushes and retagging during cleanup.
 
-The explorer never rewrites the input file. After cleanup it marks the snapshot as potentially stale; run `stats` again to refresh sizes and counts. Filtering sums the file's existing values without recalculating cross-repository deduplication: `unique` remains attributed by the original scan order, and is not a reclaimable-space estimate. A zero `running` count can mean no running-image inventory was supplied.
+The explorer never rewrites the input file. After cleanup it marks the snapshot as potentially stale; press `R` in the repository view to refresh a live scan, or run `stats` again for a file snapshot. A failed live scan keeps the previous snapshot when no new results are available; a partial scan exposes the collected repositories with an error message. Filtering sums the snapshot's existing values without recalculating cross-repository deduplication: `unique` remains attributed by the original scan order, and is not a reclaimable-space estimate. A zero `running` count can mean no running-image inventory was supplied.
 
 ### `top`
 

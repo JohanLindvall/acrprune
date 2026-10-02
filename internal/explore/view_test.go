@@ -209,6 +209,60 @@ func TestRulesLoadAndReloadErrorsKeepState(t *testing.T) {
 	}
 }
 
+func TestLiveStatisticsReloadPreservesViewAndClearsStaleness(t *testing.T) {
+	b := registrytest.New()
+	b.Add("one", registrytest.Image("one"), registry.Attributes{})
+	a := newApp(sampleStats(), Options{Client: testClient(b), LiveStats: true, Sort: "name", Filter: "one", Reverse: true})
+	a.stale = true
+	a.repos.marked["two"] = true
+	press(t, a, tcell.KeyRune, 'R')
+	if r := finishJob(t, a); r.err != nil {
+		t.Fatal(r.err)
+	}
+	if len(a.repos.data) != 1 || a.repos.data[0].Count != 1 || a.repos.current() != "one" || a.stale {
+		t.Fatalf("repos=%+v stale=%t", a.repos, a.stale)
+	}
+	if a.repos.sortKey != "name" || a.repos.query != "one" || !a.repos.reverse || len(a.repos.marked) != 0 {
+		t.Fatalf("view state=%+v", a.repos)
+	}
+	if err := b.DeleteRepository(t.Context(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	press(t, a, tcell.KeyRune, 'R')
+	if r := finishJob(t, a); r.err != nil || len(a.repos.data) != 0 {
+		t.Fatal(a.repos.data, r.err)
+	}
+}
+
+func TestLiveStatisticsPartialAndFailedScans(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprint(partial), func(t *testing.T) {
+			b := registrytest.New()
+			b.Add("one", registrytest.Image("one"), registry.Attributes{})
+			b.Add("two", registrytest.Image("two"), registry.Attributes{})
+			b.Fail = func(_, repository string) error {
+				if !partial || repository == "two" {
+					return registrytest.Forbidden("statistics")
+				}
+				return nil
+			}
+			a := newApp(sampleStats(), Options{Client: testClient(b), LiveStats: true})
+			a.stale = true
+			press(t, a, tcell.KeyRune, 'R')
+			if r := finishJob(t, a); r.err == nil || !a.stale || a.panel != "message" {
+				t.Fatalf("err=%v stale=%t panel=%s", r.err, a.stale, a.panel)
+			}
+			if partial {
+				if len(a.repos.data) != 1 || a.repos.data[0].Name != "one" || a.message[0] != "PARTIAL STATISTICS" {
+					t.Fatal(a.repos.data, a.message)
+				}
+			} else if !slices.Equal(a.repos.data, sampleStats()) || a.message[0] != "ACTION FAILED" {
+				t.Fatal("failed scan lost the previous snapshot", a.repos.data, a.message)
+			}
+		})
+	}
+}
+
 func TestExplorerDrawResponsiveNoColorAndEmpty(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	for _, size := range [][2]int{{150, 40}, {120, 30}, {80, 24}, {60, 18}, {40, 10}, {1, 1}, {0, 0}} {

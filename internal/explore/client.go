@@ -1,5 +1,5 @@
-// Package explore implements the local statistics explorer and its optional
-// registry actions. Registry changes always go through a reviewed pruning plan.
+// Package explore implements the statistics explorer for snapshots and live
+// registries. Registry changes always go through a reviewed pruning plan.
 package explore
 
 import (
@@ -37,6 +37,14 @@ type request struct {
 	digests      []string
 }
 
+func (c *Client) statistics(ctx context.Context, logger *slog.Logger) ([]pruner.RepositoryStats, error) {
+	reg, err := c.Connect(ctx, logger, false)
+	if err != nil {
+		return nil, err
+	}
+	return pruner.CollectRegistryStats(ctx, reg, c.Protect, nil)
+}
+
 func (c *Client) manifests(ctx context.Context, logger *slog.Logger, repository string) ([]*registry.Manifest, error) {
 	reg, err := c.Connect(ctx, logger, false)
 	if err != nil {
@@ -68,7 +76,7 @@ func (c *Client) prepare(ctx context.Context, logger *slog.Logger, req request) 
 	switch req.kind {
 	case "rules":
 		if len(c.Rules) == 0 && c.RuleSource == "" {
-			return nil, fmt.Errorf("no rules loaded; press L to load a rule file, or pass --rules FILE")
+			return nil, fmt.Errorf("no rules selected; press l to choose rules, L to load a rule file, or pass --rules FILE")
 		}
 		for _, warning := range rules.Warnings(c.Rules) {
 			logger.Warn("Rule never applies", "file", c.RuleSource, "detail", warning)
