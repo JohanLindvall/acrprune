@@ -11,6 +11,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/JohanLindvall/crprune/internal/cancellation"
 	"github.com/JohanLindvall/crprune/internal/imageref"
 	"github.com/JohanLindvall/crprune/internal/progress"
 )
@@ -182,7 +183,7 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, o
 					// The interruption, returned below, is the only
 					// failure worth reporting of deletions it cut short;
 					// a refusal that came first is reported all the same.
-					if ctx.Err() == nil || !canceled(err) {
+					if ctx.Err() == nil || !cancellation.Only(err) {
 						failures = append(failures, err)
 					}
 				} else {
@@ -196,11 +197,6 @@ func (r *Registry) DeleteManifests(ctx context.Context, manifests []*Manifest, o
 	return deleted, errors.Join(append(failures, ctx.Err())...)
 }
 
-// canceled reports whether err is a cancellation's, or a deadline's.
-func canceled(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
 // deleteManifest deletes one manifest, first unlocking it when unlocker is set
 // and relocking it when the deletion fails.
 func (r *Registry) deleteManifest(ctx context.Context, unlocker Unlocker, m *Manifest) error {
@@ -211,8 +207,12 @@ func (r *Registry) deleteManifest(ctx context.Context, unlocker Unlocker, m *Man
 	if unlocker != nil {
 		relocks = r.unlock(ctx, unlocker, m)
 	}
-	r.logger.Info("Deleting manifest", "manifest", m)
-	if err := r.backend.DeleteManifest(ctx, m); err != nil {
+	err := ctx.Err() // canceled while unlocking
+	if err == nil {
+		r.logger.Info("Deleting manifest", "manifest", m)
+		err = r.backend.DeleteManifest(ctx, m)
+	}
+	if err != nil {
 		r.relock(ctx, relocks)
 		return fmt.Errorf("failed to delete manifest %s: %w", m.Ref(), err)
 	}

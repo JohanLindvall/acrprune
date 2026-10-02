@@ -295,9 +295,9 @@ func TestExploreRejectsBadInputsBeforeOpeningTerminal(t *testing.T) {
 	}
 }
 
-func TestExploreHelpExplainsSnapshotScope(t *testing.T) {
+func TestExploreHelpExplainsSelectedScope(t *testing.T) {
 	out, err := captureStdout(t, func() error { return newCommand().Run(t.Context(), []string{"crprune", "explore", "--help"}) })
-	if err != nil || !strings.Contains(out, "all snapshot repositories") || !strings.Contains(out, "--rules-dir") || !strings.Contains(out, "scans --registry") {
+	if err != nil || !strings.Contains(out, "marked repositories or a wildcard/regex selection") || !strings.Contains(out, "--rules-dir") || !strings.Contains(out, "scans --registry") {
 		t.Fatal(out, err)
 	}
 }

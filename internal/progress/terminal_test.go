@@ -279,6 +279,14 @@ func TestRunSummarizes(t *testing.T) {
 			want:    []string{"msg=Canceled operation=prune"},
 			wantErr: context.Canceled,
 		},
+		{
+			name:     "cancellation and failure",
+			opts:     Options{Mode: "tui", Operation: "prune"},
+			work:     func(context.Context, *slog.Logger) error { return errors.Join(context.Canceled, boom) },
+			want:     []string{"msg=Failed operation=prune"},
+			wantErr:  boom,
+			unwanted: []string{"msg=Canceled"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

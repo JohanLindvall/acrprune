@@ -52,6 +52,8 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 		a.drawPage(screen, t, a.message)
 	case a.panel == "rule-picker":
 		a.drawRulePicker(screen, t)
+	case a.panel == "repositories":
+		a.drawRepositorySelector(screen, t)
 	case a.panel == "help":
 		a.drawPage(screen, t, []string{
 			"KEYBOARD", "",
@@ -65,14 +67,16 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 			"i            Show repository statistics (also available without --registry)",
 			"Space        Mark / unmark a row",
 			"a / c        Toggle all visible rows / clear all marks",
+			"S            Add repository selections by wildcard or regex",
 			"m            Browse live images from a repository row or its statistics",
 			"d            Preview deletion of marked rows, or the current row",
 			"l / L        Choose bundled or local rules / load a JSON rule file",
-			"p / P        Preview rules for the current repo / ALL snapshot repos",
+			"p / P        Preview rules for the current repo / marked repositories",
 			"? / Esc      Help / back; q quits; Ctrl-C interrupts", "",
 			"Repository images include every listed manifest: tagged and untagged images, multiarch indexes, their platform children, and artifacts or referrers. Enter shows all tags, platforms, full digests, index children and parent indexes. Search for untagged, multiarch, or linux/arm64 to narrow the list. Image details require --registry; statistics files contain only aggregate counts.", "",
 			"The rule picker includes bundled examples and JSON files in --rules-dir (default ./rules). Enter selects one complete file; i shows its full descriptions and repository patterns. If no rules are selected, p or P opens the picker before preparing a preview.", "",
-			"Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. All snapshot repositories includes filtered-out rows. A loaded rule only applies where its repo pattern matches.", "",
+			"Use ↑/↓ and Space to select repositories, then P to preview rules for every marked repository, including hidden selections. S adds selections by wildcard (* and ?) or regex (Tab switches mode). Matches come from the full snapshot. With no marks, P opens the pattern selector directly; the default * matches all. A loaded rule only applies where its own repo pattern matches.", "",
+			"Deletion requires --registry, a fresh preview, and a typed confirmation. Image indexes select their children too; dependencies of kept images stay protected. Recent images, running images and locks use the same protection as prune. Esc cancels an active operation and waits for requests and lock restores, keeping the previous view. Canceled deletions report confirmed progress and require a new preview.", "",
 			"Unique bytes are charged to the first repository that referenced each blob during the original scan. Filtering does not recompute deduplication. Shared means repeated references, not reclaimable bytes. A running count of zero can mean no --running inventory was supplied. Deleting a tag's manifest removes ALL of its tags.", "",
 			"This screen never rewrites your statistics file. After deletion, use R in the repository view to rescan live statistics, or run stats again for a file snapshot.",
 		})
@@ -89,7 +93,7 @@ func (a *app) draw(screen tcell.Screen, now time.Time) {
 		tui.Dialog(screen, t, "SORT BY", lines)
 	case a.panel == "rules":
 		a.drawList(screen, t)
-		tui.Dialog(screen, t, "LOAD RULE FILE", []string{"Path to a crprune JSON rule file:", "> " + a.input + "▏", "", "Enter loads and validates · Esc cancels", "p applies to current repo · P to all snapshot repos", a.status})
+		tui.Dialog(screen, t, "LOAD RULE FILE", []string{"Path to a crprune JSON rule file:", "> " + a.input + "▏", "", "Enter loads and validates · Esc cancels", "p applies to current repo · P to marked repos or a pattern", a.status})
 	default:
 		a.drawList(screen, t)
 	}
@@ -199,15 +203,15 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 		if source == "" {
 			source = "none selected"
 		}
-		status = "Rules: " + source + "   l choose · p current repo · P all snapshot repos"
+		status = "Rules: " + source + "   l choose · p current · P marked/pattern"
 	}
 	if status == "" {
 		status = "Enter details · Space mark · a mark visible · c clear marks"
 	}
 	tui.Text(screen, 1, h-2, w-2, t.Muted, status)
-	footer := "Enter images  i stats  / search  s sort  d delete  l rules  ? help  q quit"
+	footer := "Enter images  Space mark  S pattern  P rules  d delete  ? help  q quit"
 	if a.opts.Client == nil {
-		footer = "Enter/i stats  / search  s sort  m images  l rules  ? help  q quit"
+		footer = "Enter/i stats  Space mark  S pattern  / search  s sort  ? help  q quit"
 	}
 	if a.repository != "" {
 		footer = "Enter details  Esc repos  i stats  / search  R reload  ? help  q quit"
@@ -218,7 +222,7 @@ func (a *app) drawList(screen tcell.Screen, t tui.Theme) {
 func (a *app) drawRulePicker(screen tcell.Screen, t tui.Theme) {
 	w, h := screen.Size()
 	tui.Text(screen, 1, 3, w-2, t.Accent, "CHOOSE RULE FILE")
-	scope := "Select one file, then p previews the current repository or P all snapshot repositories."
+	scope := "Select one file, then p previews the current repository or P uses marked repositories or a pattern."
 	if a.ruleRequest != nil {
 		scope = "Select and preview: " + a.ruleScope
 	}

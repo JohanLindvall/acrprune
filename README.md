@@ -279,10 +279,11 @@ crprune -r myregistry explore --running images.txt --keep-younger 7d stats.json
 | `i` | Show repository statistics, including exact byte counts |
 | `Space` | Mark or unmark a row; marks survive filtering and sorting |
 | `a` / `c` | Toggle all visible marks / clear all marks |
+| `S` | Add repository selections by wildcard or regex; review matches, then `Enter` marks them |
 | `m` | Fetch and browse live images from a repository row or its statistics page |
 | `d` | Preview deletion of marked repositories or manifests; with no marks, use the highlighted row |
 | `l` / `L` | Choose an automatically loaded rule file / load and validate another file by path |
-| `p` / `P` | Preview the selected rules for the current repository / **all repositories in the loaded snapshot**, including filtered-out rows; opens the rule picker if nothing is selected |
+| `p` / `P` | Preview rules for the current repository / **marked repositories**, including hidden selections; with no marks, `P` opens the wildcard/regex selector |
 | `R` | Rescan live statistics or reload the statistics file; reload live manifests when browsing a repository |
 | `?` / `Esc` | Help / back; help and full details scroll |
 | `q` / `Ctrl-C` | Quit / interrupt; active requests and lock restores finish before the terminal closes |
@@ -291,7 +292,11 @@ With `--registry`, highlight a repository and press `Enter` to see every listed 
 
 Press `Enter` on an image for complete tags and digests, platforms, locks, artifact/subject information, and the children or parent indexes connecting it to a multiarch image. Child descriptors also show platform variants when supplied by the registry. Sizes count each manifest's own document, config and layers; index children are counted in their own rows. `Esc` returns to the list, then to repositories. `i` opens the repository's aggregate statistics. A statistics file alone does not contain individual image details; add `--registry` to fetch them. Image browsing resolves missing platforms from image configs when supported by the registry.
 
-Ctrl-C exits with interrupt status 130 without logging cancellation as an error. Other failures, including cleanup errors accompanying an interruption, are still reported.
+`Esc` cancels an active preview, scan, image load, reload, or deletion and waits for requests and lock restores. Canceled reads keep the previous snapshot, image list, rules, filters, and marks, even if a result arrives just after cancellation. A canceled deletion reports confirmed deletions and requires a new preview. `Ctrl-C` exits with interrupt status 130 without logging cancellation as an error. Other failures, including cleanup errors accompanying an interruption, are still reported; deletion warnings remain visible in the result and after exiting.
+
+To apply rules to several repositories, move with `↑`/`↓`, toggle each with `Space`, then press `P`. Use `S` to add selections by pattern: wildcard mode supports `*` for any text (including `/`) and `?` for one character; all other characters are literal. `Tab` switches to Go regex mode, where `^commons-(deploy|worker)$`, for example, selects exactly those two names. Regexes can match part of a name unless anchored. Matching is case-sensitive unless the regex includes `(?i)`. Matches come from the full loaded snapshot, including filtered-out rows, and are shown before accepting. `Enter` adds them to the marks; `Esc` leaves selection unchanged. Adjust marks with `Space`, or clear them with `c`, before pressing `P`.
+
+With no marked repositories, `P` opens the same pattern selector directly for a rule preview. Its default `*` includes all snapshot repositories; enter a narrower pattern if needed. Empty or invalid patterns and patterns with no matches cannot start a preview. Selecting repositories still respects the active rules' repository patterns and order. If no rule file is selected, the rule picker opens before preparing the preview.
 
 The explorer automatically loads the bundled example rules and `*.json` files directly in `--rules-dir` (default `./rules`, relative to the working directory). Bundled rules are available even outside a checkout. Identical local copies are omitted; modified copies appear as separate choices with their own paths. The default directory may be absent; an explicitly supplied directory must exist. Invalid rule files remain visible with their errors and cannot be selected.
 

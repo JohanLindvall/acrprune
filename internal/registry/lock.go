@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/JohanLindvall/crprune/internal/cancellation"
 	"github.com/JohanLindvall/crprune/internal/imageref"
 )
 
@@ -72,9 +73,12 @@ type relock struct {
 // failed unlock that returned a Relock may have removed the lock all the same
 // — an interrupted request can take effect — so it is restored too.
 func (r *Registry) unlock(ctx context.Context, unlocker Unlocker, m *Manifest) []relock {
+	if ctx.Err() != nil {
+		return nil
+	}
 	var relocks []relock
 	add := func(what string, restore Relock, err error) {
-		if err != nil {
+		if err != nil && (ctx.Err() == nil || !cancellation.Only(err)) {
 			r.logger.Warn("Failed to unlock; attempting deletion anyway", "unlocking", what, "err", err)
 		}
 		if restore != nil {
@@ -87,6 +91,9 @@ func (r *Registry) unlock(ctx context.Context, unlocker Unlocker, m *Manifest) [
 		add(m.Ref(), restore, err)
 	}
 	for _, tag := range m.LockedTags {
+		if ctx.Err() != nil {
+			break
+		}
 		r.logger.Info("Unlocking tag", "repository", m.Repository, "tag", tag)
 		restore, err := unlocker.UnlockTag(ctx, m.Repository, tag)
 		add(m.Repository+":"+tag, restore, err)

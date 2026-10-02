@@ -81,6 +81,9 @@ func TestRulePickerPreviewsOnlySelectedFileAndScope(t *testing.T) {
 			c := testClient(b)
 			a := newApp(sampleStats(), Options{Client: c, RuleFiles: catalog, Filter: "one"})
 			press(t, a, tcell.KeyRune, key)
+			if key == 'P' {
+				press(t, a, tcell.KeyEnter, 0)
+			}
 			if a.panel != "rule-picker" || a.job != nil || c.RuleSource != "" {
 				t.Fatal("preview did not wait for a rule choice")
 			}
@@ -121,6 +124,9 @@ func TestRulePickerPreviewsOnlySelectedFileAndScope(t *testing.T) {
 				t.Fatal("choosing rules unexpectedly started work")
 			}
 			press(t, a, tcell.KeyRune, key)
+			if key == 'P' {
+				press(t, a, tcell.KeyEnter, 0)
+			}
 			finishJob(t, a)
 			if a.plan != nil || a.message[0] != "NOTHING TO DELETE" {
 				t.Fatal(a.plan, a.message)

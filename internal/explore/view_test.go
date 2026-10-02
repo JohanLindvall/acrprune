@@ -41,10 +41,7 @@ func finishJob(t *testing.T, a *app) result {
 	}
 	select {
 	case r := <-a.job.done:
-		a.job.cancel()
-		a.job = nil
-		a.finish(r)
-		return r
+		return a.finishJob(r)
 	case <-time.After(5 * time.Second):
 		t.Fatal("job did not finish")
 		return result{}
@@ -162,7 +159,7 @@ func TestDeletionNeedsExactConfirmationAndCanBeCanceled(t *testing.T) {
 	}
 }
 
-func TestAllRulesUsesSnapshotNotFilterOrMarks(t *testing.T) {
+func TestAllRulesPatternUsesSnapshotNotFilter(t *testing.T) {
 	b := registrytest.New()
 	for _, name := range []string{"one", "two", "three", "outside"} {
 		b.Add(name, registrytest.Image(name), registry.Attributes{LastUpdated: time.Now().Add(-48 * time.Hour)})
@@ -170,8 +167,8 @@ func TestAllRulesUsesSnapshotNotFilterOrMarks(t *testing.T) {
 	c := testClient(b)
 	c.Rules = compileRules(t, `[{"repo":".+","untagged":[{"keep":false}]}]`)
 	a := newApp(sampleStats(), Options{Client: c, Filter: "one"})
-	press(t, a, tcell.KeyRune, ' ')
 	press(t, a, tcell.KeyRune, 'P')
+	press(t, a, tcell.KeyEnter, 0)
 	finishJob(t, a)
 	if len(a.targets) != 3 || !strings.Contains(a.scope, "all 3 snapshot repositories") {
 		t.Fatalf("scope=%s targets=%+v", a.scope, a.targets)

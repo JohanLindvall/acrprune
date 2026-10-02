@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JohanLindvall/crprune/internal/cancellation"
 	"github.com/JohanLindvall/crprune/internal/progress"
 	"github.com/JohanLindvall/crprune/internal/pruner"
 	"github.com/JohanLindvall/crprune/internal/registry"
@@ -64,7 +65,21 @@ func Run(ctx context.Context, stats []pruner.RepositoryStats, opts Options) erro
 	defer func() {
 		tui.Disown(screen)
 		for _, r := range a.completed {
-			a.opts.Logger.Info("Explorer cleanup", "confirmed", r.outcome, "error", r.err)
+			message := "Explorer cleanup"
+			if r.canceled {
+				message += " canceled"
+			}
+			attrs := []any{"confirmed", r.outcome}
+			if err := r.failure(); err != nil {
+				attrs = append(attrs, "error", err)
+			}
+			a.opts.Logger.Info(message, attrs...)
+			for _, entry := range r.warnings {
+				a.opts.Logger.Log(context.WithoutCancel(ctx), entry.Level, entry.Text, slog.Time("at", entry.Time))
+			}
+			if r.droppedWarnings > 0 {
+				a.opts.Logger.Info("Earlier cleanup warnings were omitted from the bounded display", "omitted", r.droppedWarnings)
+			}
 		}
 	}()
 	if opts.OnLogger != nil {
@@ -82,10 +97,22 @@ type result struct {
 	rules                    []*rules.RepoRule
 	outcome                  pruner.PruneStats
 	err                      error
+	canceled                 bool
+	warnings                 []progress.Entry
+	droppedWarnings          int
+}
+
+// failure preserves independent failures, even when the user also canceled.
+func (r result) failure() error {
+	if r.canceled && cancellation.Only(r.err) {
+		return nil
+	}
+	return r.err
 }
 
 type job struct {
 	title    string
+	ctx      context.Context
 	cancel   context.CancelFunc
 	done     chan result
 	stopping bool
@@ -107,6 +134,7 @@ type app struct {
 	ruleCursor, ruleOffset, ruleRows int
 	ruleRequest                      *request
 	ruleScope                        string
+	selector                         repositorySelector
 	stale                            bool
 	reviewable                       bool
 	tracker                          *progress.Tracker
@@ -144,7 +172,7 @@ func (a *app) keys() []string {
 	return sortKeys
 }
 
-func (a *app) run(ctx context.Context, screen tcell.Screen) error {
+func (a *app) run(ctx context.Context, screen tcell.Screen) (runErr error) {
 	events := make(chan tcell.Event, 8)
 	quit, stopped := make(chan struct{}), make(chan struct{})
 	go func() { defer close(stopped); screen.ChannelEvents(events, quit) }()
@@ -153,10 +181,9 @@ func (a *app) run(ctx context.Context, screen tcell.Screen) error {
 	defer func() {
 		if a.job != nil {
 			a.job.cancel()
-			r := <-a.job.done
-			if r.kind == "execute" {
-				a.completed = append(a.completed, r)
-			}
+			a.job.stopping = true
+			r := a.finishJob(<-a.job.done)
+			runErr = errors.Join(runErr, r.failure())
 		}
 	}()
 	tick := time.NewTicker(125 * time.Millisecond)
@@ -185,11 +212,9 @@ func (a *app) run(ctx context.Context, screen tcell.Screen) error {
 			a.job.stopping = true
 			closing, canceled = ctx.Err(), nil
 		case r := <-done:
-			a.job.cancel()
-			a.job = nil
-			a.finish(r)
+			r = a.finishJob(r)
 			if closing != nil {
-				return closing
+				return errors.Join(closing, r.failure())
 			}
 		case <-refresh:
 		case event, ok := <-events:
@@ -219,7 +244,7 @@ func (a *app) run(ctx context.Context, screen tcell.Screen) error {
 func (a *app) start(ctx context.Context, title string, work func(context.Context) result) {
 	a.tracker.Reset()
 	ctx, cancel := context.WithCancel(a.tracker.Context(ctx))
-	j := &job{title: title, cancel: cancel, done: make(chan result, 1)}
+	j := &job{title: title, ctx: ctx, cancel: cancel, done: make(chan result, 1)}
 	a.job, a.status = j, ""
 	go func() {
 		defer func() {
@@ -229,6 +254,20 @@ func (a *app) start(ctx context.Context, title string, work func(context.Context
 		}()
 		j.done <- work(ctx)
 	}()
+}
+
+func (a *app) finishJob(r result) result {
+	// Capture cancellation before releasing the context. Esc also discards
+	// a successful result that raced with the keypress, including a preview.
+	r.canceled = a.job.stopping || cancellation.Only(a.job.ctx.Err())
+	a.job.cancel()
+	a.job = nil
+	if r.kind == "execute" {
+		s := a.tracker.Snapshot()
+		r.warnings, r.droppedWarnings = s.WarningLogs, s.DroppedWarnings
+	}
+	a.finish(r)
+	return r
 }
 
 func (a *app) live() bool {
@@ -284,6 +323,7 @@ func (a *app) showMessage(title string, lines ...string) {
 }
 
 func (a *app) finish(r result) {
+	err := r.failure()
 	if r.kind == "execute" {
 		a.completed = append(a.completed, r)
 		a.plan, a.targets, a.panel = nil, nil, ""
@@ -295,14 +335,40 @@ func (a *app) finish(r result) {
 		}
 		lines := []string{fmt.Sprintf("Confirmed deletions: %d manifests, %d repositories.", r.outcome.DeletedManifests, r.outcome.Repositories-r.outcome.KeptRepositories),
 			"The loaded statistics snapshot is now potentially stale. " + refresh + " Use R in the manifest view to reload live images."}
-		if r.err != nil {
-			lines = append(lines, "Stopped: "+r.err.Error(), "Some deletions may have succeeded. Prepare a new preview before retrying.")
+		title := "DELETION RESULT"
+		if r.canceled {
+			title = "DELETION CANCELED"
+			lines = append(lines, "Cancellation requested; active requests and lock restores have finished.")
 		}
-		a.showMessage("DELETION RESULT", lines...)
+		if err != nil {
+			lines = append(lines, "Stopped: "+err.Error())
+		}
+		if r.canceled || err != nil {
+			lines = append(lines, "Some deletions may have succeeded. Prepare a new preview before retrying.")
+		}
+		for _, entry := range r.warnings {
+			lines = append(lines, "Warning: "+entry.Text)
+		}
+		if r.droppedWarnings > 0 {
+			lines = append(lines, fmt.Sprintf("%d earlier warnings omitted.", r.droppedWarnings))
+		}
+		a.showMessage(title, lines...)
 		return
 	}
-	if r.err != nil && (r.kind != "statistics" || r.stats == nil) {
-		a.showMessage("ACTION FAILED", r.err.Error())
+	if r.canceled {
+		a.panel, a.plan, a.targets, a.input = "", nil, nil, ""
+		if err != nil {
+			a.showMessage("ACTION FAILED", err.Error())
+		} else {
+			a.status = "Action canceled"
+			if r.kind == "preview" {
+				a.status = "Preview canceled; nothing was deleted"
+			}
+		}
+		return
+	}
+	if err != nil && (r.kind != "statistics" || r.stats == nil) {
+		a.showMessage("ACTION FAILED", err.Error())
 		return
 	}
 	switch r.kind {
@@ -448,6 +514,10 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 		} else {
 			editText(&a.input, key)
 		}
+		return false, nil
+	}
+	if a.panel == "repositories" {
+		a.selectRepositories(ctx, key)
 		return false, nil
 	}
 	if key.Rune() == 'q' {
@@ -604,6 +674,10 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 		l.searching, l.beforeQuery = true, l.query
 	case key.Rune() == 's':
 		a.panel, a.sortCursor = "sort", max(0, slices.Index(a.keys(), l.sortKey))
+	case key.Rune() == 'S':
+		if a.repository == "" {
+			a.chooseRepositories(false)
+		}
 	case key.Rune() == 'r':
 		l.reverse = !l.reverse
 		l.refilter(l.current())
@@ -657,11 +731,14 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 			a.prepare(ctx, request{kind: "rules", repositories: []string{name}}, "rules for "+name)
 		}
 	case key.Rune() == 'P':
-		names := make([]string, len(a.repos.data))
-		for i, s := range a.repos.data {
-			names[i] = s.Name
+		if a.live() {
+			if len(a.repos.marked) > 0 {
+				names := a.repos.selected()
+				a.prepare(ctx, request{kind: "rules", repositories: names}, fmt.Sprintf("rules for %d marked snapshot repositories (including hidden selections)", len(names)))
+			} else {
+				a.chooseRepositories(true)
+			}
 		}
-		a.prepare(ctx, request{kind: "rules", repositories: names}, fmt.Sprintf("rules for all %d snapshot repositories (including filtered-out rows)", len(names)))
 	}
 	return false, nil
 }

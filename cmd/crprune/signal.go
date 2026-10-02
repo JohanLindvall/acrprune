@@ -17,27 +17,6 @@ var (
 	exit            = os.Exit
 )
 
-// cancellationOnly recognizes a cancellation through wrappers without hiding
-// another error joined to it, such as a failure to restore an image lock.
-func cancellationOnly(err error) bool {
-	if err == context.Canceled {
-		return true
-	}
-	switch wrapped := err.(type) {
-	case interface{ Unwrap() error }:
-		return cancellationOnly(wrapped.Unwrap())
-	case interface{ Unwrap() []error }:
-		errs := wrapped.Unwrap()
-		for _, inner := range errs {
-			if !cancellationOnly(inner) {
-				return false
-			}
-		}
-		return len(errs) > 0
-	}
-	return false
-}
-
 // signalCause is the cause of a run's cancellation by a signal.
 type signalCause struct {
 	os.Signal
@@ -106,12 +85,14 @@ func (in *interrupts) handle(signals <-chan os.Signal, done <-chan struct{}, can
 	case <-done:
 		return
 	}
-	cancel(signalCause{sig})
+	// Log before waking workers: they can finish and exit the process as
+	// soon as their context is canceled, losing the stopping message.
 	if in.unlocking.Load() {
 		in.logger().Warn("Stopping: waiting for requests in flight and restoring the locks removed for deletions this cuts short; another signal exits at once, abandoning them", "signal", sig.String())
 	} else {
 		in.logger().Warn("Stopping: waiting for requests in flight; another signal exits at once", "signal", sig.String())
 	}
+	cancel(signalCause{sig})
 	select {
 	case sig = <-signals:
 	case <-done:

@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/JohanLindvall/crprune/internal/cancellation"
 	"github.com/JohanLindvall/crprune/internal/tui"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
@@ -96,7 +97,7 @@ func RestoreTerminal() { tui.RestoreTerminal() }
 // scrollback once the terminal is restored.
 func summarize(ctx context.Context, logger *slog.Logger, opts Options, s Snapshot, err error) {
 	status := "Completed"
-	if errors.Is(err, context.Canceled) {
+	if cancellation.Only(err) {
 		status = "Canceled"
 	} else if err != nil {
 		status = "Failed"

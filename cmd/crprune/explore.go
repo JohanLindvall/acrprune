@@ -31,7 +31,7 @@ func exploreCommand(connect func(context.Context, *cli.Command, registry.Address
 			&cli.StringFlag{Name: "sort", Aliases: []string{"s"}, Value: "unique", Usage: "initial sort key: " + strings.Join(pruner.StatSortKeys(), ", ")},
 			&cli.BoolFlag{Name: "reverse", Usage: "reverse the initial sort order"},
 			&cli.StringFlag{Name: "filter", Aliases: []string{"f"}, Usage: "initial repository name search"},
-			&cli.StringFlag{Name: "rules", Usage: "initial rule file for p (current repository) or P (all snapshot repositories); l selects available rules"},
+			&cli.StringFlag{Name: "rules", Usage: "initial rule file for p (current repository) or P (marked repositories or a wildcard/regex selection); l selects available rules"},
 			&cli.StringFlag{Name: "rules-dir", Value: "rules", Usage: "directory of JSON rule files to load alongside the bundled examples"},
 			&ruleDurationFlag{Name: "keep-younger", Value: 24 * time.Hour, Usage: "protect images updated within this duration during cleanup (e.g. 24h, 7d)"},
 			&cli.BoolFlag{Name: "include-locked", Usage: "allow reviewed cleanup to unlock and delete locked images (ACR)"},

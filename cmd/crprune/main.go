@@ -23,6 +23,7 @@ import (
 	"github.com/urfave/cli/v3"
 	"golang.org/x/term"
 
+	"github.com/JohanLindvall/crprune/internal/cancellation"
 	"github.com/JohanLindvall/crprune/internal/fileio"
 	"github.com/JohanLindvall/crprune/internal/progress"
 	"github.com/JohanLindvall/crprune/internal/pruner"
@@ -367,7 +368,7 @@ func newCommandWithConnector(connect func(context.Context, *cli.Command, registr
 		ExitErrHandler: func(ctx context.Context, cmd *cli.Command, err error) {
 			// Keep the interrupt exit status without reporting the user's
 			// cancellation as a failure (e.g. Ctrl-C in the explorer).
-			if cancellationOnly(err) {
+			if cancellation.Only(err) {
 				return
 			}
 			logger.Error("An error occurred", "err", err)
