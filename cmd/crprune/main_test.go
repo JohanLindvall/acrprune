@@ -245,6 +245,26 @@ func TestGitHubToken(t *testing.T) {
 	}
 }
 
+func TestGitHubTokenCancellation(t *testing.T) {
+	noGitHubCredentials(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ghAuthToken = func(context.Context) (string, error) {
+		cancel()
+		return "", errors.New("signal: killed")
+	}
+	if _, err := githubToken(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("authentication cancellation = %v", err)
+	}
+	ghAuthToken = func(context.Context) (string, error) {
+		t.Fatal("started a credential helper with a canceled context")
+		return "", nil
+	}
+	if _, err := githubToken(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("already canceled authentication = %v", err)
+	}
+}
+
 func TestLoadRunningRules(t *testing.T) {
 	addr, err := registry.ParseAddress("ghcr.io/acme")
 	if err != nil {

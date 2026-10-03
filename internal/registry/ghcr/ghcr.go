@@ -234,13 +234,16 @@ func (b *Backend) namespace(ctx context.Context) (string, http.Header, error) {
 func (b *Backend) ListRepositories(ctx context.Context) ([]string, error) {
 	names := []string{}
 	err := b.paginate(ctx, b.packages+"?package_type=container&per_page="+strconv.Itoa(b.pageSize), func(body io.Reader) error {
-		var page []struct {
+		page, err := decodePage[struct {
 			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(body).Decode(&page); err != nil {
+		}](body)
+		if err != nil {
 			return fmt.Errorf("failed to decode packages: %w", err)
 		}
 		for _, p := range page {
+			if !imageref.ValidRepository(p.Name) {
+				return fmt.Errorf("invalid package name %q in listing", p.Name)
+			}
 			names = append(names, p.Name)
 		}
 		return nil
@@ -252,6 +255,27 @@ func (b *Backend) ListRepositories(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("failed to list the packages of %s: %w", b.owner, err)
 	}
 	return names, nil
+}
+
+// decodePage requires one complete JSON array. A null or truncated inventory
+// must not be mistaken for an empty package or repository.
+func decodePage[T any](body io.Reader) ([]T, error) {
+	decoder := json.NewDecoder(body)
+	var page []T
+	if err := decoder.Decode(&page); err != nil {
+		return nil, err
+	}
+	if page == nil {
+		return nil, errors.New("expected an array, got null")
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return nil, fmt.Errorf("unexpected content after listing: %w", err)
+	}
+	return page, nil
 }
 
 // packageVersion is the part of a package version the pruner needs.
@@ -289,9 +313,16 @@ func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(
 		return fmt.Errorf("invalid repository name %q", repository)
 	}
 	err := b.paginate(ctx, b.packageURL(repository)+"/versions?per_page="+strconv.Itoa(b.pageSize), func(body io.Reader) error {
-		var page []packageVersion
-		if err := json.NewDecoder(body).Decode(&page); err != nil {
+		page, err := decodePage[packageVersion](body)
+		if err != nil {
 			return fmt.Errorf("failed to decode package versions: %w", err)
+		}
+		// An untagged version has an explicit empty tags array. Missing
+		// metadata does not establish that the version is untagged.
+		for _, v := range page {
+			if v.ID <= 0 || v.Metadata.Container.Tags == nil {
+				return fmt.Errorf("incomplete package version %q: positive id and tag inventory are required", v.Name)
+			}
 		}
 		for _, v := range page {
 			if err := fn(v.attributes()); err != nil {
@@ -326,7 +357,7 @@ func (b *Backend) DeleteManifest(ctx context.Context, m *registry.Manifest) erro
 		return fmt.Errorf("invalid repository name %q", m.Repository)
 	}
 	// The id goes into the URL path; it must be the number the listing gave.
-	if _, err := strconv.ParseUint(m.ID, 10, 64); err != nil {
+	if id, err := strconv.ParseUint(m.ID, 10, 64); err != nil || id == 0 {
 		return fmt.Errorf("manifest %s has no package version id", m.Ref())
 	}
 	return b.delete(ctx, b.packageURL(m.Repository)+"/versions/"+m.ID)

@@ -24,6 +24,11 @@ func ValidRepository(name string) bool {
 	return len(name) <= 255 && repositoryPattern.MatchString(name)
 }
 
+// ValidTag reports whether tag is a complete OCI Distribution tag name.
+func ValidTag(tag string) bool {
+	return tagPattern.MatchString(tag)
+}
+
 // ValidOwner reports whether name can be a single namespace component.
 func ValidOwner(name string) bool {
 	return ValidRepository(name) && !strings.Contains(name, "/")
@@ -37,7 +42,7 @@ func Split(ref string) (repository, tag, pinned string, err error) {
 	if !ValidRepository(repository) {
 		return "", "", "", fmt.Errorf("invalid repository name %q", repository)
 	}
-	if hasTag && !tagPattern.MatchString(tag) {
+	if hasTag && !ValidTag(tag) {
 		return "", "", "", fmt.Errorf("invalid image tag %q", tag)
 	}
 	if hasDigest {

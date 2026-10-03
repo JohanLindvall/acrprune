@@ -42,11 +42,55 @@ func (t Theme) OnPanel(style tcell.Style) tcell.Style {
 // Clean prevents control and bidi formatting characters from changing layout.
 func Clean(s string) string {
 	return strings.Map(func(r rune) rune {
-		if !unicode.IsGraphic(r) {
+		// Joiners are part of emoji graphemes and scripts such as Persian.
+		// Preserve them without admitting bidi overrides or other controls.
+		if !unicode.IsGraphic(r) && r != '\u200c' && r != '\u200d' {
 			return ' '
 		}
 		return r
 	}, s)
+}
+
+// Wrap splits sanitized text at word or grapheme boundaries. It examines only
+// the next line's worth of text, so long paragraphs take linear time. A
+// grapheme wider than width occupies a line by itself; Text clips it on draw.
+func Wrap(text string, width int) []string {
+	text = Clean(text)
+	width = max(1, width)
+	var lines []string
+	for text != "" {
+		g := uniseg.NewGraphemes(text)
+		end, space, cells := 0, 0, 0
+		for g.Next() {
+			if cells+g.Width() > width {
+				if g.Str() == " " {
+					space = end // a word ending exactly at the margin fits
+				}
+				if end == 0 {
+					_, end = g.Positions()
+				}
+				break
+			}
+			cells += g.Width()
+			_, end = g.Positions()
+			if g.Str() == " " {
+				space = end
+			}
+		}
+		if end == len(text) {
+			lines = append(lines, text)
+			break
+		}
+		if space > 0 {
+			end = space
+		}
+		lines = append(lines, strings.TrimRight(text[:end], " "))
+		text = strings.TrimLeft(text[end:], " ")
+	}
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
 }
 
 // Text writes a single line, clipping at grapheme boundaries and reserving an
@@ -110,31 +154,7 @@ func Dialog(screen tcell.Screen, theme Theme, title string, lines []string) {
 	inner := max(1, width-4)
 	var wrapped []string
 	for _, line := range lines {
-		line = Clean(line)
-		for uniseg.StringWidth(line) > inner {
-			end, space := 0, 0
-			g := uniseg.NewGraphemes(line)
-			cells := 0
-			for g.Next() {
-				cells += g.Width()
-				if cells > inner {
-					break
-				}
-				_, end = g.Positions()
-				if g.Str() == " " {
-					space = end
-				}
-			}
-			if space > 0 {
-				end = space
-			}
-			if end == 0 {
-				break
-			}
-			wrapped = append(wrapped, strings.TrimRight(line[:end], " "))
-			line = strings.TrimLeft(line[end:], " ")
-		}
-		wrapped = append(wrapped, line)
+		wrapped = append(wrapped, Wrap(line, inner)...)
 	}
 	height := min(h, len(wrapped)+4)
 	x, y := (w-width)/2, (h-height)/2

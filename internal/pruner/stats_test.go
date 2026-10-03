@@ -1,6 +1,8 @@
 package pruner
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -13,6 +15,20 @@ import (
 	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 	"github.com/JohanLindvall/crprune/internal/rules"
 )
+
+func TestStatsCancellationAfterLastRepositoryRetainsSnapshot(t *testing.T) {
+	b := registrytest.New()
+	b.Add("app", registrytest.Image("app"), registry.Attributes{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stats, err := CollectRegistryStats(ctx, fakePruner(t, b).Registry, nil, func([]RepositoryStats) error {
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || len(stats) != 1 || stats[0].Name != "app" {
+		t.Fatalf("stats=%v err=%v; want completed snapshot and cancellation", stats, err)
+	}
+}
 
 func TestRunningMatchUsesOnlyFirstRepositoryRule(t *testing.T) {
 	rules := ruleSet(t, `[{"repo":"^app$","tagged":[{"tag":"^v2$","keep":true}]},{"repo":".+","tagged":[{"keep":true}],"untagged":[{"keep":true}]}]`)

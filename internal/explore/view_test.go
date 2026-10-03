@@ -299,18 +299,10 @@ func TestRenderSample(t *testing.T) {
 	if out == "" {
 		t.Skip("set CRPRUNE_RENDER_DIR for sample render")
 	}
-	f, err := os.Open("../../ghcr.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-	stats, err := pruner.ReadStats(f)
-	if err != nil {
-		t.Fatal(err)
-	}
+	stats := sampleStats()
 	for _, size := range [][2]int{{140, 34}, {80, 24}} {
 		s := screenFor(t, size[0], size[1])
-		a := newApp(stats, Options{Source: "ghcr.json"})
+		a := newApp(stats, Options{Source: "sample statistics"})
 		a.draw(s, time.Now())
 		cells, w, h := s.GetContents()
 		type cell struct {

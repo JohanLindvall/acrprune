@@ -109,6 +109,7 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 	var missing []Attributes
 	listed := 0
 	seen := map[string]struct{}{}
+	tagOwners := map[string]string{}
 	listErr := r.backend.ListManifests(groupCtx, repository, func(attrs Attributes) error {
 		if err := groupCtx.Err(); err != nil {
 			return err
@@ -120,6 +121,15 @@ func (r *Registry) FetchRepositoryManifests(ctx context.Context, repository stri
 		progress.Report(ctx, progress.Event{Kind: progress.Listed, Count: 1})
 		if _, err := godigest.Parse(attrs.Digest); err != nil {
 			return fmt.Errorf("listing returned an invalid manifest digest %q: %w", attrs.Digest, err)
+		}
+		for _, tag := range attrs.Tags {
+			if !imageref.ValidTag(tag) {
+				return fmt.Errorf("listing returned an invalid tag %q for %s@%s", tag, repository, attrs.Digest)
+			}
+			if previous, exists := tagOwners[tag]; exists && previous != attrs.Digest {
+				return fmt.Errorf("%w: tag %s:%s refers to both %s and %s; rerun the command", ErrRepositoryChanged, repository, tag, previous, attrs.Digest)
+			}
+			tagOwners[tag] = attrs.Digest
 		}
 		if _, duplicate := seen[attrs.Digest]; duplicate {
 			return fmt.Errorf("%w: manifest %s@%s was listed more than once, as happens when the repository changes during pagination; rerun the command", ErrRepositoryChanged, repository, attrs.Digest)

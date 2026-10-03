@@ -286,6 +286,32 @@ func TestDuplicateListingFailsClosed(t *testing.T) {
 	}
 }
 
+func TestListingRejectsInvalidTags(t *testing.T) {
+	for _, tag := range []string{"", "has whitespace", "../latest", "\x1b[2J", strings.Repeat("a", 129)} {
+		t.Run(tag, func(t *testing.T) {
+			b := registrytest.New()
+			b.Add("app", registrytest.Image("a"), registry.Attributes{Tags: []string{tag}})
+			_, _, err := newRegistry(t, b, nil).FetchRepositoryManifests(t.Context(), "app", registry.FetchOptions{})
+			if err == nil || !strings.Contains(err.Error(), "invalid tag") {
+				t.Fatalf("malformed tags reached the inventory: %v", err)
+			}
+			if b.Calls("GetManifest") != 0 {
+				t.Fatal("downloaded content after an invalid listing")
+			}
+		})
+	}
+}
+
+func TestListingRejectsAmbiguousTagOwners(t *testing.T) {
+	b := registrytest.New()
+	b.Add("app", registrytest.Image("a"), registry.Attributes{Tags: []string{"latest"}})
+	b.Add("app", registrytest.Image("b"), registry.Attributes{Tags: []string{"latest"}})
+	_, _, err := newRegistry(t, b, nil).FetchRepositoryManifests(t.Context(), "app", registry.FetchOptions{})
+	if !errors.Is(err, registry.ErrRepositoryChanged) || !strings.Contains(err.Error(), "tag") {
+		t.Fatalf("ambiguous tag inventory was accepted: %v", err)
+	}
+}
+
 func TestListingFailureCancelsDownloads(t *testing.T) {
 	fake := registrytest.New()
 	digest := fake.Add("app", registrytest.Image("a"), registry.Attributes{})
@@ -477,10 +503,10 @@ func TestFetchDerivesTagSubjects(t *testing.T) {
 	att := fake.Add("app", registrytest.Image("attestation"), registry.Attributes{Tags: []string{tagOf(image) + ".att", tagOf(image) + ".sbom"}})
 	fallback := fake.Add("app", registrytest.Index(registrytest.Child(att, "unknown", "unknown")), registry.Attributes{Tags: []string{tagOf(image)}})
 	elsewhere := fake.Add("app", registrytest.Image("elsewhere"), registry.Attributes{Tags: []string{tagOf(godigest.FromString("not here").String()) + ".sig"}})
-	mixed := fake.Add("app", registrytest.Image("mixed"), registry.Attributes{Tags: []string{tagOf(image) + ".sig", "latest"}})
+	mixed := fake.Add("app", registrytest.Image("mixed"), registry.Attributes{Tags: []string{tagOf(att) + ".sig", "latest"}})
 	declared := registrytest.Image("declared")
 	declared.Subject = &v1.Descriptor{MediaType: v1.MediaTypeImageManifest, Digest: godigest.Digest(att)}
-	oci := fake.Add("app", declared, registry.Attributes{Tags: []string{tagOf(image) + ".sig"}})
+	oci := fake.Add("app", declared, registry.Attributes{Tags: []string{tagOf(cosign) + ".sig"}})
 	raw, err := json.Marshal(registrytest.Image("cosign"))
 	if err != nil {
 		t.Fatal(err)

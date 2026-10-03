@@ -151,7 +151,9 @@ func runScreen(ctx context.Context, screen tcell.Screen, tracker *Tracker, opts 
 	defer cancel()
 	log := slog.New(&logHandler{tracker: tracker, base: logger.Handler()})
 	result := make(chan error, 1)
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		defer func() {
 			if value := recover(); value != nil {
 				result <- &panicError{value: value, stack: debug.Stack()}
@@ -159,6 +161,9 @@ func runScreen(ctx context.Context, screen tcell.Screen, tracker *Tracker, opts 
 		}()
 		result <- work(ctx, log)
 	}()
+	// This also runs when drawing or syncing the screen panics. Workers
+	// may need to restore registry locks after cancellation.
+	defer func() { cancel(); <-finished }()
 
 	events := make(chan tcell.Event, 8)
 	quit := make(chan struct{})

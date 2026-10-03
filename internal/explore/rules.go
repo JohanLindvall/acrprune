@@ -3,6 +3,7 @@ package explore
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -45,13 +46,27 @@ func DiscoverRules(directory string) []RuleFile {
 			continue
 		}
 		source := filepath.Join(directory, entry.Name())
-		data, err := os.ReadFile(source)
+		data, err := readRuleFile(source)
 		if original, ok := bundled[entry.Name()]; ok && err == nil && bytes.Equal(original, data) {
 			continue
 		}
 		catalog = append(catalog, compileRuleFile(source, data, err))
 	}
 	return catalog
+}
+
+// Interactive rule loading accepts regular files, including symlinks to
+// them. Opening a named pipe could otherwise hang discovery or prevent an
+// active load from finishing when the user cancels the explorer.
+func readRuleFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("rule source %q is not a regular file", path)
+	}
+	return os.ReadFile(path)
 }
 
 func compileRuleFile(source string, data []byte, err error) RuleFile {

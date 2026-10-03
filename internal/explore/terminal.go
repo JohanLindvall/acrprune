@@ -499,17 +499,9 @@ func (a *app) key(ctx context.Context, key *tcell.EventKey) (bool, error) {
 				return false, nil
 			}
 			a.start(ctx, "Loading rules", func(context.Context) result {
-				f, err := os.Open(path)
-				if err != nil {
-					return result{err: err}
-				}
-				defer func() { _ = f.Close() }()
-				specs, err := rules.ParseSpecs(f)
-				if err != nil {
-					return result{err: err}
-				}
-				compiled, err := rules.Compile(specs)
-				return result{kind: "rules", rules: compiled, source: path, err: err}
+				data, err := readRuleFile(path)
+				file := compileRuleFile(path, data, err)
+				return result{kind: "rules", rules: file.Rules, source: file.Source, err: file.Err}
 			})
 		} else {
 			editText(&a.input, key)

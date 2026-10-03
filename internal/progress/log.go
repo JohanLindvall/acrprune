@@ -16,8 +16,15 @@ import (
 type logHandler struct {
 	tracker *Tracker
 	base    slog.Handler
-	attrs   []slog.Attr
+	attrs   []boundAttr
 	group   string
+}
+
+// A bound attribute keeps the group that was active when WithAttrs was
+// called. Changing its key would corrupt empty groups and zero attributes.
+type boundAttr struct {
+	group string
+	attr  slog.Attr
 }
 
 func (h *logHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -49,8 +56,8 @@ func (h *logHandler) Handle(_ context.Context, record slog.Record) error {
 		}
 		fmt.Fprintf(&text, "  %s=%v", key, attr.Value)
 	}
-	for _, attr := range h.attrs {
-		add("", attr)
+	for _, bound := range h.attrs {
+		add(bound.group, bound.attr)
 	}
 	record.Attrs(func(attr slog.Attr) bool { add(h.group, attr); return true })
 	h.tracker.appendLog(Entry{Time: record.Time, Level: record.Level, Text: truncate(clean(text.String()), maxEntryText)}, retryUntil)
@@ -60,13 +67,8 @@ func (h *logHandler) Handle(_ context.Context, record slog.Record) error {
 func (h *logHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	clone := *h
 	clone.attrs = slices.Clone(h.attrs)
-	if h.group != "" {
-		for _, attr := range attrs {
-			attr.Key = h.group + attr.Key
-			clone.attrs = append(clone.attrs, attr)
-		}
-	} else {
-		clone.attrs = append(clone.attrs, attrs...)
+	for _, attr := range attrs {
+		clone.attrs = append(clone.attrs, boundAttr{group: h.group, attr: attr})
 	}
 	return &clone
 }

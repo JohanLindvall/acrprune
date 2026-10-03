@@ -257,7 +257,7 @@ func (a *app) drawRulePicker(screen tcell.Screen, t tui.Theme) {
 	} else if details > 0 {
 		var lines []string
 		for _, line := range ruleDetails(a.opts.RuleFiles[a.ruleCursor]) {
-			lines = append(lines, wrap(line, max(1, w-4))...)
+			lines = append(lines, tui.Wrap(line, w-4)...)
 		}
 		for i, line := range lines[:min(len(lines), details)] {
 			tui.Text(screen, 2, h-2-details+i, w-4, t.Muted, line)
@@ -510,7 +510,7 @@ func (a *app) drawPage(screen tcell.Screen, t tui.Theme, paragraphs []string) {
 	w, h := screen.Size()
 	var lines []string
 	for _, p := range paragraphs {
-		lines = append(lines, wrap(p, max(1, w-4))...)
+		lines = append(lines, tui.Wrap(p, w-4)...)
 	}
 	rows := max(1, h-5)
 	a.panelOffset = max(0, min(a.panelOffset, len(lines)-rows))
@@ -526,33 +526,6 @@ func (a *app) drawPage(screen tcell.Screen, t tui.Theme, paragraphs []string) {
 		footer = "Enter/m images · ↑/↓ scroll · PgUp/PgDn page · Esc back · q quit"
 	}
 	tui.Text(screen, 1, h-1, w-2, t.Muted, footer)
-}
-
-func wrap(text string, width int) []string {
-	text = tui.Clean(text)
-	var lines []string
-	for uniseg.StringWidth(text) > width {
-		g, end, space, cells := uniseg.NewGraphemes(text), 0, 0, 0
-		for g.Next() {
-			cells += g.Width()
-			if cells > width {
-				break
-			}
-			_, end = g.Positions()
-			if g.Str() == " " {
-				space = end
-			}
-		}
-		if space > 0 {
-			end = space
-		}
-		if end == 0 {
-			break
-		}
-		lines = append(lines, strings.TrimRight(text[:end], " "))
-		text = strings.TrimLeft(text[end:], " ")
-	}
-	return append(lines, text)
 }
 
 func (a *app) drawPlan(screen tcell.Screen, t tui.Theme) {
@@ -632,7 +605,7 @@ func (a *app) drawConfirmation(screen tcell.Screen, t tui.Theme) {
 	put(6, t.Base, "Scope: "+a.scope)
 	put(7, t.Muted, "Every tag on the reviewed manifests will be removed.")
 	put(9, t.Base, "Type this exact phrase, then press Enter:")
-	lines := wrap(a.confirmPhrase(), max(1, w-4))
+	lines := tui.Wrap(a.confirmPhrase(), w-4)
 	a.reviewable = a.reviewable && len(lines) <= h-14
 	for i, line := range lines {
 		if 10+i < h-4 {

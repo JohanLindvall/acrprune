@@ -52,6 +52,7 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 	logger := reg.Logger()
 	stats := []RepositoryStats{}
 	seen := map[string]struct{}{}
+	matcher := rules.NewRepositoryMatcher(runningRules)
 	var denied []string
 	var skipped []error
 	partial := func(err error) ([]RepositoryStats, error) {
@@ -94,7 +95,10 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 		}
 		repoStats := calculateStatsSeen(repository, slices.Collect(maps.Values(contents.Manifests)), seen)
 		countMissing(&repoStats, contents.Missing)
-		repositoryRunning := runningRulesFor(repository, runningRules)
+		var repositoryRunning []*rules.RepoRule
+		if rule := matcher.Match(repository); rule != nil {
+			repositoryRunning = []*rules.RepoRule{rule}
+		}
 		repoStats.Running = countRunning(contents.Manifests, repository, repositoryRunning)
 		for _, attrs := range contents.Missing {
 			if runningMatch(&registry.Manifest{Attributes: attrs}, repository, repositoryRunning) {
@@ -121,8 +125,8 @@ func CollectRegistryStats(ctx context.Context, reg *registry.Registry, runningRu
 		errs = append(errs, fmt.Errorf("skipped %d of %d repositories that could not be scanned reliably: %w",
 			len(skipped), len(repositories), errors.Join(skipped...)))
 	}
-	if len(errs) > 0 {
-		return partial(errors.Join(errs...))
+	if err := errors.Join(append(errs, ctx.Err())...); err != nil {
+		return partial(err)
 	}
 	return stats, nil
 }

@@ -550,12 +550,19 @@ func connectGHCR(ctx context.Context, addr registry.Address, pageSize int, needD
 // in the GitHub CLI's order of precedence, and otherwise the GitHub CLI's own
 // login.
 func githubToken(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	for _, name := range []string{"GH_TOKEN", "GITHUB_TOKEN"} {
 		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
 			return token, nil
 		}
 	}
-	if token, err := ghAuthToken(ctx); err == nil && token != "" {
+	token, err := ghAuthToken(ctx)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err == nil && token != "" {
 		return token, nil
 	}
 	return "", errors.New("no GitHub token: set GH_TOKEN or GITHUB_TOKEN to a token with the read:packages scope (and delete:packages to prune), or log in with the GitHub CLI: gh auth login --scopes read:packages,delete:packages")

@@ -42,6 +42,11 @@ type Pruner struct {
 	// preview captures the exact, protected decision for interactive review.
 	// Only Prepare sets it, on a private dry-run copy of the pruner.
 	preview *DeletionPlan
+	// requested and selection bound a manual manifest preview to its selected
+	// digests and their dependency/referrer closure. Only PrepareManifests sets
+	// requested; each repository inspection resolves selection once.
+	requested []string
+	selection map[string]bool
 }
 
 // PruneStats accumulates counts over one or more repository prunes. The
@@ -101,7 +106,9 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 	p.Logger.Debug("Starting prune", "dryRun", p.DryRun, "keepYounger", p.KeepYounger, "rules", len(ruleSet))
 
 	progress.Report(ctx, progress.Event{Kind: progress.Phase, Name: "Listing repositories"})
-	repositories, err := p.candidateRepositories(ctx, ruleSet)
+	matcher := rules.NewRepositoryMatcher(ruleSet)
+	protect := rules.NewRepositoryMatcher(p.Protect)
+	repositories, err := p.candidateRepositories(ctx, ruleSet, matcher)
 	if err != nil {
 		return err
 	}
@@ -114,12 +121,12 @@ func (p *Pruner) Prune(ctx context.Context, ruleSet []*rules.RepoRule) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		match := slices.IndexFunc(ruleSet, func(rule *rules.RepoRule) bool { return rule.Repo.MatchString(repository) })
-		if match < 0 {
+		rule := matcher.Match(repository)
+		if rule == nil {
 			continue
 		}
 		progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: repository})
-		stats, err := p.pruneRepository(ctx, repository, ruleSet[match])
+		stats, err := p.pruneRepository(ctx, repository, rule, protect.Match(repository))
 		if err != nil && stats.Repositories == 0 {
 			stats = untouched // failure before the repository could be inspected
 		}
@@ -215,7 +222,7 @@ func skippable(err error) bool {
 // candidateRepositories returns the repositories the rules can apply to: the
 // literal names when every rule targets a plain ^name$ pattern, or the full
 // registry listing as soon as one rule needs it to resolve what it matches.
-func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.RepoRule) ([]string, error) {
+func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.RepoRule, matcher *rules.RepositoryMatcher) ([]string, error) {
 	var literals []string
 	seen := map[string]struct{}{}
 	for _, rule := range ruleSet {
@@ -231,7 +238,7 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 				return nil, err
 			}
 			return slices.DeleteFunc(repositories, func(repository string) bool {
-				return !slices.ContainsFunc(ruleSet, func(rule *rules.RepoRule) bool { return rule.Repo.MatchString(repository) })
+				return matcher.Match(repository) == nil
 			}), nil
 		}
 		if _, ok := seen[name]; !ok {
@@ -246,12 +253,15 @@ func (p *Pruner) candidateRepositories(ctx context.Context, ruleSet []*rules.Rep
 // pruneRepository applies the rule to the repository. In a live run it lists
 // the repository again before deleting anything, and fails with
 // registry.ErrRepositoryChanged when anything changed since it was inspected.
-func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *rules.RepoRule) (PruneStats, error) {
+func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule, protect *rules.RepoRule) (PruneStats, error) {
 	// A generated inventory has a rule per repository. Find this one's rule
 	// once, rather than scanning the entire inventory for every manifest in
 	// each of the decision passes. Keep the caller's Pruner unchanged.
 	local := *p
-	local.Protect = runningRulesFor(repository, p.Protect)
+	local.Protect = nil
+	if protect != nil {
+		local.Protect = []*rules.RepoRule{protect}
+	}
 	p = &local
 	contents, found, err := p.Registry.FetchRepositoryManifests(ctx, repository, registry.FetchOptions{
 		IgnoreMissing: rule.IgnoreMissingManifests,
@@ -271,6 +281,12 @@ func (p *Pruner) pruneRepository(ctx context.Context, repository string, rule *r
 			"repository", repository, "missing", len(contents.Missing))
 		known := calculateStats(repository, slices.Collect(maps.Values(manifests)))
 		return leftAlone(len(manifests)+len(contents.Missing), known.Unique), nil
+	}
+	if p.requested != nil {
+		p.selection, err = expandSelection(ctx, repository, manifests, p.requested)
+		if err != nil {
+			return PruneStats{}, err
+		}
 	}
 	if len(manifests) == 0 {
 		// Neither ACR nor GHCR keeps empty repositories, so an existing one
@@ -456,6 +472,14 @@ func (p *Pruner) decide(all []*registry.Manifest, manifests map[string]*registry
 
 	kept := map[string]struct{}{}
 	for _, m := range all {
+		if p.selection != nil && !p.selection[m.Digest] {
+			// Manual cleanup never sweeps unrelated referrers, even those
+			// whose subjects are gone or form a tag-scheme cycle.
+			if _, err := p.keepWithDependencies(m.Digest, manifests, kept, rule); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if m.SubjectDigest() != "" {
 			continue // referrers follow their subject; decided below
 		}

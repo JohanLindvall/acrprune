@@ -93,55 +93,25 @@ func (c *Client) prepare(ctx context.Context, logger *slog.Logger, req request) 
 	if err != nil {
 		return nil, err
 	}
+	p := &pruner.Pruner{Registry: reg, Logger: logger, KeepYounger: c.KeepYounger, IncludeLocked: c.IncludeLocked, Protect: c.Protect}
 	var ruleSet []*rules.RepoRule
 	switch req.kind {
 	case "rules":
 		ruleSet = scopedRules(c.Rules, req.repositories)
 	case "repositories":
 		for _, name := range req.repositories {
-			ruleSet = append(ruleSet, deletionRule(name, nil, true))
+			ruleSet = append(ruleSet, deletionRule(name))
 		}
 	case "manifests":
-		name := req.repositories[0]
-		progress.Report(ctx, progress.Event{Kind: progress.Repository, Name: name})
-		contents, _, err := reg.FetchRepositoryManifests(ctx, name, registry.FetchOptions{})
-		if err != nil {
-			return nil, err
-		}
-		// Deleting an image selects its index children as well. The pruner
-		// still retains any child another kept image needs, and signatures
-		// follow their subjects using the usual referrer rules.
-		selected := map[string]bool{}
-		pending := slices.Clone(req.digests)
-		for len(pending) > 0 {
-			digest := pending[len(pending)-1]
-			pending = pending[:len(pending)-1]
-			if selected[digest] {
-				continue
-			}
-			m := contents.Manifests[digest]
-			if m == nil {
-				return nil, fmt.Errorf("manifest %s@%s is unavailable; reload the repository", name, digest)
-			}
-			selected[digest] = true
-			for _, child := range m.Manifests {
-				pending = append(pending, string(child.Digest))
-			}
-		}
-		parts := slices.Sorted(maps.Keys(selected))
-		for i := range parts {
-			parts[i] = regexp.QuoteMeta(parts[i])
-		}
-		ruleSet = []*rules.RepoRule{deletionRule(name, regexp.MustCompile("^(?:"+strings.Join(parts, "|")+")$"), false)}
+		return p.PrepareManifests(ctx, req.repositories[0], req.digests)
 	}
-	p := &pruner.Pruner{Registry: reg, Logger: logger, KeepYounger: c.KeepYounger, IncludeLocked: c.IncludeLocked, Protect: c.Protect}
 	return p.Prepare(ctx, ruleSet)
 }
 
-func deletionRule(name string, digest *regexp.Regexp, whole bool) *rules.RepoRule {
-	common := rules.CommonRule{Digest: digest, Keep: false}
+func deletionRule(name string) *rules.RepoRule {
+	common := rules.CommonRule{Keep: false}
 	return &rules.RepoRule{Repo: regexp.MustCompile("^" + regexp.QuoteMeta(name) + "$"),
-		MustDeleteEverything: whole,
+		MustDeleteEverything: true,
 		Tagged:               []rules.TaggedRule{{CommonRule: common}}, Untagged: []rules.UntaggedRule{{CommonRule: common}}}
 }
 
@@ -150,14 +120,12 @@ func deletionRule(name string, digest *regexp.Regexp, whole bool) *rules.RepoRul
 // Literal clones prevent a broad pattern from reaching outside the snapshot.
 func scopedRules(ruleSet []*rules.RepoRule, repositories []string) []*rules.RepoRule {
 	var scoped []*rules.RepoRule
+	matcher := rules.NewRepositoryMatcher(ruleSet)
 	for _, name := range slices.Compact(slices.Sorted(slices.Values(repositories))) {
-		for _, rule := range ruleSet {
-			if rule.Repo.MatchString(name) {
-				clone := *rule
-				clone.Repo = regexp.MustCompile("^" + regexp.QuoteMeta(name) + "$")
-				scoped = append(scoped, &clone)
-				break
-			}
+		if rule := matcher.Match(name); rule != nil {
+			clone := *rule
+			clone.Repo = regexp.MustCompile("^" + regexp.QuoteMeta(name) + "$")
+			scoped = append(scoped, &clone)
 		}
 	}
 	return scoped

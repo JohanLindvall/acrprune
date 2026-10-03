@@ -3,9 +3,9 @@ package explore
 import (
 	"slices"
 	"strings"
-	"unicode"
 
 	"github.com/JohanLindvall/crprune/internal/pruner"
+	"github.com/JohanLindvall/crprune/internal/tui"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/uniseg"
 )
@@ -146,8 +146,9 @@ func editText(value *string, key *tcell.EventKey) {
 	case tcell.KeyCtrlU:
 		*value = ""
 	case tcell.KeyRune:
-		if unicode.IsGraphic(key.Rune()) && len(*value) < 4096 {
-			*value += string(key.Rune())
+		text := string(key.Rune())
+		if tui.Clean(text) == text && len(*value)+len(text) <= 4096 {
+			*value += text
 		}
 	}
 }

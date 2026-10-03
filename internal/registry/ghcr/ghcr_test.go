@@ -3,6 +3,7 @@ package ghcr
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -376,7 +377,7 @@ func TestDeleteManifest(t *testing.T) {
 		t.Errorf("confirming requests = %v", got)
 	}
 
-	for _, bad := range []string{"", "12/../34", "-1"} {
+	for _, bad := range []string{"", "0", "12/../34", "-1"} {
 		m.ID = bad
 		if err := b.DeleteManifest(ctx, m); err == nil || !strings.Contains(err.Error(), "package version id") {
 			t.Errorf("ID %q: error = %v, want a missing-id error", bad, err)
@@ -480,6 +481,46 @@ func TestListingDecodeFailures(t *testing.T) {
 	}
 	if err := b.ListManifests(ctx, "app", func(registry.Attributes) error { return nil }); err == nil || !strings.Contains(err.Error(), "failed to decode package versions") {
 		t.Errorf("ListManifests error = %v", err)
+	}
+}
+
+func TestListingRejectsNullAndTrailingContent(t *testing.T) {
+	for _, body := range []string{"null", "[] []", "[] trailing", "[null]"} {
+		t.Run(body, func(t *testing.T) {
+			f, b := newFakeGitHub(t, true)
+			f.before = func(w http.ResponseWriter, _ *http.Request) bool {
+				_, _ = io.WriteString(w, body)
+				return true
+			}
+			if _, err := b.ListRepositories(t.Context()); err == nil {
+				t.Fatal("malformed package listing accepted")
+			}
+			if err := b.ListManifests(t.Context(), "app", func(registry.Attributes) error { return nil }); err == nil {
+				t.Fatal("malformed version listing accepted")
+			}
+		})
+	}
+}
+
+func TestVersionListingRequiresIdentityAndTagInventory(t *testing.T) {
+	for _, body := range []string{
+		`[{"id":0,"name":"sha256:abc","metadata":{"container":{"tags":[]}}}]`,
+		`[{"id":-1,"name":"sha256:abc","metadata":{"container":{"tags":[]}}}]`,
+		`[{"id":1,"name":"sha256:abc"}]`,
+		`[{"id":1,"name":"sha256:abc","metadata":{"container":{}}}]`,
+		`[{"id":1,"name":"sha256:abc","metadata":{"container":{"tags":null}}}]`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			f, b := newFakeGitHub(t, true)
+			f.before = func(w http.ResponseWriter, _ *http.Request) bool {
+				_, _ = io.WriteString(w, body)
+				return true
+			}
+			listed := false
+			if err := b.ListManifests(t.Context(), "app", func(registry.Attributes) error { listed = true; return nil }); err == nil || listed {
+				t.Fatal("incomplete metadata reached retention rules", err)
+			}
+		})
 	}
 }
 

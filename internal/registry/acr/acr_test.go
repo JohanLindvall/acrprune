@@ -332,7 +332,7 @@ func TestListManifests(t *testing.T) {
 	f.manifests["team/app"] = []any{
 		map[string]any{
 			"digest":         "sha256:aaa",
-			"tags":           []any{"v1", nil, "latest"},
+			"tags":           []any{"v1", "latest"},
 			"lastUpdateTime": updated.Format(time.RFC3339),
 			"architecture":   "arm64",
 			"os":             "linux",
@@ -373,6 +373,17 @@ func TestListManifests(t *testing.T) {
 	boom := errors.New("boom")
 	if err := b.ListManifests(context.Background(), "team/app", func(registry.Attributes) error { return boom }); !errors.Is(err, boom) {
 		t.Errorf("fn error = %v, want %v", err, boom)
+	}
+}
+
+func TestListManifestsRejectsNullTags(t *testing.T) {
+	f := newFakeACR()
+	f.manifests["app"] = []any{map[string]any{"digest": "sha256:aaa", "tags": []any{nil}}}
+	b := newTestBackend(t, f, 10)
+	listed := false
+	err := b.ListManifests(t.Context(), "app", func(registry.Attributes) error { listed = true; return nil })
+	if err == nil || listed {
+		t.Fatalf("null tag became an untagged image: listed=%v, err=%v", listed, err)
 	}
 }
 

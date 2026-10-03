@@ -60,16 +60,21 @@ if [ "$1" = --version ]; then
   echo 'GNU Wget 1.24.5 built on linux-gnu.'
   exit 0
 fi
-out= header= url=
+out= header= url= redirect=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -O) out=$2; shift ;;
     --header=*) header=${1#--header=} ;;
+    --max-redirect=*) redirect=${1#--max-redirect=} ;;
     -*) ;;
     *) url=$1 ;;
   esac
   shift
 done
+if [ -n "$header" ] && [ "$redirect" != 0 ]; then
+  echo 'wget must not forward authentication through redirects' >&2
+  exit 1
+fi
 printf 'wget %s %s\n' "$url" "$header" >> "$MOCK_DIR/calls"
 file=$MOCK_DIR/web/${url#https://}
 if [ ! -f "$file" ]; then
@@ -137,6 +142,12 @@ printf '%s' '{"tag_name":"v0.1.10","assets":[{"name":"acrprune-v0.1.10-linux-amd
 release v0.1.11 linux-amd64
 : > "$web/github.com/JohanLindvall/crprune/releases/download/v0.1.11/checksums-v0.1.11.txt"
 printf '%s' '{"tag_name":"v0.1.11","assets":[{"name":"checksums-v0.1.11.txt"},{"name":"crprune-v0.1.11-linux-amd64.tar.gz"}]}' > "$api/tags/v0.1.11"
+# A valid, checksummed archive whose binary cannot execute successfully.
+release v0.1.14 linux-amd64
+printf '#!/bin/sh\nexit 1\n' > "$stage/crprune"
+tar -czf "$assets/crprune-v0.1.14-linux-amd64.tar.gz" -C "$stage" crprune
+(cd "$assets" && sha256sum -- *.tar.gz > checksums-v0.1.14.txt)
+printf '%s' '{"tag_name":"v0.1.14","assets":[{"name":"checksums-v0.1.14.txt"},{"name":"crprune-v0.1.14-linux-amd64.tar.gz"}]}' > "$api/tags/v0.1.14"
 
 with_curl="$test_dir/curl:$test_dir/tools"
 unset GH_TOKEN GITHUB_TOKEN CRPRUNE_REPO
@@ -230,6 +241,10 @@ rm "$test_dir/out/bin/acrprune"
 mkdir "$test_dir/cwd"
 (cd "$test_dir/cwd" && passes "$with_curl" env MOCK_ARCH=aarch64 sh "$download")
 installed "$test_dir/cwd" 'crprune version v0.1.13 linux-arm64'
+passes "$with_curl" sh "$download" "$test_dir/path with spaces"
+installed "$test_dir/path with spaces" 'crprune version v0.1.13 linux-amd64'
+(cd "$test_dir/cwd" && passes "$with_curl" sh "$download" -- -bin)
+installed "$test_dir/cwd/-bin" 'crprune version v0.1.13 linux-amd64'
 
 # A token authenticates the API request only, never the downloads.
 passes "$with_curl" env GH_TOKEN=secret sh "$download" "$test_dir/token"
@@ -259,6 +274,11 @@ fi
 mkdir "$test_dir/keep"
 printf '#!/bin/sh\necho old\n' > "$test_dir/keep/crprune"
 chmod +x "$test_dir/keep/crprune"
+fails 'binary that cannot run' "$with_curl" sh "$download" -v v0.1.14 "$test_dir/keep"
+installed "$test_dir/keep" old
+mkdir -p "$test_dir/directory/crprune"
+fails 'directory at target path' "$with_curl" sh "$download" "$test_dir/directory"
+[ -z "$(ls -A "$test_dir/directory/crprune")" ]
 fails 'corrupt archive' "$with_curl" env CORRUPT=1 sh "$download" "$test_dir/keep"
 grep -q 'checksum mismatch for crprune-v0.1.13-linux-amd64.tar.gz' "$test_dir/stderr"
 installed "$test_dir/keep" old

@@ -359,6 +359,52 @@ func TestRunRestoresTerminalBeforePanicking(t *testing.T) {
 	t.Fatal("Run returned instead of panicking")
 }
 
+// A rendering panic must still cancel work and wait for cleanup such as
+// restoring registry locks before relinquishing the terminal.
+func TestRenderingPanicWaitsForWorkerCleanup(t *testing.T) {
+	screen := newWatchedScreen(100, 30)
+	fakeTerminal(t, func() (tcell.Screen, error) { return screen, nil })
+	started, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var finished, restoredTooSoon atomic.Bool
+	screen.onFini = func() { restoredTooSoon.Store(!finished.Load()) }
+	old := onScreen
+	onScreen = func(tcell.Screen, func()) { <-started; panic("render failed") }
+	t.Cleanup(func() { onScreen = old })
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_ = Run(t.Context(), Options{Mode: "tui"}, slog.New(slog.DiscardHandler), func(ctx context.Context, _ *slog.Logger) error {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			<-release
+			finished.Store(true)
+			return ctx.Err()
+		})
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("rendering panic did not cancel the worker")
+	}
+	select {
+	case value := <-panicked:
+		close(release)
+		t.Fatalf("Run panicked before worker cleanup completed: %v", value)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case value := <-panicked:
+		if value != "render failed" || restoredTooSoon.Load() || !finished.Load() {
+			t.Errorf("panic=%v, terminal restored before cleanup=%v, worker finished=%v", value, restoredTooSoon.Load(), finished.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not propagate the rendering panic after cleanup")
+	}
+}
+
 // TestRestoreTerminal: a process exiting on a second interrupt left the
 // terminal raw, on the alternate screen. RestoreTerminal restores it while
 // Run runs, from any goroutine and only once, and the display draws nothing

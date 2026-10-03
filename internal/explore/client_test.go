@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/opencontainers/go-digest"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"github.com/JohanLindvall/crprune/internal/registry"
 	"github.com/JohanLindvall/crprune/internal/registry/registrytest"
 	"github.com/JohanLindvall/crprune/internal/rules"
@@ -118,5 +121,71 @@ func TestImageSelectionIncludesChildrenButRetainsSharedDependency(t *testing.T) 
 	}
 	if len(b.Digests("app")) != 2 {
 		t.Fatal(b.Digests("app"))
+	}
+}
+
+func TestImageSelectionUsesOneInspection(t *testing.T) {
+	b := registrytest.New()
+	old := registry.Attributes{LastUpdated: time.Now().Add(-48 * time.Hour)}
+	remove := b.Add("app", registrytest.Image("remove"), old)
+	b.Add("app", registrytest.Image("keep"), old)
+	plan, err := testClient(b).prepare(t.Context(), quiet(), request{kind: "manifests", repositories: []string{"app"}, digests: []string{remove}})
+	if err != nil || len(plan.Targets()) != 1 {
+		t.Fatal(plan, err)
+	}
+	if b.Calls("ListManifests") != 1 || b.Calls("GetManifest") != 2 {
+		t.Fatalf("preview inspected the repository repeatedly: listings=%d downloads=%d", b.Calls("ListManifests"), b.Calls("GetManifest"))
+	}
+}
+
+func TestImageSelectionLeavesUnrelatedReferrersAlone(t *testing.T) {
+	for _, cycle := range []bool{false, true} {
+		t.Run(map[bool]string{false: "dangling", true: "tag cycle"}[cycle], func(t *testing.T) {
+			b := registrytest.New()
+			old := registry.Attributes{LastUpdated: time.Now().Add(-48 * time.Hour)}
+			remove := b.Add("app", registrytest.Image("remove"), old)
+			b.Add("app", registrytest.Image("keep"), old)
+			if cycle {
+				first, second := registrytest.Image("signature-a"), registrytest.Image("signature-b")
+				a := b.Add("app", first, old)
+				z := b.Add("app", second, old)
+				attrs := old
+				attrs.Tags = []string{strings.Replace(z, ":", "-", 1) + ".sig"}
+				b.Add("app", first, attrs)
+				attrs.Tags = []string{strings.Replace(a, ":", "-", 1) + ".sig"}
+				b.Add("app", second, attrs)
+			} else {
+				doc := registrytest.Image("dangling-signature")
+				doc.Subject = &v1.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("a", 64))}
+				b.Add("app", doc, old)
+			}
+			plan, err := testClient(b).prepare(t.Context(), quiet(), request{kind: "manifests", repositories: []string{"app"}, digests: []string{remove}})
+			if err != nil {
+				t.Fatal("unrelated referrers prevented manual cleanup:", err)
+			}
+			if targets := plan.Targets(); len(targets) != 1 || targets[0].Digest != remove {
+				t.Fatalf("manual selection widened to unrelated referrers: %+v", targets)
+			}
+			if _, err := plan.Execute(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(b.Deleted(), []string{"app@" + remove}) {
+				t.Fatal(b.Deleted())
+			}
+		})
+	}
+}
+
+func TestImageSelectionCanDeleteDanglingReferrer(t *testing.T) {
+	b := registrytest.New()
+	doc := registrytest.Image("signature")
+	doc.Subject = &v1.Descriptor{Digest: digest.Digest("sha256:" + strings.Repeat("a", 64))}
+	remove := b.Add("app", doc, registry.Attributes{LastUpdated: time.Now().Add(-48 * time.Hour)})
+	plan, err := testClient(b).prepare(t.Context(), quiet(), request{kind: "manifests", repositories: []string{"app"}, digests: []string{remove}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets := plan.Targets(); len(targets) != 1 || targets[0].Digest != remove {
+		t.Fatalf("selected dangling referrer was not deletable: %+v", targets)
 	}
 }

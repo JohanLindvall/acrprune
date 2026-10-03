@@ -29,7 +29,13 @@ fetch() {
   if [ "$downloader" = curl ]; then
     curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 ${1:+-H "$1"} -o "$file" "$url"
   else
-    wget -q ${1:+--header="$1"} -O "$file" "$url"
+    # Wget forwards custom headers to redirected hosts. An authenticated
+    # API request must use the canonical URL and refuse redirects; asset
+    # downloads carry no token and still follow GitHub's storage redirects.
+    if [ "$#" -gt 0 ]; then
+      set -- --max-redirect=0 "--header=$1"
+    fi
+    wget -q "$@" -O "$file" "$url"
   fi
 }
 
@@ -147,13 +153,18 @@ main() {
   fi
 
   # Stage next to the target so that the final rename is atomic, even over a
-  # binary that is running.
+  # binary that is running. Check it before replacing a working installation.
+  case "$dir" in /*) ;; *) dir=./$dir ;; esac
   mkdir -p "$dir" || die "cannot create $dir"
-  staged=$dir/.$binary.download.$$
-  cp "$tmp/$binary" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$dir/$binary" ||
+  dir=$(CDPATH='' cd -- "$dir" && pwd) || die "cannot resolve $dir"
+  [ ! -d "$dir/$binary" ] || die "cannot replace directory $dir/$binary"
+  staged=$(mktemp "$dir/.$binary.download.XXXXXX") || die "cannot stage $dir/$binary"
+  cp "$tmp/$binary" "$staged" && chmod 755 "$staged" || die "cannot stage $dir/$binary"
+  "$staged" --version >&2 || die "downloaded $binary does not run on this machine; installation unchanged"
+  mv -f "$staged" "$dir/$binary" ||
     die "cannot install $dir/$binary"
-  installed=$(CDPATH='' cd -- "$dir" && pwd)/$binary
-  "$installed" --version >&2 || die "installed $installed, but it does not run on this machine"
+  staged=
+  installed=$dir/$binary
   echo "$installed"
 }
 

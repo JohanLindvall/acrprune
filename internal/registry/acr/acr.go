@@ -130,6 +130,13 @@ func (b *Backend) ListManifests(ctx context.Context, repository string, fn func(
 	})
 	return forEachPage(ctx, pager, func(page azcontainerregistry.ClientListManifestsResponse) *string { return page.Link }, func(page azcontainerregistry.ClientListManifestsResponse) error {
 		for _, attrs := range page.Attributes {
+			if attrs != nil {
+				for _, tag := range attrs.Tags {
+					if tag == nil {
+						return fmt.Errorf("manifest listing for %s contains a null tag", repository)
+					}
+				}
+			}
 			if err := fn(attributes(attrs)); err != nil {
 				return err
 			}

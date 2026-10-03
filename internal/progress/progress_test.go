@@ -135,6 +135,31 @@ func TestLogHandlerBoundsText(t *testing.T) {
 	}
 }
 
+func TestLogHandlerBoundGroups(t *testing.T) {
+	tracker := NewTracker()
+	logger := tracker.Logger(slog.New(slog.NewTextHandler(&strings.Builder{}, nil)))
+	grouped := logger.WithGroup("repo").With(slog.Attr{},
+		slog.Group("", slog.String("name", "app")),
+		slog.Group("nested", slog.String("tag", "v1")),
+		slog.Group("empty"))
+	grouped.WithGroup("").Info("bound", "count", 2)
+	grouped.With("delay", time.Second).Warn("retry")
+	logger.Info("base")
+	s := tracker.Snapshot()
+	if len(s.Logs) != 3 {
+		t.Fatalf("logs = %+v", s.Logs)
+	}
+	if got, want := s.Logs[0].Text, "bound  repo.name=app  repo.nested.tag=v1  repo.count=2"; got != want {
+		t.Errorf("bound groups = %q, want %q", got, want)
+	}
+	if s.Logs[2].Text != "base" {
+		t.Errorf("derived attributes leaked into original logger: %q", s.Logs[2].Text)
+	}
+	if s.RetryUntil.IsZero() {
+		t.Error("bound retry delay was lost")
+	}
+}
+
 func TestKindString(t *testing.T) {
 	if Finished.String() != "Finished" || Candidates.String() != "Candidates" || Kind(99).String() != "Kind(99)" {
 		t.Errorf("kind names: %v %v %v", Finished, Candidates, Kind(99))
